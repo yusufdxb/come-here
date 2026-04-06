@@ -1,0 +1,5 @@
+audio_node:
+  ros__parameters:
+    use_mock: true
+    publish_rate_hz: 10.0
+    mock_azimuth_rad: 0.0

@@ -1,0 +1,21 @@
+# Combined parameter overrides for all nodes
+# Use this file with: ros2 launch come_here_bringup come_here.launch.py
+
+audio_node:
+  ros__parameters:
+    use_mock: true
+    publish_rate_hz: 10.0
+
+perception_node:
+  ros__parameters:
+    use_mock: true
+    publish_rate_hz: 10.0
+
+behavior_node:
+  ros__parameters:
+    tick_rate_hz: 10.0
+    direction_confidence_threshold: 0.5
+    person_confidence_threshold: 0.5
+    approach_stop_distance_m: 0.8
+    search_timeout_s: 10.0
+    approach_speed: 0.3
