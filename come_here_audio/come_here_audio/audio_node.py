@@ -18,6 +18,7 @@ from come_here_audio.wake_phrase_detector import (
     MockWakePhraseDetector,
     WakePhraseDetector,
 )
+from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
 
 # TODO: Replace with real message imports after come_here_msgs is built
 # from come_here_msgs.msg import AudioDirection, WakePhrase
@@ -30,27 +31,47 @@ class AudioNode(Node):
 
         # Parameters
         self.declare_parameter('use_mock', True)
+        self.declare_parameter('wake_detector', 'mock')  # 'mock' or 'whisper'
         self.declare_parameter('publish_rate_hz', 10.0)
         self.declare_parameter('mock_azimuth_rad', 0.0)
+        self.declare_parameter('whisper_model_size', 'base.en')
+        self.declare_parameter('whisper_device', 'cpu')
+        self.declare_parameter('whisper_chunk_duration_s', 2.0)
+        self.declare_parameter('whisper_adapter_path', '')  # path to LoRA adapter
 
         use_mock = self.get_parameter('use_mock').value
+        wake_detector_type = self.get_parameter('wake_detector').value
         rate_hz = self.get_parameter('publish_rate_hz').value
         mock_azimuth = self.get_parameter('mock_azimuth_rad').value
 
-        # Provider selection
+        # Direction provider selection
         # TODO: Add real provider selection when mic hardware is known
         if use_mock:
             self._direction_provider: AudioDirectionProvider = MockAudioProvider(
                 fixed_azimuth_rad=mock_azimuth
             )
-            self._wake_detector: WakePhraseDetector = MockWakePhraseDetector()
-            self.get_logger().info('Using MOCK audio providers (no real hardware)')
+            self.get_logger().info('Using MOCK audio direction provider')
         else:
-            # TODO: Instantiate real hardware provider here
             raise NotImplementedError(
-                'Real audio provider not yet implemented. '
+                'Real audio direction provider not yet implemented. '
                 'Set use_mock:=true or implement a real AudioDirectionProvider.'
             )
+
+        # Wake phrase detector selection
+        if wake_detector_type == 'whisper':
+            adapter_path = self.get_parameter('whisper_adapter_path').value
+            adapter_path = adapter_path if adapter_path else None
+            self._wake_detector: WakePhraseDetector = WhisperPhraseDetector(
+                model_size=self.get_parameter('whisper_model_size').value,
+                device=self.get_parameter('whisper_device').value,
+                chunk_duration_s=self.get_parameter('whisper_chunk_duration_s').value,
+                adapter_path=adapter_path,
+            )
+            label = 'WHISPER (fine-tuned)' if adapter_path else 'WHISPER (base)'
+            self.get_logger().info(f'Using {label} wake phrase detector')
+        else:
+            self._wake_detector = MockWakePhraseDetector()
+            self.get_logger().info('Using MOCK wake phrase detector')
 
         self._direction_provider.setup()
         self._wake_detector.setup()
@@ -64,8 +85,8 @@ class AudioNode(Node):
             String, '/come_here/wake_phrase', 10
         )
 
-        # Mock trigger subscriber
-        if use_mock:
+        # Mock trigger subscriber (only when using mock wake detector)
+        if isinstance(self._wake_detector, MockWakePhraseDetector):
             self._mock_sub = self.create_subscription(
                 Bool, '/come_here/mock_trigger', self._mock_trigger_cb, 10
             )

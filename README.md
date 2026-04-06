@@ -49,7 +49,8 @@ STOP --> IDLE
 ### Key Abstractions
 
 - **`AudioDirectionProvider`** (`come_here_audio/audio_direction_provider.py`): ABC for sound source direction estimation. Swap in real mic hardware by subclassing this.
-- **`WakePhraseDetector`** (`come_here_audio/wake_phrase_detector.py`): ABC for wake phrase detection. Plug in Vosk, Porcupine, NeMo, etc.
+- **`WakePhraseDetector`** (`come_here_audio/wake_phrase_detector.py`): ABC for wake phrase detection.
+  - **`WhisperPhraseDetector`** (`whisper_phrase_detector.py`): Real implementation using faster-whisper. Runs Whisper in a background thread on rolling audio chunks, triggers on "come here" in the transcript.
 - **`PersonDetector`** (`come_here_perception/person_detector.py`): ABC for visual person detection. Plug in YOLO, MediaPipe, etc.
 
 All three have mock implementations for local development.
@@ -69,6 +70,10 @@ source install/setup.bash
 
 # Launch (mock mode)
 ros2 launch come_here_bringup come_here.launch.py use_mock:=true
+
+# For Whisper wake phrase detection (requires faster-whisper + sounddevice):
+# pip install faster-whisper sounddevice numpy
+# Then set wake_detector param to 'whisper' in audio_params.yaml
 ```
 
 ### Testing Mock Trigger
@@ -102,7 +107,7 @@ cd come_here_behavior && python -m pytest test/
 ## Hardware-Dependent Work (Not Yet Implemented)
 
 1. **Microphone array integration**: Need mic model to implement a real `AudioDirectionProvider` (GCC-PHAT, MUSIC, SRP-PHAT, etc.)
-2. **Wake phrase engine**: Need to choose ASR/wake-word engine (Vosk, Porcupine, NeMo) and implement a real `WakePhraseDetector`
+2. **Wake phrase validation**: `WhisperPhraseDetector` is implemented but not yet tested on hardware. Needs validation with the actual mic and ambient noise conditions
 3. **Person detection model**: Need to integrate YOLO or equivalent with the GO2's camera and implement a real `PersonDetector`
 4. **GO2 locomotion bridge**: `cmd_rotate` and `cmd_move` topics are placeholders -- need to bridge to the Unitree SDK or `cmd_vel`
 5. **Message migration**: Switch from `std_msgs` placeholders to `come_here_msgs` custom messages after first `colcon build`

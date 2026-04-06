@@ -1,8 +1,8 @@
 """Wake phrase detection abstraction.
 
 Detects the trigger phrase "come here" from audio input.
-Currently a stub - real implementation will depend on the chosen
-ASR/wake-word engine (e.g., Vosk, Porcupine, NeMo).
+Implementations: MockWakePhraseDetector (testing), WhisperPhraseDetector (real).
+See also whisper_phrase_detector.py for the Whisper-based implementation.
 """
 
 from abc import ABC, abstractmethod

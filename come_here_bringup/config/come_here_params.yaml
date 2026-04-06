@@ -4,7 +4,12 @@
 audio_node:
   ros__parameters:
     use_mock: true
+    wake_detector: mock        # 'mock' or 'whisper'
     publish_rate_hz: 10.0
+    whisper_model_size: base.en
+    whisper_device: cuda
+    whisper_chunk_duration_s: 2.0
+    whisper_adapter_path: ''
 
 perception_node:
   ros__parameters:
