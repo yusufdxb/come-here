@@ -14,6 +14,7 @@ from std_msgs.msg import Bool, Header
 
 from come_here_audio.audio_direction_provider import AudioDirectionProvider
 from come_here_audio.mock_audio_provider import MockAudioProvider
+from come_here_audio.respeaker_doa_provider import ReSpeakerDOAProvider
 from come_here_audio.wake_phrase_detector import (
     MockWakePhraseDetector,
     WakePhraseDetector,
@@ -45,19 +46,25 @@ class AudioNode(Node):
         mock_azimuth = self.get_parameter('mock_azimuth_rad').value
 
         # Direction provider selection
-        # TODO: Add real provider selection when mic hardware is known
+        self.declare_parameter('respeaker_frame_offset_deg', 0.0)
+        frame_offset = self.get_parameter('respeaker_frame_offset_deg').value
+
         if use_mock:
             self._direction_provider: AudioDirectionProvider = MockAudioProvider(
                 fixed_azimuth_rad=mock_azimuth
             )
             self.get_logger().info('Using MOCK audio direction provider')
         else:
-            raise NotImplementedError(
-                'Real audio direction provider not yet implemented. '
-                'Set use_mock:=true or implement a real AudioDirectionProvider.'
+            self._direction_provider = ReSpeakerDOAProvider(
+                frame_offset_deg=frame_offset
             )
+            self.get_logger().info('Using RESPEAKER audio direction provider')
 
         # Wake phrase detector selection
+        self.declare_parameter('mic_device', 'hw:0,0')
+        self.declare_parameter('mic_channels', 6)
+        self.declare_parameter('mic_beam_channel', 1)
+
         if wake_detector_type == 'whisper':
             adapter_path = self.get_parameter('whisper_adapter_path').value
             adapter_path = adapter_path if adapter_path else None
@@ -66,6 +73,9 @@ class AudioNode(Node):
                 device=self.get_parameter('whisper_device').value,
                 chunk_duration_s=self.get_parameter('whisper_chunk_duration_s').value,
                 adapter_path=adapter_path,
+                mic_device=self.get_parameter('mic_device').value,
+                mic_channels=self.get_parameter('mic_channels').value,
+                mic_beam_channel=self.get_parameter('mic_beam_channel').value,
             )
             label = 'WHISPER (fine-tuned)' if adapter_path else 'WHISPER (base)'
             self.get_logger().info(f'Using {label} wake phrase detector')
