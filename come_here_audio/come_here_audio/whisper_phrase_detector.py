@@ -65,19 +65,25 @@ class WhisperPhraseDetector(WakePhraseDetector):
         device: str = "cpu",
         compute_type: str = "int8",
         adapter_path: Optional[str] = None,
-        mic_device: Optional[int] = None,
+        mic_device: Optional[str] = None,
+        mic_channels: int = 6,
+        mic_beam_channel: int = 1,
         chunk_duration_s: float = 2.0,
         sample_rate: int = 16000,
         confidence_threshold: float = 0.4,
+        no_speech_threshold: float = 0.5,
     ):
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
         self._adapter_path = adapter_path
         self._mic_device = mic_device
+        self._mic_channels = mic_channels
+        self._mic_beam_channel = mic_beam_channel
         self._chunk_duration = chunk_duration_s
         self._sample_rate = sample_rate
         self._confidence_threshold = confidence_threshold
+        self._no_speech_threshold = no_speech_threshold
 
         # Determine backend
         self._use_hf = adapter_path is not None
@@ -111,12 +117,24 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._thread.start()
 
     def _resolve_local_model(self, subdir: str) -> str | None:
-        """Check if a local model cache exists alongside the package."""
+        """Check if a local model cache exists alongside the package.
+
+        Handles both flat layout (models/faster-whisper-base.en/*.bin)
+        and HuggingFace cache layout (models/.../snapshots/<hash>/*.bin).
+        """
         import pathlib
-        # Walk up from this file to find the project root models/ dir
         pkg_dir = pathlib.Path(__file__).resolve().parent.parent.parent
         local = pkg_dir / "models" / subdir
-        return str(local) if local.is_dir() else None
+        if not local.is_dir():
+            return None
+        # Check for HF cache structure: find the snapshot directory
+        snapshots = list(local.rglob("snapshots"))
+        if snapshots:
+            # Use the first snapshot hash directory
+            snap_dirs = list(snapshots[0].iterdir())
+            if snap_dirs:
+                return str(snap_dirs[0])
+        return str(local)
 
     def _setup_faster_whisper(self) -> None:
         local = self._resolve_local_model(f"faster-whisper-{self._model_size}")
@@ -162,28 +180,32 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._hf_processor = None
 
     def _listen_loop(self) -> None:
-        """Background thread: record audio chunks and run Whisper on each."""
+        """Background thread: record audio chunks and run Whisper on each.
+
+        Records multi-channel audio from the ReSpeaker and extracts the
+        beamformed channel (ch0 by default) for Whisper inference.
+        """
         import sounddevice as sd
 
         chunk_samples = int(self._chunk_duration * self._sample_rate)
 
         while self._running:
             try:
-                # Record one chunk
-                # TODO: When mic hardware is known, configure device/channels here
                 audio = sd.rec(
                     chunk_samples,
                     samplerate=self._sample_rate,
-                    channels=1,
+                    channels=self._mic_channels,
                     dtype='float32',
                     device=self._mic_device,
                 )
                 sd.wait()
 
-                audio_np = audio.flatten().astype(np.float32)
+                # Extract selected channel and apply gain boost
+                audio_np = audio[:, self._mic_beam_channel].flatten().astype(np.float32)
+                audio_np = np.clip(audio_np * 4.0, -1.0, 1.0)
 
-                # Skip silent chunks
-                if np.max(np.abs(audio_np)) < 0.01:
+                # Skip silent chunks (threshold accounts for gain)
+                if np.max(np.abs(audio_np)) < 0.02:
                     continue
 
                 if self._use_hf:
@@ -198,15 +220,23 @@ class WhisperPhraseDetector(WakePhraseDetector):
                     time.sleep(0.5)
 
     def _transcribe_ct2(self, audio_np: np.ndarray) -> None:
-        """Transcribe using faster-whisper (CTranslate2)."""
+        """Transcribe using faster-whisper (CTranslate2).
+
+        Note: vad_filter is disabled — it crashes on ARM/Jetson due to
+        an onnxruntime assertion failure. We use the ReSpeaker's hardware
+        VAD (VOICEACTIVITY register) and silence detection instead.
+        """
         segments, info = self._ct2_model.transcribe(
             audio_np,
-            beam_size=3,
+            beam_size=1,
             language="en",
-            vad_filter=True,
         )
 
         for segment in segments:
+            # Filter hallucinations from silence/noise
+            if segment.no_speech_prob > self._no_speech_threshold:
+                continue
+
             text = segment.text.strip().lower()
             avg_logprob = segment.avg_log_prob
             confidence = min(1.0, max(0.0, 1.0 + avg_logprob))
