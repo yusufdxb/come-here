@@ -76,31 +76,31 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| AUD-01 | Pending | Pending |
-| AUD-02 | Pending | Pending |
-| AUD-03 | Pending | Pending |
-| AUD-04 | Pending | Pending |
-| WAKE-01 | Pending | Pending |
-| WAKE-02 | Pending | Pending |
-| WAKE-03 | Pending | Pending |
-| WAKE-04 | Pending | Pending |
-| VIS-01 | Pending | Pending |
-| VIS-02 | Pending | Pending |
-| VIS-03 | Pending | Pending |
-| VIS-04 | Pending | Pending |
-| VIS-05 | Pending | Pending |
-| LOC-01 | Pending | Pending |
-| LOC-02 | Pending | Pending |
-| LOC-03 | Pending | Pending |
-| INT-01 | Pending | Pending |
-| INT-02 | Pending | Pending |
-| INT-03 | Pending | Pending |
+| LOC-01 | Phase 1 | Pending |
+| LOC-02 | Phase 1 | Pending |
+| LOC-03 | Phase 1 | Pending |
+| AUD-01 | Phase 2 | Pending |
+| AUD-02 | Phase 2 | Pending |
+| AUD-03 | Phase 2 | Pending |
+| AUD-04 | Phase 2 | Pending |
+| WAKE-01 | Phase 2 | Pending |
+| WAKE-02 | Phase 2 | Pending |
+| WAKE-03 | Phase 2 | Pending |
+| WAKE-04 | Phase 2 | Pending |
+| VIS-01 | Phase 3 | Pending |
+| VIS-02 | Phase 3 | Pending |
+| VIS-03 | Phase 3 | Pending |
+| VIS-04 | Phase 3 | Pending |
+| VIS-05 | Phase 3 | Pending |
+| INT-01 | Phase 4 | Pending |
+| INT-02 | Phase 4 | Pending |
+| INT-03 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 19 total
-- Mapped to phases: 0
-- Unmapped: 19 ⚠️
+- Mapped to phases: 19
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-06*
-*Last updated: 2026-04-06 after initial definition*
+*Last updated: 2026-04-06 after roadmap creation*
