@@ -9,3 +9,6 @@ models/
 deps/
 training/data/
 training/output/
+.planning/
+CLAUDE.md
+AGENTS.md
