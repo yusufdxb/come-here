@@ -185,10 +185,9 @@ def main():
                 target_az = state["target_az"]
                 target_deg = abs(math.degrees(target_az))
                 # Sport API: big deadzone, needs z>=1.5 to move
-                # z=1.5@20ms did ~240 deg/s
-                cmd_z = 2.0
-                deg_per_sec = 300.0
-                duration = max(0.15, min(target_deg / deg_per_sec, 3.0))
+                cmd_z = 3.0
+                deg_per_sec = 200.0
+                duration = max(0.2, min(target_deg / deg_per_sec, 4.0))
                 if elapsed < duration:
                     sign = 1.0 if target_az > 0 else -1.0
                     sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": cmd_z * sign}))
