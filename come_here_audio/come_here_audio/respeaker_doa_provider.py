@@ -51,7 +51,7 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
             with the robot's forward axis. Positive = counter-clockwise.
     """
 
-    def __init__(self, frame_offset_deg: float = 0.0):
+    def __init__(self, frame_offset_deg: float = 29.0):
         self._frame_offset_deg = frame_offset_deg
         self._dev = None
 

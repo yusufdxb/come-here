@@ -59,7 +59,7 @@ def whisper_thread(model):
             audio = sd.rec(int(3 * 16000), samplerate=16000, channels=6, dtype="float32", device="hw:0,0")
             sd.wait()
             ch = audio[:, 1].flatten()
-            ch = np.clip(ch * 4.0, -1.0, 1.0)
+            ch = np.clip(ch * 10.0, -1.0, 1.0)
             if np.max(np.abs(ch)) < 0.02:
                 continue
             segs, info = model.transcribe(ch, beam_size=1, language="en")
@@ -78,7 +78,7 @@ def main():
     model = WhisperModel(model_path, device="cpu", compute_type="int8")
 
     print("Starting DOA...")
-    doa = ReSpeakerDOAProvider(frame_offset_deg=0.0)
+    doa = ReSpeakerDOAProvider(frame_offset_deg=29.0)
     doa.setup()
 
     print("Starting Whisper listener...")
