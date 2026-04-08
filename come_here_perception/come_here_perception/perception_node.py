@@ -4,34 +4,56 @@ Publishes:
   /come_here/person_detection  (std_msgs/Float64MultiArray) [bearing, distance, confidence, detected]
 
 Subscribes:
+  /camera/image_raw            (sensor_msgs/Image) - from go2_av_node
   /come_here/mock_person       (std_msgs/Bool) - toggle mock person detection
 """
 
+import cv2
+import numpy as np
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float64MultiArray
 
 from come_here_perception.person_detector import MockPersonDetector, PersonDetector
+from come_here_perception.yolo_person_detector import YoloPersonDetector
 
 
 class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
 
-        self.declare_parameter('use_mock', True)
+        self.declare_parameter('use_mock', False)
         self.declare_parameter('publish_rate_hz', 10.0)
+        self.declare_parameter('model_path', '/home/unitree/come-here/models/yolo11n.pt')
+        self.declare_parameter('confidence', 0.45)
 
         use_mock = self.get_parameter('use_mock').value
         rate_hz = self.get_parameter('publish_rate_hz').value
 
-        # TODO: Add real detector (YOLO, MediaPipe, etc.) when camera is available
         if use_mock:
             self._detector: PersonDetector = MockPersonDetector()
             self.get_logger().info('Using MOCK person detector (no real camera)')
         else:
-            raise NotImplementedError(
-                'Real person detector not yet implemented. Set use_mock:=true.'
+            model_path = self.get_parameter('model_path').value
+            confidence = self.get_parameter('confidence').value
+            self._detector: PersonDetector = YoloPersonDetector(
+                model_path=model_path, confidence=confidence,
             )
+            self.get_logger().info(f'Using YOLO person detector: {model_path}')
+
+            # Subscribe to camera feed
+            cam_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.create_subscription(
+                Image, '/camera/image_raw', self._on_image, cam_qos
+            )
+            self.get_logger().info('Subscribed to /camera/image_raw')
 
         self._detector.setup()
 
@@ -46,6 +68,14 @@ class PerceptionNode(Node):
 
         self._timer = self.create_timer(1.0 / rate_hz, self._tick)
         self.get_logger().info(f'Perception node started at {rate_hz} Hz')
+
+    def _on_image(self, msg: Image):
+        """Convert ROS Image to numpy and feed to detector."""
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3
+        )
+        if isinstance(self._detector, YoloPersonDetector):
+            self._detector.update_frame(frame)
 
     def _mock_person_cb(self, msg: Bool):
         if isinstance(self._detector, MockPersonDetector):
