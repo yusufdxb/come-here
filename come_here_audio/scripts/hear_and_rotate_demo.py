@@ -17,6 +17,7 @@ sys.path.insert(0, "/home/unitree/come-here/come_here_audio")
 import rclpy
 from rclpy.node import Node
 from unitree_api.msg import Request
+from geometry_msgs.msg import Twist
 import json
 import datetime
 import random
@@ -71,6 +72,7 @@ def main():
     node = rclpy.create_node('come_here_demo')
     sport_pub = node.create_publisher(Request, '/api/sport/request', 10)
     audio_pub = node.create_publisher(Request, '/api/audiohub/request', 10)
+    vel_pub = node.create_publisher(Twist, '/cmd_vel', 10)
 
     wav_path = "/home/unitree/come-here/i_am_coming.wav"
 
@@ -88,11 +90,11 @@ def main():
         model_size="base.en",
         device="cpu",
         compute_type="int8",
-        mic_device="hw:0,0",
+        mic_device=None,  # auto-detect ReSpeaker (card number changes on replug)
         mic_channels=6,
         mic_beam_channel=1,
-        mic_gain=4.0,
-        window_duration_s=1.0,
+        mic_gain=25.0,
+        window_duration_s=1.5,
         hop_duration_ms=1000,
         end_silence_ms=200,
         energy_threshold=0.001,
@@ -110,9 +112,11 @@ def main():
         t_match = time.monotonic()
         print(f"[WAKE] Heard: '{detection.phrase}' (conf={detection.confidence:.2f})")
 
-        # Latch DOA from continuous polling
+        # Get DOA: try latched (median of recent VAD samples), fall back to single-shot
         t_doa_start = time.monotonic()
-        direction = doa.get_latched_direction(window_s=1.0)
+        direction = doa.get_latched_direction(window_s=3.0)
+        if direction is None:
+            direction = doa.get_direction()  # single-shot fallback
         t_doa_latch = time.monotonic()
 
         if direction is None:
@@ -151,6 +155,17 @@ def main():
     detector.set_on_detection(on_wake)
     detector.setup()
 
+    # Configure ReSpeaker AGC AFTER audio stream is open (resets on USB replug)
+    try:
+        import subprocess
+        subprocess.run(["python3", "/home/unitree/usb_4_mic_array/tuning.py", "AGCMAXGAIN", "1000"],
+                       capture_output=True, timeout=5)
+        subprocess.run(["python3", "/home/unitree/usb_4_mic_array/tuning.py", "AGCONOFF", "1"],
+                       capture_output=True, timeout=5)
+        print("ReSpeaker AGC configured.")
+    except Exception:
+        pass
+
     print("")
     print("========================================")
     print("  COME HERE DEMO (streaming)")
@@ -168,22 +183,29 @@ def main():
             if state["mode"] == "ROTATING":
                 elapsed = time.time() - state["rotate_start"]
                 target_az = state["target_az"]
-                duration = max(0.5, min(abs(target_az) / 0.5, 5.0))
+                target_deg = abs(math.degrees(target_az))
+                # Sport API: big deadzone, needs z>=1.5 to move
+                # z=1.5@20ms did ~240 deg/s
+                cmd_z = 2.0
+                deg_per_sec = 300.0
+                duration = max(0.15, min(target_deg / deg_per_sec, 3.0))
                 if elapsed < duration:
-                    vyaw = 0.5 if target_az > 0 else -0.5
-                    sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": vyaw}))
+                    sign = 1.0 if target_az > 0 else -1.0
+                    sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": cmd_z * sign}))
                 else:
                     sport_pub.publish(make_req(1003))
-                    print("[DONE] Rotation complete! Say 'come here' again.")
+                    deg = math.degrees(target_az)
+                    print(f"[DONE] Rotated {deg:+.0f} deg in {elapsed:.1f}s. Say 'come here' again.")
                     print("")
                     state["mode"] = "IDLE"
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping robot...")
+        vel_pub.publish(Twist())  # stop rotation
         sport_pub.publish(make_req(1003))
         time.sleep(0.3)
 

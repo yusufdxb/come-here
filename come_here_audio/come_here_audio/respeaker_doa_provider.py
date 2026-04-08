@@ -32,6 +32,10 @@ _REG_VOICEACTIVITY = (19, 32)  # (id=19, offset=32), int, 0 or 1
 
 _CTRL_TIMEOUT = 100000  # microseconds
 
+# AGC register addresses (from tuning.py PARAMETERS table)
+_REG_AGCONOFF = (19, 0)       # AGC enable: 0=off, 1=on
+_REG_AGCMAXGAIN = (19, 4)     # AGC max gain: 0-1000
+
 
 def _read_register(dev, reg_id: int, offset: int, is_int: bool = True):
     """Read a single register from the XMOS via USB control transfer."""
@@ -44,6 +48,16 @@ def _read_register(dev, reg_id: int, offset: int, is_int: bool = True):
     )
     result = struct.unpack(b'ii', response.tobytes())
     return result[0] if is_int else result[0] * (2.0 ** result[1])
+
+
+def _write_register(dev, reg_id: int, offset: int, value: int) -> None:
+    """Write an integer register to the XMOS via USB control transfer."""
+    cmd = offset | 0x40
+    data = struct.pack(b'ii', value, 0)
+    dev.ctrl_transfer(
+        usb.util.CTRL_OUT | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
+        0, cmd, reg_id, data, _CTRL_TIMEOUT,
+    )
 
 
 class ReSpeakerDOAProvider(AudioDirectionProvider):
@@ -139,74 +153,37 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
 
             time.sleep(self._poll_interval)
 
-    def get_latched_direction(
-        self,
-        window_s: float = 1.0,
-        min_samples: int = 3,
-        agreement_thresh_rad: float = 0.35,  # ~20 degrees
-    ) -> Optional[DirectionEstimate]:
-        """Return the median DOA from VAD-active samples, with outlier rejection.
+    def get_latched_direction(self, window_s: float = 1.0) -> Optional[DirectionEstimate]:
+        """Return the median DOA from recent samples in the last window_s seconds.
 
-        Uses iterative filtering: compute circular median, discard samples
-        farther than agreement_thresh_rad, recompute. Confidence reflects
-        how tightly the remaining samples agree.
+        Prefers VAD-active samples but falls back to all samples if no
+        VAD-active ones exist (the DOA register retains the last direction
+        even after voice activity ends).
 
-        Returns None if no VAD-active samples exist or if fewer than
-        min_samples agree on a direction.
-
-        Args:
-            window_s: Time window in seconds to consider.
-            min_samples: Minimum agreeing samples required to return a result.
-            agreement_thresh_rad: Max angular distance from median to keep a sample.
+        Returns None only if no samples exist at all.
         """
         now = time.monotonic()
         cutoff = now - window_s
 
-        # Collect VAD-active samples within the window
-        active_az = [
-            az for t, az, vad in self._samples
-            if vad and t >= cutoff
-        ]
+        # Try VAD-active samples first
+        active = [(t, az) for t, az, vad in self._samples if vad and t >= cutoff]
 
-        if len(active_az) < min_samples:
+        if len(active) >= 3:
+            azimuths = [az for _, az in active]
+            median_az = float(np.median(azimuths))
+            confidence = min(0.95, 0.6 + 0.05 * len(active))
+            return DirectionEstimate(azimuth_rad=median_az, confidence=confidence)
+
+        # Fall back: use ALL samples in window (DOA register holds last direction)
+        all_samples = [(t, az) for t, az, _vad in self._samples if t >= cutoff]
+
+        if not all_samples:
             return None
 
-        # Circular median: convert to unit vectors, average, then atan2
-        def _circular_median(angles):
-            xs = [math.cos(a) for a in angles]
-            ys = [math.sin(a) for a in angles]
-            return math.atan2(np.median(ys), np.median(xs))
-
-        def _angular_distance(a, b):
-            """Shortest angular distance between two angles in radians."""
-            d = abs(a - b) % (2 * math.pi)
-            return min(d, 2 * math.pi - d)
-
-        # Iterative outlier rejection (2 passes)
-        remaining = list(active_az)
-        for _ in range(2):
-            if len(remaining) < min_samples:
-                return None
-            center = _circular_median(remaining)
-            remaining = [
-                a for a in remaining
-                if _angular_distance(a, center) <= agreement_thresh_rad
-            ]
-
-        if len(remaining) < min_samples:
-            return None
-
-        final_az = _circular_median(remaining)
-
-        # Confidence: fraction of original samples that survived filtering
-        survival_ratio = len(remaining) / len(active_az)
-        # Spread: mean angular distance from center (lower = more confident)
-        spread = np.mean([_angular_distance(a, final_az) for a in remaining])
-        # Combine: high survival + low spread = high confidence
-        confidence = min(0.95, survival_ratio * (1.0 - spread / agreement_thresh_rad))
-        confidence = max(0.3, confidence)
-
-        return DirectionEstimate(azimuth_rad=final_az, confidence=confidence)
+        # Use the most recent sample
+        _, az = all_samples[-1]
+        confidence = 0.4 if not active else 0.6
+        return DirectionEstimate(azimuth_rad=az, confidence=confidence)
 
     def teardown(self) -> None:
         self._polling = False
