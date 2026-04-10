@@ -1,14 +1,29 @@
-"""Full demo: hear 'come here' -> say 'I am coming' -> rotate toward speaker."""
-import sys, os, time, math, functools, threading, queue, base64
+"""Full demo: hear 'come here' -> say 'I am coming' -> rotate toward speaker.
+
+Uses streaming WhisperPhraseDetector with event-driven detection callback.
+Critical path: speech_end -> inference -> callback -> rotate_pub
+Acknowledgment playback is fire-and-forget (off critical path).
+"""
+import sys
+import os
+import time
+import math
+import functools
+import threading
+import base64
+
 sys.path.insert(0, "/home/unitree/come-here/come_here_audio")
 
 import rclpy
 from rclpy.node import Node
 from unitree_api.msg import Request
-import json, datetime, random
-import numpy as np
-import sounddevice as sd
-from faster_whisper import WhisperModel
+from geometry_msgs.msg import Twist
+import json
+import datetime
+import random
+
+from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
+from come_here_audio.wake_phrase_detector import PhraseDetection
 from come_here_audio.respeaker_doa_provider import ReSpeakerDOAProvider
 
 print = functools.partial(print, flush=True)
@@ -50,57 +65,111 @@ def play_wav_on_robot(node, pub, wav_path):
     rclpy.spin_once(node, timeout_sec=0.05)
 
 
-# Whisper background thread
-detection_q = queue.Queue()
-
-def whisper_thread(model):
-    while True:
-        try:
-            audio = sd.rec(int(3 * 16000), samplerate=16000, channels=6, dtype="float32", device="hw:0,0")
-            sd.wait()
-            ch = audio[:, 1].flatten()
-            ch = np.clip(ch * 10.0, -1.0, 1.0)
-            if np.max(np.abs(ch)) < 0.02:
-                continue
-            segs, info = model.transcribe(ch, beam_size=1, language="en")
-            for s in segs:
-                if s.no_speech_prob > 0.5:
-                    continue
-                if "come here" in s.text.strip().lower():
-                    detection_q.put(s.text.strip())
-        except Exception:
-            time.sleep(1)
-
-
 def main():
-    print("Loading Whisper...")
-    model_path = "/home/unitree/come-here/models/faster-whisper-base.en/models--Systran--faster-whisper-base.en/snapshots/3d3d5dee26484f91867d81cb899cfcf72b96be6c"
-    model = WhisperModel(model_path, device="cpu", compute_type="int8")
-
-    print("Starting DOA...")
-    doa = ReSpeakerDOAProvider(frame_offset_deg=29.0)
-    doa.setup()
-
-    print("Starting Whisper listener...")
-    t = threading.Thread(target=whisper_thread, args=(model,), daemon=True)
-    t.start()
-
+    # --- ROS setup ---
     print("Init ROS...")
     rclpy.init()
     node = rclpy.create_node('come_here_demo')
     sport_pub = node.create_publisher(Request, '/api/sport/request', 10)
     audio_pub = node.create_publisher(Request, '/api/audiohub/request', 10)
+    vel_pub = node.create_publisher(Twist, '/cmd_vel', 10)
 
     wav_path = "/home/unitree/come-here/i_am_coming.wav"
 
-    state = "IDLE"
-    target_az = 0.0
-    rotate_start = 0.0
-    last_doa = None
+    # --- DOA setup (continuous polling) ---
+    print("Starting DOA (continuous 30Hz)...")
+    doa = ReSpeakerDOAProvider(frame_offset_deg=29.0)
+    doa.setup()
+    doa.start_continuous(poll_rate_hz=30.0)
+
+    # --- Whisper setup (streaming) ---
+    # Use base.en on CPU (CUDA unavailable on this Jetson)
+    model_path = "/home/unitree/come-here/models/faster-whisper-base.en/models--Systran--faster-whisper-base.en/snapshots/3d3d5dee26484f91867d81cb899cfcf72b96be6c"
+    print("Loading Whisper (base.en / cpu / int8, streaming)...")
+    detector = WhisperPhraseDetector(
+        model_size="base.en",
+        device="cpu",
+        compute_type="int8",
+        mic_device=None,  # auto-detect ReSpeaker (card number changes on replug)
+        mic_channels=6,
+        mic_beam_channel=1,
+        mic_gain=25.0,
+        window_duration_s=1.5,
+        hop_duration_ms=1000,
+        end_silence_ms=200,
+        energy_threshold=0.001,
+    )
+
+    # State shared with callback
+    state = {"mode": "IDLE", "target_az": 0.0, "rotate_start": 0.0}
+    latency_log = []
+
+    def on_wake(detection: PhraseDetection, t_speech_end: float):
+        """Event-driven callback: fires immediately when 'come here' detected."""
+        if state["mode"] != "IDLE":
+            return
+
+        t_match = time.monotonic()
+        print(f"[WAKE] Heard: '{detection.phrase}' (conf={detection.confidence:.2f})")
+
+        # Get DOA: try latched (median of recent VAD samples), fall back to single-shot
+        t_doa_start = time.monotonic()
+        direction = doa.get_latched_direction(window_s=3.0)
+        if direction is None:
+            direction = doa.get_direction()  # single-shot fallback
+        t_doa_latch = time.monotonic()
+
+        if direction is None:
+            print("[WARN] No DOA available, staying IDLE.")
+            return
+
+        target_az = direction.azimuth_rad
+        deg = math.degrees(target_az)
+        print(f"[TURN] DOA: {deg:+.0f} deg (conf={direction.confidence:.2f}), rotating...")
+
+        # Publish rotation IMMEDIATELY (critical path)
+        state["mode"] = "ROTATING"
+        state["target_az"] = target_az
+        state["rotate_start"] = time.time()
+        t_rotate_pub = time.monotonic()
+
+        # Log latency
+        latency = {
+            "speech_end_to_rotate": t_rotate_pub - t_speech_end,
+            "infer_to_match": t_match - t_speech_end,  # includes segmenter + inference
+            "doa_latch": t_doa_latch - t_doa_start,
+        }
+        latency_log.append(latency)
+        print(f"[LATENCY] speech_end->rotate_pub={latency['speech_end_to_rotate']:.4f}s "
+              f"infer={latency['infer_to_match']:.4f}s "
+              f"doa_latch={latency['doa_latch']:.4f}s")
+
+        # Fire-and-forget acknowledgment (OFF critical path)
+        def _play():
+            try:
+                play_wav_on_robot(node, audio_pub, wav_path)
+            except Exception:
+                pass
+        threading.Thread(target=_play, daemon=True).start()
+
+    detector.set_on_detection(on_wake)
+    detector.setup()
+
+    # Configure ReSpeaker AGC AFTER audio stream is open (resets on USB replug)
+    try:
+        import subprocess
+        subprocess.run(["python3", "/home/unitree/usb_4_mic_array/tuning.py", "AGCMAXGAIN", "1000"],
+                       capture_output=True, timeout=5)
+        subprocess.run(["python3", "/home/unitree/usb_4_mic_array/tuning.py", "AGCONOFF", "1"],
+                       capture_output=True, timeout=5)
+        print("ReSpeaker AGC configured.")
+    except Exception:
+        pass
 
     print("")
     print("========================================")
-    print("  COME HERE DEMO - Say 'come here'!")
+    print("  COME HERE DEMO (streaming)")
+    print("  Say 'come here'!")
     print("  Robot will respond and rotate to you.")
     print("  Running for 120 seconds.")
     print("========================================")
@@ -111,53 +180,45 @@ def main():
         while time.time() - start < 120:
             rclpy.spin_once(node, timeout_sec=0.01)
 
-            d = doa.get_direction()
-            if d:
-                last_doa = d
-
-            if state == "IDLE":
-                try:
-                    txt = detection_q.get_nowait()
-                    print("[WAKE] Heard: '%s'" % txt)
-
-                    # Say "I am coming"
-                    print("[SPEAK] Playing 'I am coming'...")
-                    play_wav_on_robot(node, audio_pub, wav_path)
-                    print("[SPEAK] Done.")
-
-                    # Rotate toward speaker
-                    if last_doa:
-                        target_az = last_doa.azimuth_rad
-                        deg = math.degrees(target_az)
-                        print("[TURN] DOA: %+.0f deg, rotating..." % deg)
-                        state = "ROTATING"
-                        rotate_start = time.time()
-                    else:
-                        print("[WARN] No DOA available, back to listening.")
-                except queue.Empty:
-                    pass
-
-            elif state == "ROTATING":
-                elapsed = time.time() - rotate_start
-                duration = max(0.5, min(abs(target_az) / 0.5, 5.0))
+            if state["mode"] == "ROTATING":
+                elapsed = time.time() - state["rotate_start"]
+                target_az = state["target_az"]
+                target_deg = abs(math.degrees(target_az))
+                # Sport API: big deadzone, needs z>=1.5 to move
+                cmd_z = 3.0
+                deg_per_sec = 200.0
+                duration = max(0.2, min(target_deg / deg_per_sec, 4.0))
                 if elapsed < duration:
-                    vyaw = 0.5 if target_az > 0 else -0.5
-                    sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": vyaw}))
+                    sign = 1.0 if target_az > 0 else -1.0
+                    sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": cmd_z * sign}))
                 else:
                     sport_pub.publish(make_req(1003))
-                    print("[DONE] Rotation complete! Say 'come here' again.")
+                    deg = math.degrees(target_az)
+                    print(f"[DONE] Rotated {deg:+.0f} deg in {elapsed:.1f}s. Say 'come here' again.")
                     print("")
-                    state = "IDLE"
-                    last_doa = None
+                    state["mode"] = "IDLE"
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping robot...")
+        vel_pub.publish(Twist())  # stop rotation
         sport_pub.publish(make_req(1003))
         time.sleep(0.3)
+
+        # Print latency summary
+        if latency_log:
+            vals = [l["speech_end_to_rotate"] for l in latency_log]
+            vals.sort()
+            p50 = vals[len(vals) // 2]
+            p95 = vals[int(len(vals) * 0.95)]
+            print(f"\n[LATENCY SUMMARY] {len(vals)} trials")
+            print(f"  speech_end->rotate_pub: p50={p50:.4f}s  p95={p95:.4f}s")
+            print(f"  min={min(vals):.4f}s  max={max(vals):.4f}s")
+
+        detector.teardown()
         doa.teardown()
         node.destroy_node()
         rclpy.shutdown()
