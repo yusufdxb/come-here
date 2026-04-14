@@ -82,22 +82,44 @@ def main():
     doa.setup()
     doa.start_continuous(poll_rate_hz=30.0)
 
+    # --- Find ReSpeaker device ---
+    # device=None selects PulseAudio "default" which returns silence.
+    # Must find ReSpeaker by name. Card number changes on every USB replug.
+    import sounddevice as sd
+    respeaker_dev = None
+    for i, dev in enumerate(sd.query_devices()):
+        if 'respeaker' in dev['name'].lower() and dev['max_input_channels'] >= 6:
+            respeaker_dev = i
+            break
+    if respeaker_dev is None:
+        print("[ERROR] ReSpeaker not found! Available devices:")
+        print(sd.query_devices())
+        sys.exit(1)
+    print(f"Found ReSpeaker at device index {respeaker_dev}")
+
     # --- Whisper setup (streaming) ---
-    # Use base.en on CPU (CUDA unavailable on this Jetson)
-    model_path = "/home/unitree/come-here/models/faster-whisper-base.en/models--Systran--faster-whisper-base.en/snapshots/3d3d5dee26484f91867d81cb899cfcf72b96be6c"
-    print("Loading Whisper (base.en / cpu / int8, streaming)...")
+    # Hardware VAD (ReSpeaker firmware) does NOT work when GO2 motors are
+    # running — motor noise overwhelms it, VAD stays permanently False.
+    # Instead, use hop=1000ms and let Whisper's own no_speech_prob filter
+    # motor noise. This was the proven working config from 2026-04-08.
+    print("Loading Whisper (base.en / cpu / int8, no VAD, hop=1000ms)...")
     detector = WhisperPhraseDetector(
         model_size="base.en",
         device="cpu",
         compute_type="int8",
-        mic_device=None,  # auto-detect ReSpeaker (card number changes on replug)
+        mic_device=respeaker_dev,
         mic_channels=6,
         mic_beam_channel=1,
-        mic_gain=25.0,
+        mic_gain=40.0,     # raw ch1 peaks ~0.03; at 25x range is ~1m, 40x extends to ~2-3m
         window_duration_s=1.5,
-        hop_duration_ms=1000,
+        hop_duration_ms=1000,  # 1s hop — limits inference rate, Whisper filters noise
         end_silence_ms=200,
         energy_threshold=0.001,
+        confidence_threshold=0.30,  # motor noise degrades logprobs; Whisper hears
+                                    # "come here" at 0.28-0.45 conf with motors on
+        no_speech_threshold=0.75,   # default 0.5 rejects real speech when motors are
+                                    # on (no_speech_prob inflated by motor noise)
+        vad_check_fn=None,  # disabled — firmware VAD dead with motors running
     )
 
     # State shared with callback
@@ -125,7 +147,13 @@ def main():
 
         target_az = direction.azimuth_rad
         deg = math.degrees(target_az)
-        print(f"[TURN] DOA: {deg:+.0f} deg (conf={direction.confidence:.2f}), rotating...")
+
+        # Minimum angle deadzone: skip rotation for tiny DOA (noise / already facing)
+        if abs(deg) < 8.0:
+            print(f"[SKIP] DOA {deg:+.0f}° below 8° deadzone, already facing speaker.")
+            return
+
+        print(f"[TURN] DOA: {deg:+.0f}° (conf={direction.confidence:.2f}), rotating...")
 
         # Publish rotation IMMEDIATELY (critical path)
         state["mode"] = "ROTATING"
@@ -171,30 +199,41 @@ def main():
     print("  COME HERE DEMO (streaming)")
     print("  Say 'come here'!")
     print("  Robot will respond and rotate to you.")
-    print("  Running for 120 seconds.")
+    print(f"  Calibration: DOA offset={29.0}°, "
+          f"mic_gain=40.0, conf>=0.30, no_speech<=0.75")
+    print(f"  Rotation: cmd_z=2.0, est 90°/s")
+    print("  Running for 300 seconds (Ctrl+C to stop).")
     print("========================================")
     print("")
 
     start = time.time()
     try:
-        while time.time() - start < 120:
+        while time.time() - start < 300:
             rclpy.spin_once(node, timeout_sec=0.01)
 
             if state["mode"] == "ROTATING":
                 elapsed = time.time() - state["rotate_start"]
                 target_az = state["target_az"]
                 target_deg = abs(math.degrees(target_az))
-                # Sport API: big deadzone, needs z>=1.5 to move
-                cmd_z = 3.0
-                deg_per_sec = 200.0
-                duration = max(0.2, min(target_deg / deg_per_sec, 4.0))
+                # --- Rotation calibration ---
+                # Sport API Move(x,y,z): z is yaw rate. GO2 needs z>=1.5 to move.
+                # cmd_z=2.0 gives smoother, more controllable rotation than 3.0.
+                # Measured ~90°/s at cmd_z=2.0 on GO2 (conservative estimate).
+                # If robot under-rotates: decrease deg_per_sec.
+                # If robot over-rotates: increase deg_per_sec.
+                cmd_z = 2.0
+                deg_per_sec = 90.0
+                duration = max(0.3, min(target_deg / deg_per_sec, 4.0))
                 if elapsed < duration:
                     sign = 1.0 if target_az > 0 else -1.0
                     sport_pub.publish(make_req(1008, {"x": 0.0, "y": 0.0, "z": cmd_z * sign}))
                 else:
                     sport_pub.publish(make_req(1003))
                     deg = math.degrees(target_az)
-                    print(f"[DONE] Rotated {deg:+.0f} deg in {elapsed:.1f}s. Say 'come here' again.")
+                    print(f"[DONE] Rotated {deg:+.0f}° in {elapsed:.1f}s "
+                          f"(cmd_z={cmd_z}, est {deg_per_sec}°/s, dur={duration:.2f}s)")
+                    print(f"       If under-rotated, decrease deg_per_sec. "
+                          f"If over-rotated, increase deg_per_sec.")
                     print("")
                     state["mode"] = "IDLE"
 
