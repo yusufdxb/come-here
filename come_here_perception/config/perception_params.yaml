@@ -2,3 +2,8 @@ perception_node:
   ros__parameters:
     use_mock: true
     publish_rate_hz: 10.0
+
+face_detector_node:
+  ros__parameters:
+    face_detector: mediapipe   # 'mediapipe' | 'mock'
+    min_confidence: 0.5

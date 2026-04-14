@@ -42,6 +42,13 @@ def generate_launch_description():
             output='screen',
         ),
         Node(
+            package='come_here_perception',
+            executable='face_detector_node',
+            name='face_detector_node',
+            parameters=[perception_params],
+            output='screen',
+        ),
+        Node(
             package='come_here_behavior',
             executable='behavior_node',
             name='behavior_node',

@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'perception_node = come_here_perception.perception_node:main',
+            'face_detector_node = come_here_perception.face_detector_node:main',
         ],
     },
 )

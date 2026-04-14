@@ -12,6 +12,7 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>come_here_msgs</depend>
 
   <test_depend>python3-pytest</test_depend>
 

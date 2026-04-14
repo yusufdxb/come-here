@@ -6,3 +6,10 @@ behavior_node:
     approach_stop_distance_m: 0.8
     search_timeout_s: 10.0
     approach_speed: 0.3
+    lost_timeout_s: 1.0
+    # SIT_AND_IDENTIFY sequence timing
+    sit_settle_s: 1.0
+    face_timeout_s: 1.5
+    speak_hold_s: 5.0
+    stand_settle_s: 0.5
+    speak_text: "I am here"
