@@ -1,122 +1,248 @@
 # come-here
 
-Audio-visual approach system for the Unitree GO2. The robot hears "come here," estimates the sound direction, rotates toward it, detects the speaker visually, and walks to them.
+An audio-visual approach system for the [Unitree GO2](https://www.unitree.com/go2) quadruped. The robot hears the phrase *"come here,"* estimates the speaker's direction from a microphone array, rotates toward them, locates them visually on the onboard camera, walks up, sits down in front of them, and says *"I am here."*
+
+The stack runs entirely on the Jetson Orin NX payload attached to the robot — no external compute, no network dependency at runtime.
+
+---
+
+## Behavior
+
+```
+you say "come here"
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────┐
+│  IDLE → LISTENING → TURN_TO_SOUND → SEARCH_FOR_PERSON       │
+│          → APPROACH_PERSON → SIT_AND_IDENTIFY → IDLE        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Per phase:
+
+| Phase | What happens |
+|---|---|
+| Wake | faster-whisper (base.en, int8) streams raw ReSpeaker channel 1, a 300 Hz highpass filter rejects motor rumble, and a 3 s cooldown suppresses duplicates. |
+| Direction | ReSpeaker firmware DOA is read over USB HID. A 3 s window of VAD-active samples is cleaned with IQR outlier rejection and collapsed to a circular median (handles wraparound at ±π). |
+| Rotate | Publishes `Move(0, 0, z)` to the GO2 Sport API at `cmd_z=2.0` (measured ~90°/s). Skipped if the DOA is already inside an 8° deadzone. |
+| Search | YOLO11n filters COCO class 0 (person). Bearing comes from bbox center + camera HFOV; distance comes from bbox height under a pinhole model with a 1.7 m person-height prior. |
+| Approach | Visual-servoing loop at 10 Hz: constant forward velocity with P-controlled yaw toward the person's bearing, stopping when the distance estimate crosses `approach_stop_distance_m`. Falls back to `SEARCH_FOR_PERSON` if the person is lost for more than `lost_timeout_s`. |
+| Sit + identify | Linear 4-substep sequence: sit (Sport API StandDown) → wait → fire a single MediaPipe face-detection inference on the latest frame → speak "I am here" via the GO2 audiohub API → wait → stand (Sport API BalanceStand) → return to IDLE. Face detection is informational in the MVP, not gating. |
+
+---
 
 ## Architecture
 
 ```
-                    +-----------+
-                    |  Behavior |
-                    |  (state   |
-                    |  machine) |
-                    +-----+-----+
-                     /    |    \
-                    v     v     v
-            cmd_rotate  cmd_move  state
-                    ^     ^
-                    |     |
-        +-----------+   +-------------+
-        |   Audio   |   | Perception  |
-        |   Node    |   |   Node      |
-        +-----------+   +-------------+
-        wake_phrase     person_detection
-        audio_direction
+    audio_node ───┐                 face_detector_node
+         │        │                         ▲
+         ▼        ▼                         │ request / result
+    /come_here/wake_phrase          /come_here/face_detect_request
+    /come_here/audio_direction      /come_here/face_detection
+         │        │                         │
+         └────────┴────────────┬────────────┘
+                               ▼
+                        behavior_node
+                     (state machine)
+                               │
+         ┌─────────────────────┼────────────────────────────┐
+         ▼                     ▼                            ▼
+  /come_here/cmd_rotate  /come_here/cmd_move     /come_here/cmd_{sit,stand,say}
+         │                     │                            │
+         └─────────────────────┴────────────────┬───────────┘
+                                                ▼
+                                  GO2 Sport API + audiohub bridge
 ```
+
+Three functional nodes (audio, perception + face detector, behavior) communicate over typed topics. The behavior node is authoritative — everything downstream consumes its commands.
 
 ### Packages
 
-| Package | Purpose |
-|---------|---------|
-| `come_here_msgs` | Message definitions (AudioDirection, PersonDetection, WakePhrase) |
-| `come_here_audio` | Audio direction estimation + wake phrase detection |
-| `come_here_perception` | Visual person detection and tracking |
-| `come_here_behavior` | State machine: IDLE -> LISTENING -> TURN_TO_SOUND -> SEARCH_FOR_PERSON -> APPROACH_PERSON -> STOP |
-| `come_here_bringup` | Launch files and combined configuration |
+| Package | Build | Role |
+|---|---|---|
+| `come_here_msgs` | `ament_cmake` | Typed messages: `AudioDirection`, `PersonDetection`, `WakePhrase`, `FaceDetection` |
+| `come_here_audio` | `ament_python` | ReSpeaker DOA provider, Whisper wake-phrase detector, audio ROS node, streaming ring buffer, LoRA-capable inference path |
+| `come_here_perception` | `ament_python` | YOLO11n person detector, MediaPipe face detector (on-demand), perception ROS node + face-detector ROS node |
+| `come_here_behavior` | `ament_python` | Finite state machine: approach controller, sit-and-identify sequencer, placeholder command publishers |
+| `come_here_bringup` | `ament_python` | Top-level launch file + combined parameter loading |
 
-### State Machine
+### Key abstractions
 
-```
-IDLE  --(wake phrase)--> LISTENING
-LISTENING --(direction confident)--> TURN_TO_SOUND
-TURN_TO_SOUND --(rotation issued)--> SEARCH_FOR_PERSON
-SEARCH_FOR_PERSON --(person found)--> APPROACH_PERSON
-SEARCH_FOR_PERSON --(timeout)--> IDLE
-APPROACH_PERSON --(close enough)--> STOP
-APPROACH_PERSON --(person lost)--> SEARCH_FOR_PERSON
-STOP --> IDLE
-```
+All sensor inputs are behind ABCs with mock and real implementations. This lets the full system run on a laptop with no hardware plugged in.
 
-### Key Abstractions
+- **`AudioDirectionProvider`** → `MockAudioProvider`, `ReSpeakerDOAProvider` (pyusb HID, DOAANGLE + VOICEACTIVITY registers)
+- **`WakePhraseDetector`** → `WhisperPhraseDetector` (faster-whisper CPU int8, optional HF + LoRA adapter, streaming segmenter + LatestOnlyQueue)
+- **`PersonDetector`** → `MockPersonDetector`, `YoloPersonDetector` (ultralytics YOLO11n, class 0 only)
+- **`FaceDetector`** → `MockFaceDetector`, `MediapipeFaceDetector` (MediaPipe short-range model, single-shot)
 
-- **`AudioDirectionProvider`** (`come_here_audio/audio_direction_provider.py`): ABC for sound source direction estimation. Swap in real mic hardware by subclassing this.
-- **`WakePhraseDetector`** (`come_here_audio/wake_phrase_detector.py`): ABC for wake phrase detection.
-  - **`WhisperPhraseDetector`** (`whisper_phrase_detector.py`): Real implementation using faster-whisper. Runs Whisper in a background thread on rolling audio chunks, triggers on "come here" in the transcript.
-- **`PersonDetector`** (`come_here_perception/person_detector.py`): ABC for visual person detection. Plug in YOLO, MediaPipe, etc.
+---
 
-All three have mock implementations for local development.
+## Hardware stack
 
-## Setup
+| Component | Part | Notes |
+|---|---|---|
+| Robot | Unitree GO2 EDU | Audio validated on EDU (not Pro or Air). Sport API over CycloneDDS. |
+| Compute | Jetson Orin NX 16 GB | 25 W profile. ROS 2 Humble on Ubuntu 22.04. |
+| Microphone | Seeed ReSpeaker Mic Array v2.0 (XMOS XVF-3000) | UAC1.0, 6-channel, 16 kHz. pyusb for HID control (AGC, DOA, VAD registers). |
+| Camera | GO2 front camera via videohub API | JPEG frames over DDS. H.264 path and WebRTC path are currently broken; videohub is the working source. |
+| Speaker | GO2 built-in (audiohub DDS API) | Base64-chunked WAV playback. Voice assets generated with edge-tts AriaNeural. |
 
-```bash
-# Source ROS 2
-source /opt/ros/humble/setup.bash
+---
 
-# Build
-cd /path/to/come-here
-colcon build --symlink-install
+## Messages and topics
 
-# Source workspace
-source install/setup.bash
+### Messages (`come_here_msgs`)
 
-# Launch (mock mode)
-ros2 launch come_here_bringup come_here.launch.py use_mock:=true
+| Msg | Purpose |
+|---|---|
+| `AudioDirection` | Sound source azimuth + confidence |
+| `WakePhrase` | Detected phrase + confidence |
+| `PersonDetection` | Bearing, distance, confidence, detected-flag |
+| `FaceDetection` | Presence, count, confidence, normalized centroid |
 
-# For Whisper wake phrase detection (requires faster-whisper + sounddevice):
-# pip install faster-whisper sounddevice numpy
-# Then set wake_detector param to 'whisper' in audio_params.yaml
-```
+### Topics
 
-### Testing Mock Trigger
+**Published by `audio_node`:**
+- `/come_here/wake_phrase` (`std_msgs/String`)
+- `/come_here/audio_direction` (`std_msgs/Float64MultiArray` — `[azimuth_rad, confidence]`)
 
-```bash
-# Simulate "come here" detection
-ros2 topic pub --once /come_here/mock_trigger std_msgs/Bool "data: true"
+**Published by `perception_node`:**
+- `/come_here/person_detection` (`std_msgs/Float64MultiArray` — `[bearing_rad, distance_m, confidence, detected]`)
 
-# Simulate person appearing
-ros2 topic pub --once /come_here/mock_person std_msgs/Bool "data: true"
+**Published by `face_detector_node`:**
+- `/come_here/face_detection` (`come_here_msgs/FaceDetection`)
 
-# Watch state transitions
-ros2 topic echo /come_here/state
-```
+**Published by `behavior_node`:**
+- `/come_here/state` — current state name
+- `/come_here/cmd_rotate` — target yaw angle (rad)
+- `/come_here/cmd_move` — forward velocity (m/s)
+- `/come_here/cmd_sit`, `cmd_stand` — Sport API triggers
+- `/come_here/cmd_say` — text for the audiohub bridge to vocalize
+- `/come_here/face_detect_request` — triggers a single face-detection inference
 
-### Unit Tests
+The Sport API and audiohub are wrapped by an external bridge (not in this repo) — the behavior node speaks through the placeholder topics above; the bridge translates them into `/api/sport/request` and `/api/audiohub/request` DDS messages.
 
-```bash
-cd come_here_audio && python -m pytest test/
-cd come_here_perception && python -m pytest test/
-cd come_here_behavior && python -m pytest test/
-```
+---
 
-## Assumptions
+## Build and run
+
+### Prerequisites
 
 - ROS 2 Humble on Ubuntu 22.04
-- Unitree GO2 robot (locomotion commands are stubs)
-- Microphone hardware is **unknown** -- the `AudioDirectionProvider` interface exists but no real implementation yet
-- Camera assumed available on the GO2 but perception node is stubbed
+- Python 3.10+
+- `colcon`, `rosdep`
+- Runtime deps (see `setup.sh`): `faster-whisper`, `sounddevice`, `numpy`, `mediapipe`, `ultralytics`, `scipy`, `opencv-python`
+- Training deps (optional): `transformers`, `peft`, `accelerate`, `datasets`, `torch`, `torchaudio`
 
-## Hardware-Dependent Work (Not Yet Implemented)
+### Build
 
-1. **Microphone array integration**: Need mic model to implement a real `AudioDirectionProvider` (GCC-PHAT, MUSIC, SRP-PHAT, etc.)
-2. **Wake phrase validation**: `WhisperPhraseDetector` is implemented but not yet tested on hardware. Needs validation with the actual mic and ambient noise conditions
-3. **Person detection model**: Need to integrate YOLO or equivalent with the GO2's camera and implement a real `PersonDetector`
-4. **GO2 locomotion bridge**: `cmd_rotate` and `cmd_move` topics are placeholders -- need to bridge to the Unitree SDK or `cmd_vel`
-5. **Message migration**: Switch from `std_msgs` placeholders to `come_here_msgs` custom messages after first `colcon build`
+```bash
+source /opt/ros/humble/setup.bash
+cd /path/to/come-here
+colcon build --symlink-install
+source install/setup.bash
+```
 
-## Next Steps When Microphone is Provided
+### Launch in mock mode (no hardware)
 
-1. Identify the mic's driver/SDK (e.g., ReSpeaker USB, XMOS, Matrix Voice)
-2. Create `come_here_audio/come_here_audio/real_audio_provider.py` subclassing `AudioDirectionProvider`
-3. Implement `setup()` with device init, `get_direction()` with the mic's DoA algorithm, `teardown()` with cleanup
-4. Add the provider to the `audio_node.py` selection logic (the `else` branch)
-5. Test with `use_mock:=false`
-6. Choose and integrate a wake phrase engine that works with the same mic input
+```bash
+ros2 launch come_here_bringup come_here.launch.py use_mock:=true
+ros2 topic echo /come_here/state
+
+# Drive the state machine from another terminal:
+ros2 topic pub --once /come_here/wake_phrase std_msgs/String 'data: "come here"'
+ros2 topic pub --once /come_here/audio_direction std_msgs/Float64MultiArray '{data: [0.5, 0.9]}'
+ros2 topic pub --once /come_here/person_detection std_msgs/Float64MultiArray '{data: [0.0, 1.5, 0.9, 1.0]}'
+ros2 topic pub --once /come_here/person_detection std_msgs/Float64MultiArray '{data: [0.0, 0.5, 0.9, 1.0]}'   # "close enough"
+```
+
+### Launch on the robot
+
+```bash
+ros2 launch come_here_bringup come_here.launch.py use_mock:=false
+```
+
+Expects the ReSpeaker on USB, the GO2 in `BalanceStand`, and motion_switcher in "normal" mode. The Sport API + audiohub bridge node must be running alongside (not shipped in this repo).
+
+### Run tests
+
+```bash
+cd come_here_audio        && python -m pytest test/
+cd come_here_perception   && python -m pytest test/
+cd come_here_behavior     && python -m pytest test/
+```
+
+---
+
+## Training
+
+`training/` contains a LoRA fine-tuning pipeline for the Whisper wake-phrase detector, in case ambient conditions need a domain-adapted model. None of this is required at runtime.
+
+```
+training/record_samples.py    # collect labeled positives / negatives
+training/finetune_whisper.py  # LoRA fine-tune on top of base.en
+training/evaluate.py          # accuracy + live mic eval vs baseline
+```
+
+The `WhisperPhraseDetector` class accepts an `adapter_path=` kwarg that points at a LoRA checkpoint and will load it through HF `peft`.
+
+---
+
+## Configuration
+
+Per-package YAML files under each package's `config/`:
+
+- `come_here_audio/config/audio_params.yaml` — mic device, channel, gain, Whisper model/device/compute_type, thresholds, VAD gating
+- `come_here_perception/config/perception_params.yaml` — person detector (mock/YOLO), model path, confidence; face detector (mock/MediaPipe), min confidence
+- `come_here_behavior/config/behavior_params.yaml` — tick rate, direction and person confidence thresholds, approach speed, stop distance, SIT_AND_IDENTIFY timing (`sit_settle_s`, `face_timeout_s`, `speak_hold_s`, `stand_settle_s`), spoken text
+
+All of these are overridable at launch time via `--ros-args --params-file`.
+
+---
+
+## Parameters worth knowing
+
+| Param | Default | Meaning |
+|---|---|---|
+| `approach_stop_distance_m` | 0.8 | Stop approach when estimated person distance falls below this |
+| `approach_speed` | 0.3 | Forward velocity during `APPROACH_PERSON`, m/s |
+| `lost_timeout_s` | 1.0 | How long to wait for a new detection before falling back to `SEARCH_FOR_PERSON` |
+| `sit_settle_s` | 1.0 | Dwell after StandDown before firing the face detector |
+| `face_timeout_s` | 1.5 | Max wait for a `FaceDetection` response |
+| `speak_hold_s` | 5.0 | Dwell while "I am here" plays |
+| `stand_settle_s` | 0.5 | Dwell after BalanceStand before returning to IDLE |
+
+---
+
+## Status
+
+| Subsystem | Hardware-validated |
+|---|---|
+| ReSpeaker DOA (circular median + IQR, 29° frame offset) | Yes |
+| Whisper wake-phrase (base.en CPU int8, highpass + cooldown + VAD-gate paths) | Yes |
+| GO2 Sport API rotation (`cmd_z=2.0` ≈ 90°/s) | Yes |
+| GO2 audiohub voice playback ("I am coming") | Yes |
+| End-to-end hear→rotate | Yes |
+| YOLO11n person detection via `/camera/image_raw` | Pending (implemented, bench script ready) |
+| MediaPipe face detection on GO2 frames | Pending (implemented, bench script ready) |
+| Approach controller + SIT_AND_IDENTIFY sequence | Pending (unit-tested, awaits Sport API bridge) |
+
+---
+
+## Known limits and follow-ups
+
+- **Detection range ~1 m.** Motor noise on the GO2 is structure-borne (mechanical vibration through the chassis), not airborne, so software filters cannot extend range. A physical vibration-isolation mount for the ReSpeaker is the remaining lever.
+- **Firmware VAD unusable while walking.** Motor noise pins `VOICEACTIVITY=0` permanently. A custom DOA path (GCC-PHAT on raw channels) is planned.
+- **No owner identification yet.** The current MVP detects that a face is present; it does not identify whose face. Face embeddings + an enrolled reference are the next scope bump.
+- **No depth-based stop.** Distance comes from a pinhole bbox-height estimate. Integrating the GO2's front ultrasonic is the next upgrade.
+- **`cmd_rotate`/`cmd_move`/`cmd_sit`/etc. are placeholder topics.** A Sport API + audiohub bridge node translates them onto `/api/sport/request` and `/api/audiohub/request`; it lives outside this repo in the user's Jetson setup.
+
+---
+
+## License
+
+MIT — see individual `package.xml` files.
+
+## Maintainer
+
+Yusuf Guenena · <yusuf.a.guenena@gmail.com>
