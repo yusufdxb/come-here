@@ -55,4 +55,11 @@ def generate_launch_description():
             parameters=[behavior_params],
             output='screen',
         ),
+        Node(
+            package='come_here_behavior',
+            executable='go2_bridge_node',
+            name='go2_bridge_node',
+            parameters=[behavior_params],
+            output='screen',
+        ),
     ])
