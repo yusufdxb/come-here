@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AudioDirection.msg"
   "msg/PersonDetection.msg"
   "msg/WakePhrase.msg"
+  "msg/FaceDetection.msg"
   DEPENDENCIES std_msgs
 )
 
