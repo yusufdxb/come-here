@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'behavior_node = come_here_behavior.behavior_node:main',
+            'go2_bridge_node = come_here_behavior.go2_bridge_node:main',
         ],
     },
 )

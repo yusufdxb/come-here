@@ -13,3 +13,16 @@ behavior_node:
     speak_hold_s: 5.0
     stand_settle_s: 0.5
     speak_text: "I am here"
+
+go2_bridge_node:
+  ros__parameters:
+    cmd_z: 2.0
+    deg_per_sec: 90.0
+    sit_api_id: 1005
+    stand_api_id: 1002
+    move_api_id: 1008
+    stop_move_api_id: 1003
+    move_control_rate_hz: 10.0
+    wav_dir: /home/unitree/come-here/come_here_audio/scripts
+    wav_chunk_size_bytes: 16384
+    wav_chunk_delay_s: 0.15
