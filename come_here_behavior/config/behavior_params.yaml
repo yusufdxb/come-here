@@ -18,7 +18,7 @@ go2_bridge_node:
   ros__parameters:
     cmd_z: 2.0
     deg_per_sec: 90.0
-    sit_api_id: 1005
+    sit_api_id: 1009   # Sit (haunches up, head up) — not 1005 StandDown (belly flat)
     stand_api_id: 1002
     move_api_id: 1008
     stop_move_api_id: 1003
