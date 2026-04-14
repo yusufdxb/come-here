@@ -12,3 +12,14 @@ training/output/
 .planning/
 CLAUDE.md
 AGENTS.md
+
+# Operator / workflow notes — local-only, not project code
+HOW_TO_RUN.md
+RUN_NOTES.md
+LAB_TEST.md
+JETSON_*.md
+SESSION_*.md
+TODO_*.md
+LATENCY_*.md
+*_PROMPT.md
+*_PROMPT.txt
