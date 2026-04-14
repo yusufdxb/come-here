@@ -153,8 +153,49 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
 
             time.sleep(self._poll_interval)
 
+    @staticmethod
+    def _circular_median(angles_rad: list[float]) -> float:
+        """Compute median of angles handling wraparound at ±π.
+
+        Rotates all angles so the circular mean is at 0, computes the
+        standard median, then rotates back. This avoids the ±π boundary
+        problem where np.median([-3.0, 3.0, -2.9]) gives 3.0 instead of ~-3.0.
+        """
+        arr = np.array(angles_rad)
+        # Circular mean as reference point
+        mean_angle = math.atan2(np.mean(np.sin(arr)), np.mean(np.cos(arr)))
+        # Shift angles relative to the mean, wrap to [-π, π]
+        shifted = np.arctan2(np.sin(arr - mean_angle), np.cos(arr - mean_angle))
+        median_shifted = float(np.median(shifted))
+        # Rotate back
+        result = mean_angle + median_shifted
+        # Wrap to [-π, π]
+        return float(np.arctan2(np.sin(result), np.cos(result)))
+
+    @staticmethod
+    def _reject_outliers_iqr(angles_rad: list[float], factor: float = 1.5) -> list[float]:
+        """Remove outlier angles using IQR on circular-shifted values.
+
+        Shifts angles so circular mean is at 0, applies standard IQR
+        outlier rejection, then returns the surviving original angles.
+        """
+        if len(angles_rad) < 4:
+            return angles_rad  # too few for IQR
+        arr = np.array(angles_rad)
+        mean_angle = math.atan2(np.mean(np.sin(arr)), np.mean(np.cos(arr)))
+        shifted = np.arctan2(np.sin(arr - mean_angle), np.cos(arr - mean_angle))
+        q1, q3 = np.percentile(shifted, [25, 75])
+        iqr = q3 - q1
+        lower = q1 - factor * iqr
+        upper = q3 + factor * iqr
+        mask = (shifted >= lower) & (shifted <= upper)
+        return [a for a, keep in zip(angles_rad, mask) if keep]
+
     def get_latched_direction(self, window_s: float = 1.0) -> Optional[DirectionEstimate]:
         """Return the median DOA from recent samples in the last window_s seconds.
+
+        Uses circular median (handles wraparound at ±π) and IQR-based
+        outlier rejection to filter spurious firmware DOA readings.
 
         Prefers VAD-active samples but falls back to all samples if no
         VAD-active ones exist (the DOA register retains the last direction
@@ -170,8 +211,15 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
 
         if len(active) >= 3:
             azimuths = [az for _, az in active]
-            median_az = float(np.median(azimuths))
-            confidence = min(0.95, 0.6 + 0.05 * len(active))
+            # Remove outliers, then compute circular median
+            cleaned = self._reject_outliers_iqr(azimuths)
+            if len(cleaned) < 2:
+                cleaned = azimuths  # outlier rejection too aggressive, use all
+            median_az = self._circular_median(cleaned)
+            confidence = min(0.95, 0.6 + 0.05 * len(cleaned))
+            print(f"[DOA] latched: {math.degrees(median_az):+.0f}° "
+                  f"from {len(cleaned)}/{len(active)} VAD samples "
+                  f"(conf={confidence:.2f}, window={window_s}s)")
             return DirectionEstimate(azimuth_rad=median_az, confidence=confidence)
 
         # Fall back: use ALL samples in window (DOA register holds last direction)
@@ -183,6 +231,9 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
         # Use the most recent sample
         _, az = all_samples[-1]
         confidence = 0.4 if not active else 0.6
+        n_active = len(active)
+        print(f"[DOA] fallback: {math.degrees(az):+.0f}° "
+              f"(only {n_active} VAD samples, using latest, conf={confidence:.2f})")
         return DirectionEstimate(azimuth_rad=az, confidence=confidence)
 
     def teardown(self) -> None:
