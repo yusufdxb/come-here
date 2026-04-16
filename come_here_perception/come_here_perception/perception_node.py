@@ -8,7 +8,6 @@ Subscribes:
   /come_here/mock_person       (std_msgs/Bool) - toggle mock person detection
 """
 
-import cv2
 import numpy as np
 
 import rclpy
@@ -18,7 +17,10 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float64MultiArray
 
 from come_here_perception.person_detector import MockPersonDetector, PersonDetector
-from come_here_perception.yolo_person_detector import YoloPersonDetector
+
+# YoloPersonDetector pulls in ultralytics (and OpenCV). It is imported lazily
+# inside the non-mock branch so mock-mode launches do not require those
+# packages to be installed.
 
 
 class PerceptionNode(Node):
@@ -37,6 +39,7 @@ class PerceptionNode(Node):
             self._detector: PersonDetector = MockPersonDetector()
             self.get_logger().info('Using MOCK person detector (no real camera)')
         else:
+            from come_here_perception.yolo_person_detector import YoloPersonDetector
             model_path = self.get_parameter('model_path').value
             confidence = self.get_parameter('confidence').value
             self._detector: PersonDetector = YoloPersonDetector(
@@ -71,11 +74,13 @@ class PerceptionNode(Node):
 
     def _on_image(self, msg: Image):
         """Convert ROS Image to numpy and feed to detector."""
+        # Only real detectors expose update_frame; mock mode never subscribes.
+        if not hasattr(self._detector, 'update_frame'):
+            return
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             msg.height, msg.width, 3
         )
-        if isinstance(self._detector, YoloPersonDetector):
-            self._detector.update_frame(frame)
+        self._detector.update_frame(frame)
 
     def _mock_person_cb(self, msg: Bool):
         if isinstance(self._detector, MockPersonDetector):
@@ -106,8 +111,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # A second SIGINT can land during teardown or during interpreter
+        # shutdown (e.g. threading._shutdown). Ignore it for the rest of the
+        # process so shutdown stays quiet.
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

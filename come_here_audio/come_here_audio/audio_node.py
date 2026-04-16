@@ -14,12 +14,14 @@ from std_msgs.msg import Bool, Header
 
 from come_here_audio.audio_direction_provider import AudioDirectionProvider
 from come_here_audio.mock_audio_provider import MockAudioProvider
-from come_here_audio.respeaker_doa_provider import ReSpeakerDOAProvider
 from come_here_audio.wake_phrase_detector import (
     MockWakePhraseDetector,
     WakePhraseDetector,
 )
-from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
+
+# Hardware-backed providers are imported lazily inside the non-mock branches so
+# mock-mode launches do not require pyusb / faster-whisper / mediapipe to be
+# installed.
 
 # TODO: Replace with real message imports after come_here_msgs is built
 # from come_here_msgs.msg import AudioDirection, WakePhrase
@@ -55,6 +57,7 @@ class AudioNode(Node):
             )
             self.get_logger().info('Using MOCK audio direction provider')
         else:
+            from come_here_audio.respeaker_doa_provider import ReSpeakerDOAProvider
             self._direction_provider = ReSpeakerDOAProvider(
                 frame_offset_deg=frame_offset
             )
@@ -66,6 +69,7 @@ class AudioNode(Node):
         self.declare_parameter('mic_beam_channel', 1)
 
         if wake_detector_type == 'whisper':
+            from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
             adapter_path = self.get_parameter('whisper_adapter_path').value
             adapter_path = adapter_path if adapter_path else None
             self._wake_detector: WakePhraseDetector = WhisperPhraseDetector(
@@ -144,8 +148,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # A second SIGINT can land during teardown or during interpreter
+        # shutdown (e.g. threading._shutdown). Ignore it for the rest of the
+        # process so shutdown stays quiet.
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

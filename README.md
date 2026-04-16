@@ -23,10 +23,10 @@ Per phase:
 | Phase | What happens |
 |---|---|
 | Wake | faster-whisper (base.en, int8) streams raw ReSpeaker channel 1, a 300 Hz highpass filter rejects motor rumble, and a 3 s cooldown suppresses duplicates. |
-| Direction | ReSpeaker firmware DOA is read over USB HID. A 3 s window of VAD-active samples is cleaned with IQR outlier rejection and collapsed to a circular median (handles wraparound at ±π). |
-| Rotate | Publishes `Move(0, 0, z)` to the GO2 Sport API at `cmd_z=2.0` (measured ~90°/s). Skipped if the DOA is already inside an 8° deadzone. |
+| Direction | ReSpeaker firmware DOA is read over USB HID. The ROS `audio_node` publishes single-shot VAD-gated samples at 10 Hz. A filtered path (3 s window, IQR outlier rejection, circular median at ±π) exists on `ReSpeakerDOAProvider.get_latched_direction` but is not yet wired into the publish loop. |
+| Rotate | The behavior node publishes the latest azimuth on `/come_here/cmd_rotate`. The bridge drives the GO2 Sport API with `Move(0, 0, cmd_z=2.0)` (~90°/s measured) for a duration proportional to the target angle. No deadzone — every rotation command is executed, so small angles still produce a short move. |
 | Search | YOLO11n filters COCO class 0 (person). Bearing comes from bbox center + camera HFOV; distance comes from bbox height under a pinhole model with a 1.7 m person-height prior. |
-| Approach | Visual-servoing loop at 10 Hz: constant forward velocity with P-controlled yaw toward the person's bearing, stopping when the distance estimate crosses `approach_stop_distance_m`. Falls back to `SEARCH_FOR_PERSON` if the person is lost for more than `lost_timeout_s`. |
+| Approach | 10 Hz visual-servoing loop: while the person is detected, republish the latest bearing on `/come_here/cmd_rotate` and a constant `approach_speed` on `/come_here/cmd_move`. Stops when the distance estimate crosses `approach_stop_distance_m`. Falls back to `SEARCH_FOR_PERSON` if the person is lost for more than `lost_timeout_s`. Yaw control is open-loop per tick — no proportional controller in the MVP. |
 | Sit + identify | Linear 4-substep sequence: sit (Sport API StandDown) → wait → fire a single MediaPipe face-detection inference on the latest frame → speak "I am here" via the GO2 audiohub API → wait → stand (Sport API BalanceStand) → return to IDLE. Face detection is informational in the MVP, not gating. |
 
 ---
@@ -120,7 +120,7 @@ All sensor inputs are behind ABCs with mock and real implementations. This lets 
 - `/come_here/cmd_say` — text for the audiohub bridge to vocalize
 - `/come_here/face_detect_request` — triggers a single face-detection inference
 
-The Sport API and audiohub are wrapped by an external bridge (not in this repo) — the behavior node speaks through the placeholder topics above; the bridge translates them into `/api/sport/request` and `/api/audiohub/request` DDS messages.
+The Sport API and audiohub are wrapped by `go2_bridge_node` (in this repo, under `come_here_behavior/`). The behavior node speaks through the placeholder topics above; the bridge translates them into `/api/sport/request` and `/api/audiohub/request` DDS messages. The bridge is launched automatically when `use_mock:=false` and skipped in mock mode, so `unitree_api` is only required on the robot.
 
 ---
 
@@ -145,6 +145,10 @@ source install/setup.bash
 
 ### Launch in mock mode (no hardware)
 
+Mock mode skips `go2_bridge_node` (so `unitree_api` is not required) and
+forces every sensor provider to its mock implementation (so `pyusb`,
+`faster-whisper`, `ultralytics`, and `mediapipe` are not required either).
+
 ```bash
 ros2 launch come_here_bringup come_here.launch.py use_mock:=true
 ros2 topic echo /come_here/state
@@ -162,15 +166,31 @@ ros2 topic pub --once /come_here/person_detection std_msgs/Float64MultiArray '{d
 ros2 launch come_here_bringup come_here.launch.py use_mock:=false
 ```
 
-Expects the ReSpeaker on USB, the GO2 in `BalanceStand`, and motion_switcher in "normal" mode. The Sport API + audiohub bridge node must be running alongside (not shipped in this repo).
+Expects the ReSpeaker on USB, the GO2 in `BalanceStand`, and motion_switcher in "normal" mode. The launch file starts `go2_bridge_node` automatically in this mode, so the `unitree_api` ROS package must be installed on the Jetson and the GO2 DDS stack must be reachable.
 
 ### Run tests
 
+The behavior and perception packages depend on generated `come_here_msgs`
+headers, so you must build and source the workspace first:
+
 ```bash
-cd come_here_audio        && python -m pytest test/
-cd come_here_perception   && python -m pytest test/
-cd come_here_behavior     && python -m pytest test/
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select come_here_msgs
+source install/setup.bash
+# Then build the rest if you have not already:
+colcon build --symlink-install
+source install/setup.bash
+
+# Per-package tests (run from each package's own directory):
+( cd come_here_audio       && python3 -m pytest test/ )
+( cd come_here_perception  && python3 -m pytest test/ )
+( cd come_here_behavior    && python3 -m pytest test/ )
+( cd come_here_bringup     && python3 -m pytest test/ )
 ```
+
+Running `pytest` across multiple `test/` directories from the workspace
+root fails under ROS 2's pytest plugins because of duplicate module names.
+Always invoke pytest from inside one package at a time.
 
 ---
 
@@ -218,14 +238,14 @@ All of these are overridable at launch time via `--ros-args --params-file`.
 
 | Subsystem | Hardware-validated |
 |---|---|
-| ReSpeaker DOA (circular median + IQR, 29° frame offset) | Yes |
+| ReSpeaker DOA over USB HID (29° frame offset, raw VAD-gated path wired into `audio_node`; filtered circular-median + IQR path exists in `ReSpeakerDOAProvider.get_latched_direction` but is not yet used at runtime) | Yes, raw path |
 | Whisper wake-phrase (base.en CPU int8, highpass + cooldown + VAD-gate paths) | Yes |
 | GO2 Sport API rotation (`cmd_z=2.0` ≈ 90°/s) | Yes |
 | GO2 audiohub voice playback ("I am coming") | Yes |
 | End-to-end hear→rotate | Yes |
 | YOLO11n person detection via `/camera/image_raw` | Pending (implemented, bench script ready) |
 | MediaPipe face detection on GO2 frames | Pending (implemented, bench script ready) |
-| Approach controller + SIT_AND_IDENTIFY sequence | Pending (unit-tested, awaits Sport API bridge) |
+| Approach controller + SIT_AND_IDENTIFY sequence | Pending (unit-tested; `go2_bridge_node` in-repo, hardware-side execution not yet validated end-to-end) |
 
 ---
 
@@ -235,7 +255,7 @@ All of these are overridable at launch time via `--ros-args --params-file`.
 - **Firmware VAD unusable while walking.** Motor noise pins `VOICEACTIVITY=0` permanently. A custom DOA path (GCC-PHAT on raw channels) is planned.
 - **No owner identification yet.** The current MVP detects that a face is present; it does not identify whose face. Face embeddings + an enrolled reference are the next scope bump.
 - **No depth-based stop.** Distance comes from a pinhole bbox-height estimate. Integrating the GO2's front ultrasonic is the next upgrade.
-- **`cmd_rotate`/`cmd_move`/`cmd_sit`/etc. are placeholder topics.** A Sport API + audiohub bridge node translates them onto `/api/sport/request` and `/api/audiohub/request`; it lives outside this repo in the user's Jetson setup.
+- **`cmd_rotate`/`cmd_move`/`cmd_sit`/etc. are placeholder topics.** `come_here_behavior/go2_bridge_node.py` in this repo translates them onto `/api/sport/request` and `/api/audiohub/request`. It is launched only when `use_mock:=false`, so mock development does not need `unitree_api` or the GO2 DDS stack.
 
 ---
 
