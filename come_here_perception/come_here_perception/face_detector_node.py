@@ -38,10 +38,12 @@ class FaceDetectorNode(Node):
     def __init__(self):
         super().__init__('face_detector_node')
 
+        self.declare_parameter('use_mock', False)
         self.declare_parameter('face_detector', 'mediapipe')  # 'mediapipe' | 'mock'
         self.declare_parameter('min_confidence', 0.5)
 
-        impl = self.get_parameter('face_detector').value
+        use_mock = bool(self.get_parameter('use_mock').value)
+        impl = 'mock' if use_mock else self.get_parameter('face_detector').value
         min_conf = self.get_parameter('min_confidence').value
 
         self._detector: FaceDetector = self._build_detector(impl, min_conf)
@@ -124,8 +126,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # A second SIGINT can land during teardown or during interpreter
+        # shutdown (e.g. threading._shutdown). Ignore it for the rest of the
+        # process so shutdown stays quiet.
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

@@ -308,8 +308,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # A second SIGINT can land during teardown or during interpreter
+        # shutdown (e.g. threading._shutdown). Ignore it for the rest of the
+        # process so shutdown stays quiet.
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':
