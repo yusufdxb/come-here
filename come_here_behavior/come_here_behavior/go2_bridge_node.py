@@ -34,7 +34,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from unitree_api.msg import Request
 
 
@@ -124,6 +124,9 @@ class Go2BridgeNode(Node):
         )
         self.create_subscription(
             String, '/come_here/cmd_say', self._say_cb, 10
+        )
+        self.create_subscription(
+            Float64MultiArray, '/come_here/cmd_velocity', self._velocity_cb, 10
         )
 
         # Forward-velocity control timer
@@ -221,6 +224,32 @@ class Go2BridgeNode(Node):
             if not self._last_was_zero:
                 self._sport_pub.publish(make_req(self._stop_move_api_id))
                 self._last_was_zero = True
+
+    # -- cmd_velocity (unified forward + yaw for smooth approach) --
+
+    def _velocity_cb(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 2:
+            return
+        vx: float = float(msg.data[0])
+        yaw_rate: float = float(msg.data[1])
+
+        # Preempt any in-flight rotation worker (from TURN_TO_SOUND) so its
+        # Move(0, 0, z) publishes don't fight our unified command.
+        with self._rotate_lock:
+            self._rotate_generation += 1
+            self._rotate_cancel.set()
+            self._rotate_cancel = threading.Event()
+
+        if abs(vx) < 1e-3 and abs(yaw_rate) < 1e-3:
+            if not self._last_was_zero:
+                self._sport_pub.publish(make_req(self._stop_move_api_id))
+                self._last_was_zero = True
+            return
+
+        self._sport_pub.publish(
+            make_req(self._move_api_id, {'x': vx, 'y': 0.0, 'z': yaw_rate})
+        )
+        self._last_was_zero = False
 
     # -- cmd_sit / cmd_stand --
 

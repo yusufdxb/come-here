@@ -106,6 +106,9 @@ class BehaviorNode(Node):
         # -- Publishers --
         self._rotate_pub = self.create_publisher(Float64, '/come_here/cmd_rotate', 10)
         self._move_pub = self.create_publisher(Float64, '/come_here/cmd_move', 10)
+        self._velocity_pub = self.create_publisher(
+            Float64MultiArray, '/come_here/cmd_velocity', 10
+        )
         self._sit_pub = self.create_publisher(Bool, '/come_here/cmd_sit', 10)
         self._stand_pub = self.create_publisher(Bool, '/come_here/cmd_stand', 10)
         self._say_pub = self.create_publisher(String, '/come_here/cmd_say', 10)
@@ -212,14 +215,13 @@ class BehaviorNode(Node):
             self._enter_sit_sequence()
             return
 
-        # Visual-servoing command: rotate toward bearing, move forward at fixed speed.
-        rotate_msg = Float64()
-        rotate_msg.data = self._person_bearing
-        self._rotate_pub.publish(rotate_msg)
-
-        move_msg = Float64()
-        move_msg.data = self._approach_speed
-        self._move_pub.publish(move_msg)
+        # Visual-servoing: single unified Move(vx, 0, yaw_rate) via cmd_velocity.
+        # Prior scheme (cmd_rotate + cmd_move at 10 Hz) spun in place because bridge
+        # rotation-worker and move-tick published conflicting Move commands.
+        yaw_rate = max(-1.0, min(1.0, 1.0 * self._person_bearing))
+        vel_msg = Float64MultiArray()
+        vel_msg.data = [self._approach_speed, yaw_rate]
+        self._velocity_pub.publish(vel_msg)
 
     # -- SIT_AND_IDENTIFY sequence --
 

@@ -8,3 +8,5 @@ audio_node:
     whisper_device: cuda                   # 'cpu' or 'cuda'
     whisper_chunk_duration_s: 2.0
     whisper_adapter_path: ''       # path to LoRA adapter (empty = use base model)
+    mic_device: 'ReSpeaker'        # sounddevice name substring; ReSpeaker ch0-3 raw + ch4-5 processed
+    mic_channels: 6
