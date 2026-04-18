@@ -8,5 +8,6 @@ audio_node:
     whisper_device: cuda                   # 'cpu' or 'cuda'
     whisper_chunk_duration_s: 2.0
     whisper_adapter_path: ''       # path to LoRA adapter (empty = use base model)
-    mic_device: 'ReSpeaker'        # sounddevice name substring; ReSpeaker ch0-3 raw + ch4-5 processed
-    mic_channels: 6
+    mic_device: 'ReSpeaker'        # sounddevice name substring
+    mic_channels: 1                # open mono — gets ReSpeaker DSP ch 0 (beamformer+AEC+AGC+NS)
+    mic_beam_channel: 0            # index within the opened stream
