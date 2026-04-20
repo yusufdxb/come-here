@@ -1,11 +1,11 @@
 audio_node:
   ros__parameters:
     use_mock: true
-    wake_detector: mock        # 'mock' or 'whisper'
+    wake_detector: whisper     # 'mock' or 'whisper'
     publish_rate_hz: 10.0
     mock_azimuth_rad: 0.0
     whisper_model_size: base.en            # tiny.en, base.en, small.en, medium.en
-    whisper_device: cuda                   # 'cpu' or 'cuda'
+    whisper_device: cpu                    # 'cpu' or 'cuda' — demo uses cpu/int8
     whisper_chunk_duration_s: 2.0
     whisper_adapter_path: ''       # path to LoRA adapter (empty = use base model)
     mic_device: 'ReSpeaker'        # sounddevice name substring

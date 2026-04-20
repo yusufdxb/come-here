@@ -78,7 +78,6 @@ class AudioNode(Node):
             self._wake_detector: WakePhraseDetector = WhisperPhraseDetector(
                 model_size=self.get_parameter('whisper_model_size').value,
                 device=self.get_parameter('whisper_device').value,
-                chunk_duration_s=self.get_parameter('whisper_chunk_duration_s').value,
                 adapter_path=adapter_path,
                 mic_device=self.get_parameter('mic_device').value,
                 mic_channels=self.get_parameter('mic_channels').value,
