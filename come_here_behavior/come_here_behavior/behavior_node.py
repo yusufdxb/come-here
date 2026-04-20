@@ -59,6 +59,10 @@ class BehaviorNode(Node):
         self.declare_parameter('speak_hold_s', 5.0)
         self.declare_parameter('stand_settle_s', 0.5)
         self.declare_parameter('speak_text', 'I am here')
+        self.declare_parameter('wake_speak_text', 'I am coming')
+        self.declare_parameter('approach_align_threshold_rad', 0.26)
+        self.declare_parameter('approach_ccw_yaw', 1.0)
+        self.declare_parameter('approach_cw_yaw', 1.2)
 
         self._dir_threshold = self.get_parameter('direction_confidence_threshold').value
         self._person_threshold = self.get_parameter('person_confidence_threshold').value
@@ -71,6 +75,12 @@ class BehaviorNode(Node):
         self._speak_hold_s = self.get_parameter('speak_hold_s').value
         self._stand_settle_s = self.get_parameter('stand_settle_s').value
         self._speak_text = self.get_parameter('speak_text').value
+        self._wake_speak_text = self.get_parameter('wake_speak_text').value
+        self._approach_align_threshold = self.get_parameter(
+            'approach_align_threshold_rad'
+        ).value
+        self._approach_ccw_yaw = self.get_parameter('approach_ccw_yaw').value
+        self._approach_cw_yaw = self.get_parameter('approach_cw_yaw').value
 
         # -- Runtime state --
         self._state = State.IDLE
@@ -82,6 +92,14 @@ class BehaviorNode(Node):
         self._person_confidence = 0.0
         self._person_last_seen = None
         self._search_start_time = None
+
+        # APPROACH_PERSON sub-phase state (commit-phase, no per-tick switching).
+        # Phase is 'ALIGN' (rotate in place) or 'WALK' (forward only).
+        # min_phase_s is the minimum time we stay in a phase before re-evaluating.
+        self._approach_phase = 'ALIGN'
+        self._approach_phase_start = None
+        self._approach_min_align_s = 0.4
+        self._approach_min_walk_s = 1.5
 
         # SIT_AND_IDENTIFY sub-sequence state
         self._sit_substep = 0
@@ -126,6 +144,11 @@ class BehaviorNode(Node):
     def _wake_cb(self, msg: String):
         if self._state == State.IDLE:
             self.get_logger().info(f'Wake phrase received: "{msg.data}"')
+            if self._wake_speak_text:
+                say = String()
+                say.data = self._wake_speak_text
+                self._say_pub.publish(say)
+                self.get_logger().info(f'WAKE: saying "{self._wake_speak_text}"')
             self._transition(State.LISTENING)
 
     def _direction_cb(self, msg: Float64MultiArray):
@@ -215,12 +238,39 @@ class BehaviorNode(Node):
             self._enter_sit_sequence()
             return
 
-        # Visual-servoing: single unified Move(vx, 0, yaw_rate) via cmd_velocity.
-        # Prior scheme (cmd_rotate + cmd_move at 10 Hz) spun in place because bridge
-        # rotation-worker and move-tick published conflicting Move commands.
-        yaw_rate = max(-1.0, min(1.0, 1.0 * self._person_bearing))
+        # Commit-phase controller: mcf gait can't cleanly combine vx+yaw and
+        # needs a stable setpoint for ~1s+ to engage a clean trot. Publishing
+        # [vx, yaw] with vx flipping each tick (10 Hz) caused aggressive shake
+        # rather than locomotion. So: hold one axis per phase, for a minimum
+        # duration, before re-evaluating.
+        if self._approach_phase_start is None:
+            self._approach_phase_start = self.get_clock().now()
+        phase_elapsed = self._seconds_since(self._approach_phase_start)
+        bearing = self._person_bearing
         vel_msg = Float64MultiArray()
-        vel_msg.data = [self._approach_speed, yaw_rate]
+
+        if self._approach_phase == 'ALIGN':
+            if (abs(bearing) < self._approach_align_threshold
+                    and phase_elapsed >= self._approach_min_align_s):
+                self._approach_phase = 'WALK'
+                self._approach_phase_start = self.get_clock().now()
+                vel_msg.data = [self._approach_speed, 0.0]
+            else:
+                yaw_rate = self._approach_ccw_yaw if bearing > 0 else -self._approach_cw_yaw
+                vel_msg.data = [0.0, yaw_rate]
+        else:  # WALK
+            # Stay committed to WALK for at least min_walk_s, regardless of
+            # bearing jitter. Only re-align if we've walked the minimum and
+            # bearing is well outside the deadband.
+            if (phase_elapsed >= self._approach_min_walk_s
+                    and abs(bearing) > 2.0 * self._approach_align_threshold):
+                self._approach_phase = 'ALIGN'
+                self._approach_phase_start = self.get_clock().now()
+                yaw_rate = self._approach_ccw_yaw if bearing > 0 else -self._approach_cw_yaw
+                vel_msg.data = [0.0, yaw_rate]
+            else:
+                vel_msg.data = [self._approach_speed, 0.0]
+
         self._velocity_pub.publish(vel_msg)
 
     # -- SIT_AND_IDENTIFY sequence --
@@ -294,6 +344,9 @@ class BehaviorNode(Node):
         old = self._state.name
         self._state = new_state
         self.get_logger().info(f'State: {old} -> {new_state.name}')
+        if new_state == State.APPROACH_PERSON:
+            self._approach_phase = 'ALIGN'
+            self._approach_phase_start = None
 
     def _stop_motion(self):
         move_msg = Float64()
