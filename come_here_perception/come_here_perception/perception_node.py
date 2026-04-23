@@ -135,10 +135,44 @@ class PerceptionNode(Node):
 
     def _tick(self):
         result = self._detector.detect()
+        distance_m = result.distance_m
+
+        if result.detected and self._use_lidar_distance:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            cloud_age_s = now_s - self._latest_cloud_stamp_s
+            cloud_fresh = (
+                self._latest_cloud_xyz is not None
+                and cloud_age_s < self._lidar_max_age_s
+            )
+            if cloud_fresh:
+                refined = self._resolver.refine(
+                    bearing_rad=result.bearing_rad,
+                    cloud_xyz=self._latest_cloud_xyz,
+                )
+                if refined is not None:
+                    distance_m = refined
+                    if self._lidar_fallback_logged:
+                        self.get_logger().info(
+                            f'lidar distance recovered: {refined:.2f} m'
+                        )
+                        self._lidar_fallback_logged = False
+                elif not self._lidar_fallback_logged:
+                    self.get_logger().info(
+                        f'lidar gate failed (bearing={result.bearing_rad:.2f}) — '
+                        f'falling back to bbox distance {result.distance_m:.2f} m'
+                    )
+                    self._lidar_fallback_logged = True
+            elif not self._lidar_fallback_logged:
+                self.get_logger().info(
+                    f'no fresh cloud (age={cloud_age_s:.2f}s) — bbox distance '
+                    f'{result.distance_m:.2f} m'
+                )
+                self._lidar_fallback_logged = True
+
         msg = Float64MultiArray()
         msg.data = [
             result.bearing_rad,
-            result.distance_m,
+            distance_m,
             result.confidence,
             float(result.detected),
         ]
