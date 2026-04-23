@@ -134,3 +134,65 @@ For full revert: `git revert <commit>` on `lab/2026-04-16-approach-fix` — sing
 - TF-based camera→lidar fusion — current body-frame approach is sufficient without intrinsics.
 - Multi-person disambiguation via clustering — not needed for single-operator demo.
 - Merging `lab/2026-04-16-approach-fix` to `main` — blocked until both blockers resolved.
+
+## Hardware results 2026-04-23
+
+Operator stood toes on tape at 10/7/3 ft marks. Tape 0 at robot front bumper.
+Derived torso-from-LiDAR distance accounts for:
+- toes → torso body offset: ~0.20 m (body mass behind feet when standing)
+- bumper → LiDAR mount offset: ~0.25 m (L1 mounted on top/back of head)
+
+Per-distance steady-state samples (8–10 readings per pose, median shown):
+
+| Tape (toes) | Expected LiDAR-to-torso | LiDAR read | Bbox read | LiDAR err |
+|---|---|---|---|---|
+| 10 ft (3.05 m) | 3.50 m | **3.60 m** | 2.68 m (variable 2.04–2.73) | +0.10 m |
+| 7 ft (2.13 m) | 2.58 m | **2.55 m** | 2.12 m | −0.03 m |
+| 3 ft (0.91 m) | 1.36 m | **1.44 m** | 1.60 m | +0.08 m |
+
+**Result:** LiDAR within ±0.10 m of expected torso distance at all three ranges.
+Bbox is close at 7 ft full-body but **overestimates by ~0.50 m at 3 ft** (wrong direction
+for an approach stop — robot would think user is farther than they are and fail to
+stop in time). Blocker #1 is resolved by the LiDAR path.
+
+### Field-tuned gate thresholds
+
+Discovered during hardware that the spec's original gate (0.6 m vertical extent,
+min 5 points, `z_min=0.3`) was too strict for the GO2 L1 LiDAR's limited vertical
+FOV at close range. Relaxed to:
+
+- `lidar_min_vertical_extent_m = 0.15` (was 0.6)
+- `lidar_min_points = 4` (was 5)
+- `lidar_z_min = 0.1` (was 0.3) — so lower-leg returns count when upper body is
+  outside the L1's vertical FOV at <1.5 m range
+
+All three are exposed as ROS params for further tuning. The wedge + bearing + range
+filters are unchanged (still person-specific via YOLO bearing, not nearest-anything).
+
+### Jetson environmental fixes (applied in perception_node.py / yolo_person_detector.py)
+
+1. **LiDAR publisher clock skew.** Unitree bare-DDS lidar stamps clouds with a
+   clock ~188 days behind Jetson system time. Using `msg.header.stamp` made every
+   cloud look stale. Switched to arrival-time (`get_clock().now()`) as the
+   freshness reference.
+2. **Cloud-callback starvation under single-threaded executor.** On CPU-only YOLO
+   (Jetson driver too old for this torch CUDA build), tick inference runs ~1 Hz
+   and starves cloud callbacks to ~1 Hz instead of the 15 Hz publish rate.
+   Bumped `lidar_max_age_s` default from 0.5 s to 2.0 s to absorb the jitter
+   without false-fallbacks.
+3. **Ultralytics on-import network hang.** No internet on Jetson → pypi update
+   check hangs indefinitely. Baked `YOLO_OFFLINE=true` / `ULTRALYTICS_OFFLINE=true`
+   env-var defaults into `yolo_person_detector.py` at import time.
+
+### Geometric stop-distance implication
+
+With LiDAR now accurate, `approach_stop_distance_m = 0.8 m` stops the robot when
+LiDAR reads 0.8 m to torso. Accounting for offsets, user's toes end up ~0.35 m
+from the bumper at stop. For a demo where operator comfort matters, consider
+bumping the param to ~1.2 m (user's toes ~0.75 m from bumper). Kept at 0.8 m
+for 2026-04-23 session per operator decision.
+
+### Not completed this session
+
+- **Task 7** (full come-here approach → 0.8 m stop regression) deferred — robot
+  battery depleted before the walk-and-stop test. Pick up next session.

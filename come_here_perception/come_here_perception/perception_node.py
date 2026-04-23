@@ -67,7 +67,15 @@ class PerceptionNode(Node):
 
         self._use_lidar_distance = bool(self.get_parameter('use_lidar_distance').value)
         self._lidar_max_age_s = float(self.get_parameter('lidar_max_age_s').value)
-        self._resolver = LidarDistanceResolver()
+        self.declare_parameter('lidar_min_vertical_extent_m', 0.15)
+        self.declare_parameter('lidar_min_points', 4)
+        self.declare_parameter('lidar_z_min', 0.1)
+        min_extent = float(self.get_parameter('lidar_min_vertical_extent_m').value)
+        min_pts = int(self.get_parameter('lidar_min_points').value)
+        z_min = float(self.get_parameter('lidar_z_min').value)
+        self._resolver = LidarDistanceResolver(
+            min_points=min_pts, min_vertical_extent_m=min_extent, z_min=z_min
+        )
         self._latest_cloud_xyz: np.ndarray | None = None
         self._latest_cloud_stamp_s: float = 0.0
         self._lidar_fallback_logged: bool = False
@@ -189,17 +197,25 @@ class PerceptionNode(Node):
             n_pts = int(self._latest_cloud_xyz.shape[0]) if self._latest_cloud_xyz is not None else 0
             # Probe wedge without gates (use zero gates) to see raw count in wedge
             wedge_count = 0
+            z_extent = 0.0
+            wedge_r = 0.0
             if self._latest_cloud_xyz is not None:
                 x = self._latest_cloud_xyz[:, 0]
                 y = self._latest_cloud_xyz[:, 1]
                 z = self._latest_cloud_xyz[:, 2]
                 az = np.arctan2(y, x)
-                m = (np.abs(az - result.bearing_rad) < 0.14) & (z > 0.3) & (z < 1.8) & (x > 0.2)
+                m = (np.abs(az - result.bearing_rad) < 0.14) & (z > 0.1) & (z < 1.8) & (x > 0.2)
                 wedge_count = int(m.sum())
+                if wedge_count > 0:
+                    zw = z[m]
+                    z_extent = float(zw.max() - zw.min())
+                    rw = np.hypot(x[m], y[m])
+                    wedge_r = float(np.percentile(rw, 10.0))
             self.get_logger().info(
                 f'[dbg] t={self._tick_count} cb={self._cloud_cb_count} '
                 f'hits={self._lidar_success_count} fb={self._bbox_fallback_count} '
                 f'age={age:.2f}s pts={n_pts} wedge@{result.bearing_rad:.2f}={wedge_count} '
+                f'zext={z_extent:.2f} wR={wedge_r:.2f} '
                 f'dist={distance_m:.2f} det={int(result.detected)}'
             )
 
