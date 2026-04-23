@@ -35,7 +35,7 @@ class PerceptionNode(Node):
         self.declare_parameter('confidence', 0.45)
         self.declare_parameter('use_lidar_distance', True)
         self.declare_parameter('lidar_cloud_topic', '/utlidar/cloud_base')
-        self.declare_parameter('lidar_max_age_s', 0.5)
+        self.declare_parameter('lidar_max_age_s', 2.0)
 
         use_mock = self.get_parameter('use_mock').value
         rate_hz = self.get_parameter('publish_rate_hz').value
@@ -71,6 +71,11 @@ class PerceptionNode(Node):
         self._latest_cloud_xyz: np.ndarray | None = None
         self._latest_cloud_stamp_s: float = 0.0
         self._lidar_fallback_logged: bool = False
+        # Debug counters (print once per second)
+        self._cloud_cb_count: int = 0
+        self._tick_count: int = 0
+        self._lidar_success_count: int = 0
+        self._bbox_fallback_count: int = 0
 
         if self._use_lidar_distance and not use_mock:
             lidar_qos = QoSProfile(
@@ -124,9 +129,11 @@ class PerceptionNode(Node):
             return
         arr = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, 8)
         self._latest_cloud_xyz = arr[:, :3].copy()
-        self._latest_cloud_stamp_s = (
-            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        )
+        # The Unitree bare-DDS lidar stamps with its own unsynchronised clock
+        # (~188 days behind Jetson system time in practice). Use arrival time
+        # on the Jetson side instead — simpler and robust to that skew.
+        self._latest_cloud_stamp_s = self.get_clock().now().nanoseconds * 1e-9
+        self._cloud_cb_count += 1
 
     def _mock_person_cb(self, msg: Bool):
         if isinstance(self._detector, MockPersonDetector):
@@ -151,23 +158,50 @@ class PerceptionNode(Node):
                 )
                 if refined is not None:
                     distance_m = refined
+                    self._lidar_success_count += 1
                     if self._lidar_fallback_logged:
                         self.get_logger().info(
                             f'lidar distance recovered: {refined:.2f} m'
                         )
                         self._lidar_fallback_logged = False
-                elif not self._lidar_fallback_logged:
+                else:
+                    self._bbox_fallback_count += 1
+                    if not self._lidar_fallback_logged:
+                        self.get_logger().info(
+                            f'lidar gate failed (bearing={result.bearing_rad:.2f}) — '
+                            f'falling back to bbox distance {result.distance_m:.2f} m'
+                        )
+                        self._lidar_fallback_logged = True
+            else:
+                self._bbox_fallback_count += 1
+                if not self._lidar_fallback_logged:
                     self.get_logger().info(
-                        f'lidar gate failed (bearing={result.bearing_rad:.2f}) — '
-                        f'falling back to bbox distance {result.distance_m:.2f} m'
+                        f'no fresh cloud (age={cloud_age_s:.2f}s) — bbox distance '
+                        f'{result.distance_m:.2f} m'
                     )
                     self._lidar_fallback_logged = True
-            elif not self._lidar_fallback_logged:
-                self.get_logger().info(
-                    f'no fresh cloud (age={cloud_age_s:.2f}s) — bbox distance '
-                    f'{result.distance_m:.2f} m'
-                )
-                self._lidar_fallback_logged = True
+
+        self._tick_count += 1
+        # Every 10 ticks, log counters + diagnostic measurements
+        if self._tick_count % 10 == 0:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            age = now_s - self._latest_cloud_stamp_s if self._latest_cloud_stamp_s > 0 else -1
+            n_pts = int(self._latest_cloud_xyz.shape[0]) if self._latest_cloud_xyz is not None else 0
+            # Probe wedge without gates (use zero gates) to see raw count in wedge
+            wedge_count = 0
+            if self._latest_cloud_xyz is not None:
+                x = self._latest_cloud_xyz[:, 0]
+                y = self._latest_cloud_xyz[:, 1]
+                z = self._latest_cloud_xyz[:, 2]
+                az = np.arctan2(y, x)
+                m = (np.abs(az - result.bearing_rad) < 0.14) & (z > 0.3) & (z < 1.8) & (x > 0.2)
+                wedge_count = int(m.sum())
+            self.get_logger().info(
+                f'[dbg] t={self._tick_count} cb={self._cloud_cb_count} '
+                f'hits={self._lidar_success_count} fb={self._bbox_fallback_count} '
+                f'age={age:.2f}s pts={n_pts} wedge@{result.bearing_rad:.2f}={wedge_count} '
+                f'dist={distance_m:.2f} det={int(result.detected)}'
+            )
 
         msg = Float64MultiArray()
         msg.data = [
