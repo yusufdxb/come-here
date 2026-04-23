@@ -5,6 +5,7 @@ Publishes:
 
 Subscribes:
   /camera/image_raw            (sensor_msgs/Image) - from go2_av_node
+  /utlidar/cloud_base          (sensor_msgs/PointCloud2) - base-frame LiDAR (GO2 L1)
   /come_here/mock_person       (std_msgs/Bool) - toggle mock person detection
 """
 
@@ -13,9 +14,10 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool, Float64MultiArray
 
+from come_here_perception.lidar_distance_resolver import LidarDistanceResolver
 from come_here_perception.person_detector import MockPersonDetector, PersonDetector
 
 # YoloPersonDetector pulls in ultralytics (and OpenCV). It is imported lazily
@@ -31,6 +33,9 @@ class PerceptionNode(Node):
         self.declare_parameter('publish_rate_hz', 10.0)
         self.declare_parameter('model_path', '/home/unitree/come-here/models/yolo11n.pt')
         self.declare_parameter('confidence', 0.45)
+        self.declare_parameter('use_lidar_distance', True)
+        self.declare_parameter('lidar_cloud_topic', '/utlidar/cloud_base')
+        self.declare_parameter('lidar_max_age_s', 0.5)
 
         use_mock = self.get_parameter('use_mock').value
         rate_hz = self.get_parameter('publish_rate_hz').value
@@ -60,6 +65,29 @@ class PerceptionNode(Node):
 
         self._detector.setup()
 
+        self._use_lidar_distance = bool(self.get_parameter('use_lidar_distance').value)
+        self._lidar_max_age_s = float(self.get_parameter('lidar_max_age_s').value)
+        self._resolver = LidarDistanceResolver()
+        self._latest_cloud_xyz: np.ndarray | None = None
+        self._latest_cloud_stamp_s: float = 0.0
+        self._lidar_fallback_logged: bool = False
+
+        if self._use_lidar_distance and not use_mock:
+            lidar_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            cloud_topic = self.get_parameter('lidar_cloud_topic').value
+            self.create_subscription(
+                PointCloud2, cloud_topic, self._on_cloud_base, lidar_qos
+            )
+            self.get_logger().info(f'Subscribed to {cloud_topic} for distance refinement')
+        elif use_mock:
+            self.get_logger().info('Mock mode — skipping LiDAR distance refinement')
+        else:
+            self.get_logger().info('LiDAR distance refinement disabled (use_lidar_distance=false)')
+
         self._pub = self.create_publisher(
             Float64MultiArray, '/come_here/person_detection', 10
         )
@@ -81,6 +109,24 @@ class PerceptionNode(Node):
             msg.height, msg.width, 3
         )
         self._detector.update_frame(frame)
+
+    def _on_cloud_base(self, msg: PointCloud2):
+        """Parse the cloud once on arrival; cache XYZ as a contiguous (N,3) array.
+
+        Zero-copy parse: point_step=32 on the GO2 L1 cloud_base means each
+        point is 8 x float32 slots; the first three slots are x, y, z.
+        We read all 8 columns and view the first three.
+        """
+        if msg.point_step != 32:
+            self.get_logger().warn(
+                f'cloud_base point_step={msg.point_step}, expected 32 — skipping'
+            )
+            return
+        arr = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, 8)
+        self._latest_cloud_xyz = arr[:, :3].copy()
+        self._latest_cloud_stamp_s = (
+            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        )
 
     def _mock_person_cb(self, msg: Bool):
         if isinstance(self._detector, MockPersonDetector):
