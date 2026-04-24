@@ -17,6 +17,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool, Float64MultiArray
 
+from come_here_perception.bearing_smoother import BearingSmoother
 from come_here_perception.lidar_distance_resolver import LidarDistanceResolver
 from come_here_perception.person_detector import MockPersonDetector, PersonDetector
 
@@ -67,6 +68,10 @@ class PerceptionNode(Node):
 
         self._use_lidar_distance = bool(self.get_parameter('use_lidar_distance').value)
         self._lidar_max_age_s = float(self.get_parameter('lidar_max_age_s').value)
+        self.declare_parameter('bearing_ema_alpha', 0.3)
+        bearing_alpha = float(self.get_parameter('bearing_ema_alpha').value)
+        self._bearing_smoother = BearingSmoother(alpha=bearing_alpha)
+
         self.declare_parameter('lidar_min_vertical_extent_m', 0.15)
         self.declare_parameter('lidar_min_points', 4)
         self.declare_parameter('lidar_z_min', 0.1)
@@ -189,6 +194,10 @@ class PerceptionNode(Node):
                     )
                     self._lidar_fallback_logged = True
 
+        bearing_out = self._bearing_smoother.update(
+            result.bearing_rad, result.detected,
+        )
+
         self._tick_count += 1
         # Every 10 ticks, log counters + diagnostic measurements
         if self._tick_count % 10 == 0:
@@ -216,12 +225,13 @@ class PerceptionNode(Node):
                 f'hits={self._lidar_success_count} fb={self._bbox_fallback_count} '
                 f'age={age:.2f}s pts={n_pts} wedge@{result.bearing_rad:.2f}={wedge_count} '
                 f'zext={z_extent:.2f} wR={wedge_r:.2f} '
-                f'dist={distance_m:.2f} det={int(result.detected)}'
+                f'dist={distance_m:.2f} det={int(result.detected)} '
+                f'raw_b={result.bearing_rad:.2f} ema_b={bearing_out:.2f}'
             )
 
         msg = Float64MultiArray()
         msg.data = [
-            result.bearing_rad,
+            bearing_out,
             distance_m,
             result.confidence,
             float(result.detected),
