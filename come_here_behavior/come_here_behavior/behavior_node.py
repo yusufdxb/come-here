@@ -317,6 +317,12 @@ class BehaviorNode(Node):
         # duration, before re-evaluating.
         if self._approach_phase_start is None:
             self._approach_phase_start = self.get_clock().now()
+            # If already within the align deadband at entry, skip the 0.4 s
+            # ALIGN min-hold and start in WALK — otherwise the first 4 ticks
+            # publish a yaw command even when the operator is already
+            # centered, producing a small spurious rotation before walking.
+            if abs(self._person_bearing) < self._approach_align_threshold:
+                self._approach_phase = 'WALK'
         phase_elapsed = self._seconds_since(self._approach_phase_start)
         bearing = self._person_bearing
         vel_msg = Float64MultiArray()
