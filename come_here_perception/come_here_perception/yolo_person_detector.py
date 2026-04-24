@@ -44,10 +44,16 @@ class YoloPersonDetector(PersonDetector):
         model_path: str = "/home/unitree/come-here/models/yolo11n.pt",
         confidence: float = 0.45,
         camera_hfov_deg: float = CAMERA_HFOV_DEG,
+        imgsz: int = 320,
     ):
         self._model_path = model_path
         self._confidence = confidence
         self._hfov_rad = math.radians(camera_hfov_deg)
+        # Inference input size. 1920x1080 frames at imgsz=640 run ~200ms on
+        # Jetson Orin Nano; imgsz=320 runs ~60ms. Smaller imgsz trades some
+        # small-person recall for substantially lower end-to-end detection
+        # latency, which matters for the APPROACH_PERSON bearing loop.
+        self._imgsz = int(imgsz)
         self._model = None
         self._last_frame = None
 
@@ -69,7 +75,8 @@ class YoloPersonDetector(PersonDetector):
         h, w = frame.shape[:2]
 
         results = self._model(
-            frame, conf=self._confidence, verbose=False, classes=[0]
+            frame, conf=self._confidence, verbose=False, classes=[0],
+            imgsz=self._imgsz,
         )[0]
 
         if len(results.boxes) == 0:
@@ -111,6 +118,7 @@ class YoloPersonDetector(PersonDetector):
             distance_m=distance_m,
             confidence=best_conf,
             detected=True,
+            bbox_h_frac=float(bbox_h / h) if h > 0 else 0.0,
         )
 
     def teardown(self) -> None:

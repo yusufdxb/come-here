@@ -33,6 +33,9 @@ class PerceptionNode(Node):
         self.declare_parameter('publish_rate_hz', 10.0)
         self.declare_parameter('model_path', '/home/unitree/come-here/models/yolo11n.pt')
         self.declare_parameter('confidence', 0.45)
+        # YOLO input size: 320 = fast (~60ms), 640 = accurate (~200ms). Tune down
+        # for bearing-tracking responsiveness in APPROACH_PERSON.
+        self.declare_parameter('yolo_imgsz', 320)
         self.declare_parameter('use_lidar_distance', True)
         self.declare_parameter('lidar_cloud_topic', '/utlidar/cloud_base')
         self.declare_parameter('lidar_max_age_s', 2.0)
@@ -47,8 +50,9 @@ class PerceptionNode(Node):
             from come_here_perception.yolo_person_detector import YoloPersonDetector
             model_path = self.get_parameter('model_path').value
             confidence = self.get_parameter('confidence').value
+            imgsz = int(self.get_parameter('yolo_imgsz').value)
             self._detector: PersonDetector = YoloPersonDetector(
-                model_path=model_path, confidence=confidence,
+                model_path=model_path, confidence=confidence, imgsz=imgsz,
             )
             self.get_logger().info(f'Using YOLO person detector: {model_path}')
 
@@ -70,11 +74,20 @@ class PerceptionNode(Node):
         self.declare_parameter('lidar_min_vertical_extent_m', 0.15)
         self.declare_parameter('lidar_min_points', 4)
         self.declare_parameter('lidar_z_min', 0.1)
+        # Cone half-angle must be wide enough to cover the operator's leg
+        # stance at close range. At 0.8 m a ~0.3 m stance subtends ±0.19 rad;
+        # the previous 0.14 rad half-cone dropped leg points at the edges and
+        # caused repeated gate failures → bbox fallback → stop-distance miss.
+        self.declare_parameter('lidar_cone_half_rad', 0.30)
         min_extent = float(self.get_parameter('lidar_min_vertical_extent_m').value)
         min_pts = int(self.get_parameter('lidar_min_points').value)
         z_min = float(self.get_parameter('lidar_z_min').value)
+        self._cone_half_rad = float(self.get_parameter('lidar_cone_half_rad').value)
         self._resolver = LidarDistanceResolver(
-            min_points=min_pts, min_vertical_extent_m=min_extent, z_min=z_min
+            cone_half_rad=self._cone_half_rad,
+            min_points=min_pts,
+            min_vertical_extent_m=min_extent,
+            z_min=z_min,
         )
         self._latest_cloud_xyz: np.ndarray | None = None
         self._latest_cloud_stamp_s: float = 0.0
@@ -204,7 +217,7 @@ class PerceptionNode(Node):
                 y = self._latest_cloud_xyz[:, 1]
                 z = self._latest_cloud_xyz[:, 2]
                 az = np.arctan2(y, x)
-                m = (np.abs(az - result.bearing_rad) < 0.14) & (z > 0.1) & (z < 1.8) & (x > 0.2)
+                m = (np.abs(az - result.bearing_rad) < self._cone_half_rad) & (z > 0.1) & (z < 1.8) & (x > 0.2)
                 wedge_count = int(m.sum())
                 if wedge_count > 0:
                     zw = z[m]
@@ -225,6 +238,7 @@ class PerceptionNode(Node):
             distance_m,
             result.confidence,
             float(result.detected),
+            float(result.bbox_h_frac),
         ]
         self._pub.publish(msg)
 

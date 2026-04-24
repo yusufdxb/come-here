@@ -15,6 +15,7 @@ class PersonEstimate:
     distance_m: float     # estimated distance (0 if unknown)
     confidence: float     # 0.0 to 1.0
     detected: bool        # true if person found
+    bbox_h_frac: float = 0.0  # bbox height / frame height — close-range proxy
 
 
 class PersonDetector(ABC):
