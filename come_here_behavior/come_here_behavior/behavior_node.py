@@ -63,6 +63,24 @@ class BehaviorNode(Node):
         self.declare_parameter('approach_align_threshold_rad', 0.26)
         self.declare_parameter('approach_ccw_yaw', 1.0)
         self.declare_parameter('approach_cw_yaw', 1.2)
+        self.declare_parameter('skip_turn_to_sound', False)
+        # mcf gait requires vx >= 0.5 and >=1 s stable setpoint; shorter commits
+        # cause shake-in-place. Defaults match the values used in yesterday's
+        # Apr 23 hardware-validated run.
+        self.declare_parameter('approach_min_align_s', 0.4)
+        self.declare_parameter('approach_min_walk_s', 1.5)
+        self.declare_parameter('bearing_ema_alpha', 0.3)
+        # Safety stop debounce: require N consecutive det=0 ticks before
+        # halting motion mid-approach. Lets the mcf gait ride through short
+        # YOLO detection flickers without setpoint churn (which manifests as
+        # shake-in-place).
+        self.declare_parameter('safety_stop_miss_threshold', 3)
+        # Bbox-height stop trigger (LiDAR-independent). At close range the
+        # GO2 L1's vertical FOV loses the person (chest above, legs below),
+        # so LiDAR distance reads the floor/wall behind them. A person bbox
+        # that fills >= 75% of frame height = close-enough to stop regardless
+        # of distance estimate.
+        self.declare_parameter('bbox_stop_fraction', 0.75)
 
         self._dir_threshold = self.get_parameter('direction_confidence_threshold').value
         self._person_threshold = self.get_parameter('person_confidence_threshold').value
@@ -81,6 +99,16 @@ class BehaviorNode(Node):
         ).value
         self._approach_ccw_yaw = self.get_parameter('approach_ccw_yaw').value
         self._approach_cw_yaw = self.get_parameter('approach_cw_yaw').value
+        self._skip_turn_to_sound = bool(self.get_parameter('skip_turn_to_sound').value)
+        self._bearing_ema_alpha = float(self.get_parameter('bearing_ema_alpha').value)
+        self._safety_stop_miss_threshold = int(
+            self.get_parameter('safety_stop_miss_threshold').value
+        )
+        self._det_miss_count = 0
+        self._bbox_stop_fraction = float(
+            self.get_parameter('bbox_stop_fraction').value
+        )
+        self._person_bbox_h_frac = 0.0
 
         # -- Runtime state --
         self._state = State.IDLE
@@ -98,8 +126,8 @@ class BehaviorNode(Node):
         # min_phase_s is the minimum time we stay in a phase before re-evaluating.
         self._approach_phase = 'ALIGN'
         self._approach_phase_start = None
-        self._approach_min_align_s = 0.4
-        self._approach_min_walk_s = 1.5
+        self._approach_min_align_s = float(self.get_parameter('approach_min_align_s').value)
+        self._approach_min_walk_s = float(self.get_parameter('approach_min_walk_s').value)
 
         # SIT_AND_IDENTIFY sub-sequence state
         self._sit_substep = 0
@@ -158,10 +186,21 @@ class BehaviorNode(Node):
 
     def _person_cb(self, msg: Float64MultiArray):
         if len(msg.data) >= 4:
-            self._person_bearing = msg.data[0]
+            raw_bearing = msg.data[0]
+            detected = bool(msg.data[3])
+            # 5th field added 2026-04-24 for close-range stop trigger. Older
+            # publishers without it → default 0 (trigger inactive).
+            self._person_bbox_h_frac = float(msg.data[4]) if len(msg.data) >= 5 else 0.0
+            # EMA smoothing on bearing to damp YOLO bbox-center jitter (±0.6 rad
+            # frame-to-frame observed). Reset to raw on first sighting after
+            # a detection gap so we don't carry stale bearing.
+            if detected and self._person_detected:
+                a = self._bearing_ema_alpha
+                self._person_bearing = a * raw_bearing + (1.0 - a) * self._person_bearing
+            else:
+                self._person_bearing = raw_bearing
             self._person_distance = msg.data[1]
             self._person_confidence = msg.data[2]
-            detected = bool(msg.data[3])
             self._person_detected = detected
             if detected:
                 self._person_last_seen = self.get_clock().now()
@@ -183,6 +222,11 @@ class BehaviorNode(Node):
             return
 
         if self._state == State.LISTENING:
+            if self._skip_turn_to_sound:
+                self._transition(State.SEARCH_FOR_PERSON)
+                self._search_start_time = self.get_clock().now()
+                self._person_last_seen = None
+                return
             if self._last_dir_confidence >= self._dir_threshold:
                 self._transition(State.TURN_TO_SOUND)
             return
@@ -232,8 +276,36 @@ class BehaviorNode(Node):
             self._transition(State.SEARCH_FOR_PERSON)
             return
 
-        # Close-enough check: trigger sit sequence
-        if self._person_distance > 0 and self._person_distance <= self._stop_distance:
+        # Safety stop (debounced): halt motion if detection has been missing
+        # for safety_stop_miss_threshold consecutive ticks (default 3 =
+        # ~300 ms at 10 Hz). An instant stop on every det=0 frame makes the
+        # mcf gait churn — the gait needs a stable setpoint held for ~1 s+,
+        # so short YOLO flickers must not toggle vx.
+        if not self._person_detected:
+            self._det_miss_count += 1
+            if self._det_miss_count >= self._safety_stop_miss_threshold:
+                self._stop_motion()
+                return
+        else:
+            self._det_miss_count = 0
+
+        # Close-enough check: trigger sit sequence on either
+        #   (a) LiDAR/bbox distance <= stop_distance, or
+        #   (b) YOLO bbox height >= bbox_stop_fraction of frame — close-range
+        #       proxy that works when LiDAR loses the person in vertical FOV.
+        close_by_distance = (
+            self._person_distance > 0
+            and self._person_distance <= self._stop_distance
+        )
+        close_by_bbox = (
+            self._person_bbox_h_frac >= self._bbox_stop_fraction
+        )
+        if close_by_distance or close_by_bbox:
+            self.get_logger().info(
+                f'Close-enough: dist={self._person_distance:.2f} m '
+                f'bbox_h_frac={self._person_bbox_h_frac:.2f} '
+                f'(trigger: {"dist" if close_by_distance else "bbox"})'
+            )
             self._stop_motion()
             self._enter_sit_sequence()
             return
@@ -272,6 +344,16 @@ class BehaviorNode(Node):
                 vel_msg.data = [self._approach_speed, 0.0]
 
         self._velocity_pub.publish(vel_msg)
+        # Throttled debug so we can verify the approach controller is actually
+        # commanding motion (rather than early-returning every tick).
+        self._approach_log_tick = getattr(self, '_approach_log_tick', 0) + 1
+        if self._approach_log_tick % 10 == 0:
+            self.get_logger().info(
+                f'approach: phase={self._approach_phase} '
+                f'bearing={bearing:+.2f} dist={self._person_distance:.2f} '
+                f'bbox={self._person_bbox_h_frac:.2f} det={int(self._person_detected)} '
+                f'cmd=[vx={vel_msg.data[0]:.2f} yaw={vel_msg.data[1]:+.2f}]'
+            )
 
     # -- SIT_AND_IDENTIFY sequence --
 
