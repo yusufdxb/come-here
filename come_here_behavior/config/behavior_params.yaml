@@ -2,9 +2,16 @@ behavior_node:
   ros__parameters:
     tick_rate_hz: 10.0
     direction_confidence_threshold: 0.5
-    # ReSpeaker DOA (XMOS DSP) is dead — angle stuck in rear quadrant.
-    # Skip TURN_TO_SOUND until firmware is fixed; LISTENING jumps to SEARCH_FOR_PERSON.
-    skip_turn_to_sound: true
+    # 2026-04-30: DOA confirmed publishing on hardware (az ~0.6 rad, conf 0.9)
+    # so TURN_TO_SOUND is back in the loop. If DOA regresses, set true again.
+    skip_turn_to_sound: false
+    # Max time LISTENING will wait for a high-confidence DOA reading before
+    # falling back to SEARCH_FOR_PERSON without rotation.
+    listening_timeout_s: 1.5
+    # Consecutive person-detection frames required before SEARCH commits to
+    # APPROACH. YOLO at 1-2 Hz on CPU produces occasional false positives
+    # mid-rotation; requiring 2 frames filters those without much delay.
+    search_min_consecutive_detections: 2
     person_confidence_threshold: 0.5
     approach_stop_distance_m: 0.8
     search_timeout_s: 10.0
@@ -28,7 +35,11 @@ behavior_node:
     bearing_ema_alpha: 0.3
     lost_timeout_s: 3.0
     # SIT_AND_IDENTIFY sequence timing
-    sit_settle_s: 1.0
+    # Time from cmd_sit publish until the physical sit is visibly settled.
+    # go2_bridge inserts a 0.5 s StopMove pre-delay before issuing Sit api_id,
+    # and the Go2's sit motion itself takes ~2-2.5 s. Setting this below the
+    # combined ~3 s causes "I am here" to fire while the dog is still folding.
+    sit_settle_s: 3.0
     face_timeout_s: 1.5
     speak_hold_s: 5.0
     stand_settle_s: 0.5
