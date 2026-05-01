@@ -52,6 +52,8 @@ class BehaviorNode(Node):
         self.declare_parameter('person_confidence_threshold', 0.5)
         self.declare_parameter('approach_stop_distance_m', 0.8)
         self.declare_parameter('search_timeout_s', 10.0)
+        self.declare_parameter('listening_timeout_s', 1.5)
+        self.declare_parameter('search_min_consecutive_detections', 2)
         self.declare_parameter('approach_speed', 0.3)
         self.declare_parameter('lost_timeout_s', 1.0)
         self.declare_parameter('sit_settle_s', 1.0)
@@ -86,6 +88,10 @@ class BehaviorNode(Node):
         self._person_threshold = self.get_parameter('person_confidence_threshold').value
         self._stop_distance = self.get_parameter('approach_stop_distance_m').value
         self._search_timeout = self.get_parameter('search_timeout_s').value
+        self._listening_timeout_s = float(self.get_parameter('listening_timeout_s').value)
+        self._search_min_consecutive_detections = int(
+            self.get_parameter('search_min_consecutive_detections').value
+        )
         self._approach_speed = self.get_parameter('approach_speed').value
         self._lost_timeout = self.get_parameter('lost_timeout_s').value
         self._sit_settle_s = self.get_parameter('sit_settle_s').value
@@ -120,6 +126,11 @@ class BehaviorNode(Node):
         self._person_confidence = 0.0
         self._person_last_seen = None
         self._search_start_time = None
+        # When LISTENING began — used to time out and fall back to SEARCH if
+        # DOA confidence never crosses the threshold.
+        self._listening_start_time = None
+        # Consecutive-detection counter for SEARCH→APPROACH commit.
+        self._person_consec_hits = 0
 
         # APPROACH_PERSON sub-phase state (commit-phase, no per-tick switching).
         # Phase is 'ALIGN' (rotate in place) or 'WALK' (forward only).
@@ -202,6 +213,13 @@ class BehaviorNode(Node):
             self._person_distance = msg.data[1]
             self._person_confidence = msg.data[2]
             self._person_detected = detected
+            # Maintain a consecutive-detection counter so SEARCH can require
+            # a minimum number of stable hits before committing to APPROACH.
+            # Resets immediately on any detection gap.
+            if detected and self._person_confidence >= self._person_threshold:
+                self._person_consec_hits += 1
+            else:
+                self._person_consec_hits = 0
             if detected:
                 self._person_last_seen = self.get_clock().now()
 
@@ -229,6 +247,19 @@ class BehaviorNode(Node):
                 return
             if self._last_dir_confidence >= self._dir_threshold:
                 self._transition(State.TURN_TO_SOUND)
+                return
+            # DOA hasn't produced a confident reading yet — wait briefly,
+            # then fall back to a passive SEARCH so the loop doesn't stall.
+            if (self._listening_start_time is not None
+                    and self._seconds_since(self._listening_start_time)
+                    > self._listening_timeout_s):
+                self.get_logger().warn(
+                    'LISTENING timed out without DOA confidence — '
+                    'skipping TURN_TO_SOUND'
+                )
+                self._transition(State.SEARCH_FOR_PERSON)
+                self._search_start_time = self.get_clock().now()
+                self._person_last_seen = None
             return
 
         if self._state == State.TURN_TO_SOUND:
@@ -245,11 +276,19 @@ class BehaviorNode(Node):
 
         if self._state == State.SEARCH_FOR_PERSON:
             elapsed = self._seconds_since(self._search_start_time)
-            if self._person_detected and self._person_confidence >= self._person_threshold:
+            # Require N consecutive detections to filter YOLO false positives
+            # mid-rotation (e.g. flash bbox=0.78 on a chair while the camera
+            # sweeps past), which previously caused immediate-sit triggers.
+            if self._person_consec_hits >= self._search_min_consecutive_detections:
                 self._transition(State.APPROACH_PERSON)
-            elif elapsed > self._search_timeout:
+                return
+            if elapsed > self._search_timeout:
                 self.get_logger().warn('Search timed out, returning to IDLE')
                 self._transition(State.IDLE)
+                return
+            # Passive wait — TURN_TO_SOUND has already pointed the dog at the
+            # speaker. Active scan-rotation here would only preempt that
+            # calibrated DOA rotate within 100 ms, defeating the purpose.
             return
 
         if self._state == State.APPROACH_PERSON:
@@ -429,9 +468,24 @@ class BehaviorNode(Node):
     # -- Helpers --
 
     def _transition(self, new_state: State):
+        old_state = self._state
         old = self._state.name
         self._state = new_state
         self.get_logger().info(f'State: {old} -> {new_state.name}')
+        # Cancel any in-flight rotate worker when leaving SEARCH_FOR_PERSON.
+        # The DOA-driven rotate from TURN_TO_SOUND may still be running when
+        # SEARCH detects a person; cmd_velocity[0,0] preempts the worker and
+        # emits StopMove. Without this, a late-running rotate fires StopMove
+        # during SIT/STAND and interrupts the sequence.
+        if (old_state == State.SEARCH_FOR_PERSON
+                and new_state != State.SEARCH_FOR_PERSON):
+            cancel_msg = Float64MultiArray()
+            cancel_msg.data = [0.0, 0.0]
+            self._velocity_pub.publish(cancel_msg)
+        if new_state == State.LISTENING:
+            self._listening_start_time = self.get_clock().now()
+        if new_state == State.SEARCH_FOR_PERSON:
+            self._person_consec_hits = 0
         if new_state == State.APPROACH_PERSON:
             self._approach_phase = 'ALIGN'
             self._approach_phase_start = None
