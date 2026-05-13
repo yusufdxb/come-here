@@ -12,14 +12,15 @@ The stack runs entirely on the Jetson Orin NX payload attached to the robot — 
 
 ## Behavior
 
-```
-you say "come here"
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│  IDLE → LISTENING → TURN_TO_SOUND → SEARCH_FOR_PERSON       │
-│          → APPROACH_PERSON → SIT_AND_IDENTIFY → IDLE        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> LISTENING: you say "come here"
+    LISTENING --> TURN_TO_SOUND
+    TURN_TO_SOUND --> SEARCH_FOR_PERSON
+    SEARCH_FOR_PERSON --> APPROACH_PERSON
+    APPROACH_PERSON --> SIT_AND_IDENTIFY
+    SIT_AND_IDENTIFY --> IDLE
 ```
 
 Per phase:
@@ -37,25 +38,20 @@ Per phase:
 
 ## Architecture
 
-```
-    audio_node ───┐                 face_detector_node
-         │        │                         ▲
-         ▼        ▼                         │ request / result
-    /come_here/wake_phrase          /come_here/face_detect_request
-    /come_here/audio_direction      /come_here/face_detection
-         │        │                         │
-         └────────┴────────────┬────────────┘
-                               ▼
-                        behavior_node
-                     (state machine)
-                               │
-         ┌─────────────────────┼────────────────────────────┐
-         ▼                     ▼                            ▼
-  /come_here/cmd_rotate  /come_here/cmd_move     /come_here/cmd_{sit,stand,say}
-         │                     │                            │
-         └─────────────────────┴────────────────┬───────────┘
-                                                ▼
-                                  GO2 Sport API + audiohub bridge
+```mermaid
+graph TD
+    audio_node[audio_node]
+    face_detector[face_detector_node]
+    behavior[behavior_node, state machine]
+    bridge[GO2 Sport API + audiohub bridge]
+
+    audio_node -->|/come_here/wake_phrase| behavior
+    audio_node -->|/come_here/audio_direction| behavior
+    behavior -->|/come_here/face_detect_request| face_detector
+    face_detector -->|/come_here/face_detection| behavior
+    behavior -->|/come_here/cmd_rotate| bridge
+    behavior -->|/come_here/cmd_move| bridge
+    behavior -->|/come_here/cmd_sit, cmd_stand, cmd_say| bridge
 ```
 
 Three functional nodes (audio, perception + face detector, behavior) communicate over typed topics. The behavior node is authoritative — everything downstream consumes its commands.
