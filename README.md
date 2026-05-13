@@ -1,5 +1,9 @@
 # come-here
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E.svg)](https://docs.ros.org/en/humble/)
+[![Status](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#status)
+
 An audio-visual approach system for the [Unitree GO2](https://www.unitree.com/go2) quadruped. The robot hears the phrase *"come here,"* estimates the speaker's direction from a microphone array, rotates toward them, locates them visually on the onboard camera, walks up, sits down in front of them, and says *"I am here."*
 
 The stack runs entirely on the Jetson Orin NX payload attached to the robot — no external compute, no network dependency at runtime.
