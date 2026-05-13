@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from come_here_audio.phrase_matcher import match_trigger
 from come_here_audio.ring_buffer import LatestOnlyQueue, RingBuffer
 from come_here_audio.wake_phrase_detector import PhraseDetection, WakePhraseDetector
 
@@ -69,19 +70,28 @@ class WhisperPhraseDetector(WakePhraseDetector):
         compute_type: str = "int8",
         adapter_path: Optional[str] = None,
         mic_device: Optional[str] = None,
-        mic_channels: int = 6,
-        mic_beam_channel: int = 1,
+        mic_channels: int = 1,
+        mic_beam_channel: int = 0,
         sample_rate: int = 16000,
         confidence_threshold: float = 0.4,
         no_speech_threshold: float = 0.5,
+        phrase_ratio_threshold: float = 0.80,
         # Streaming params
-        mic_gain: float = 4.0,
-        window_duration_s: float = 1.0,
-        hop_duration_ms: int = 250,
-        end_silence_ms: int = 200,
-        ring_buffer_duration_s: float = 3.0,
-        energy_threshold: float = 0.001,
+        mic_gain: float = 1.0,
+        highpass_filter: bool = False,
+        ring_buffer_duration_s: float = 6.0,
+        # Utterance endpointing (Jetson go2_voice_tree parity)
+        utterance_rms_threshold: float = 0.015,
+        silence_to_end_sec: float = 0.70,
+        min_utterance_sec: float = 0.20,
+        max_utterance_sec: float = 4.50,
         vad_check_fn: Optional[Callable[[], bool]] = None,
+        # Deprecated — fixed-hop segmenter was replaced by utterance endpointing.
+        # Kept so existing callers (e.g. hear_and_rotate_demo) don't raise TypeError.
+        window_duration_s: Optional[float] = None,
+        hop_duration_ms: Optional[int] = None,
+        end_silence_ms: Optional[int] = None,
+        energy_threshold: Optional[float] = None,
     ):
         self._model_size = model_size
         self._device = device
@@ -93,12 +103,14 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._sample_rate = sample_rate
         self._confidence_threshold = confidence_threshold
         self._no_speech_threshold = no_speech_threshold
+        self._phrase_ratio_threshold = phrase_ratio_threshold
         self._mic_gain = mic_gain
-        self._window_duration_s = window_duration_s
-        self._hop_duration_ms = hop_duration_ms
-        self._end_silence_ms = end_silence_ms
+        self._highpass_filter = highpass_filter
         self._ring_buffer_duration_s = ring_buffer_duration_s
-        self._energy_threshold = energy_threshold
+        self._utterance_rms_threshold = utterance_rms_threshold
+        self._silence_to_end_sec = silence_to_end_sec
+        self._min_utterance_sec = min_utterance_sec
+        self._max_utterance_sec = max_utterance_sec
         self._vad_check_fn = vad_check_fn
 
         # Determine backend
@@ -177,17 +189,19 @@ class WhisperPhraseDetector(WakePhraseDetector):
         """Open a non-blocking InputStream for continuous capture."""
         import sounddevice as sd
 
-        # Highpass filter at 300Hz to remove motor noise rumble.
-        # Motor vibration is concentrated below 200Hz; voice formants
-        # are 300-3000Hz. This dramatically improves SNR on the GO2.
-        try:
-            from scipy.signal import butter, sosfilt_zi
-            self._hp_sos = butter(4, 300, btype='highpass',
-                                  fs=self._sample_rate, output='sos')
-            self._hp_zi = sosfilt_zi(self._hp_sos) * 0.0
-            print("[AUDIO] Highpass filter at 300Hz enabled")
-        except ImportError:
-            print("[AUDIO] scipy not available, no highpass filter")
+        # Highpass filter at 300Hz — off by default. The ReSpeaker DSP channel
+        # (ch 0) already runs noise suppression; stacking a 300Hz HP on top of
+        # it attenuates lower voice formants for no real gain. Only enable when
+        # bypassing the DSP (e.g. reading a raw capsule directly).
+        if self._highpass_filter:
+            try:
+                from scipy.signal import butter, sosfilt_zi
+                self._hp_sos = butter(4, 300, btype='highpass',
+                                      fs=self._sample_rate, output='sos')
+                self._hp_zi = sosfilt_zi(self._hp_sos) * 0.0
+                print("[AUDIO] Highpass filter at 300Hz enabled")
+            except ImportError:
+                print("[AUDIO] scipy not available, no highpass filter")
 
         blocksize = int(0.1 * self._sample_rate)  # 100ms blocks
         self._stream = sd.InputStream(
@@ -201,70 +215,97 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._stream.start()
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """PortAudio callback: extract beam channel, filter, apply gain, write to ring buffer.
+        """PortAudio callback: pick channel, optionally filter/gain, write to ring buffer.
 
         Runs in PortAudio's thread — keep it fast, no allocations beyond the slice.
+        With defaults (mic_channels=1, mic_beam_channel=0) this reads the
+        ReSpeaker DSP output (beamformer + AEC + AGC + NS applied in firmware)
+        straight through — no software gain, no clip, no highpass needed.
         """
         if not self._running:
             return
-        # Extract the selected channel
         mono = indata[:, self._mic_beam_channel].copy()
-        # Highpass filter: remove motor noise below 300Hz
         if self._hp_sos is not None:
             from scipy.signal import sosfilt
             mono, self._hp_zi = sosfilt(self._hp_sos, mono, zi=self._hp_zi)
-        # Apply gain and clip
-        mono = mono * self._mic_gain
-        np.clip(mono, -1.0, 1.0, out=mono)
+        if self._mic_gain != 1.0:
+            mono = mono * self._mic_gain
+            np.clip(mono, -1.0, 1.0, out=mono)
         self._ring_buffer.write(mono)
 
     def _segmenter_loop(self) -> None:
-        """Emit audio segments for Whisper inference, gated by hardware VAD.
+        """Utterance endpointing — RMS-gated start, trailing silence closes it.
 
-        When a vad_check_fn is provided (from ReSpeaker hardware VAD),
-        segments are only queued when VAD indicates recent speech. This
-        prevents wasting inference time on noise, keeping the inference
-        thread free for actual speech — cutting latency significantly.
+        Matches the Jetson ``go2_voice_tree`` approach: a short analysis frame
+        above ``utterance_rms_threshold`` starts an utterance; trailing silence
+        of ``silence_to_end_sec`` closes it; hard cap at ``max_utterance_sec``.
+        "Come here" is ~0.6–0.8 s — the previous fixed 1 s hop frequently cut
+        it mid-phrase; endpointing hands Whisper the whole phrase as one chunk.
 
-        Without vad_check_fn, falls back to peak-amplitude gating.
-
-        The LatestOnlyQueue ensures that if inference is slower than the
-        hop interval, stale segments are dropped automatically.
+        Hardware VAD (if ``vad_check_fn`` is set) is logged as advisory only,
+        not a hard gate — when the XMOS firmware misses 1 m speech, Whisper
+        still sees the audio and can catch it.
         """
-        window_samples = int(self._window_duration_s * self._sample_rate)
-        hop_s = self._hop_duration_ms / 1000.0
-        # Minimum samples before first emission (wait for buffer to fill)
-        min_written = window_samples
+        frame_samples = int(0.05 * self._sample_rate)  # 50 ms analysis frame
+        check_interval_s = 0.05
+        min_samples = int(self._min_utterance_sec * self._sample_rate)
+        max_samples = int(self._max_utterance_sec * self._sample_rate)
+        silence_samples_needed = int(self._silence_to_end_sec * self._sample_rate)
+
+        in_speech = False
+        utterance_start_pos = 0
+        last_speech_pos = 0
+        last_processed_pos = 0
 
         while self._running:
-            time.sleep(hop_s)
+            time.sleep(check_interval_s)
 
-            if self._ring_buffer.total_written < min_written:
+            total = self._ring_buffer.total_written
+            if total < frame_samples or total == last_processed_pos:
+                continue
+            last_processed_pos = total
+
+            frame = self._ring_buffer.read_last(frame_samples)
+            rms = float(np.sqrt(np.mean(frame ** 2)))
+            voiced = rms >= self._utterance_rms_threshold
+
+            if not in_speech:
+                if voiced:
+                    in_speech = True
+                    utterance_start_pos = total - frame_samples
+                    last_speech_pos = total
                 continue
 
-            segment = self._ring_buffer.read_last(window_samples)
-            peak = float(np.max(np.abs(segment)))
+            if voiced:
+                last_speech_pos = total
 
-            # Skip truly dead silence (below noise floor)
-            if peak < 0.02:
+            utt_len = total - utterance_start_pos
+            silence_len = total - last_speech_pos
+            should_close = (
+                silence_len >= silence_samples_needed
+                or utt_len >= max_samples
+            )
+
+            if not should_close:
                 continue
 
-            # VAD gating: ALWAYS check hardware VAD when available.
-            # Motor noise on the GO2 produces peaks of 0.6-0.9 which
-            # would bypass any peak-based threshold. Only queue when
-            # the ReSpeaker firmware detects actual voice activity.
-            if self._vad_check_fn is not None:
-                if not self._vad_check_fn():
-                    continue
-                print(f"[SEG] VAD-gated segment queued (peak={peak:.3f})")
-            else:
-                # No hardware VAD — fall back to peak threshold
-                if peak < 0.10:
-                    continue
-                print(f"[SEG] Peak-gated segment queued (peak={peak:.3f})")
+            if utt_len >= min_samples:
+                samples = min(utt_len, max_samples)
+                segment = self._ring_buffer.read_last(samples)
 
-            t_speech_end = time.monotonic()
-            self._segment_queue.put((segment, t_speech_end))
+                vad_note = ""
+                if self._vad_check_fn is not None:
+                    vad_hit = self._vad_check_fn()
+                    vad_note = f" vad={'hit' if vad_hit else 'miss (advisory)'}"
+
+                print(f"[SEG] utterance closed "
+                      f"len={utt_len / self._sample_rate:.2f}s"
+                      f"{vad_note}")
+
+                t_speech_end = time.monotonic()
+                self._segment_queue.put((segment, t_speech_end))
+
+            in_speech = False
 
     def _inference_loop(self) -> None:
         """Pull segments from queue, run Whisper, fire callbacks on match."""
@@ -396,6 +437,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
             beam_size=1,
             language="en",
             initial_prompt="come here",
+            vad_filter=True,
         )
 
         seg_count = 0
@@ -415,10 +457,18 @@ class WhisperPhraseDetector(WakePhraseDetector):
                       f"conf={confidence:.2f} logprob={avg_logprob:.2f}")
                 continue
 
-            # Log all passing transcriptions (matched or not)
-            for trigger in self.TRIGGER_PHRASES:
-                if trigger in text:
-                    return PhraseDetection(phrase=trigger, confidence=confidence)
+            match = match_trigger(
+                text,
+                self.TRIGGER_PHRASES,
+                ratio_threshold=self._phrase_ratio_threshold,
+            )
+            if match is not None:
+                if match.ratio < 1.0:
+                    print(f"[WHISPER] fuzzy match: heard '{match.heard}' "
+                          f"~ '{match.phrase}' ratio={match.ratio:.2f}")
+                return PhraseDetection(
+                    phrase=match.phrase, confidence=confidence
+                )
 
             # Passed thresholds but didn't match trigger phrase
             if text:
@@ -449,8 +499,15 @@ class WhisperPhraseDetector(WakePhraseDetector):
 
         confidence = 0.85
 
-        for trigger in self.TRIGGER_PHRASES:
-            if trigger in text:
-                return PhraseDetection(phrase=trigger, confidence=confidence)
+        match = match_trigger(
+            text,
+            self.TRIGGER_PHRASES,
+            ratio_threshold=self._phrase_ratio_threshold,
+        )
+        if match is not None:
+            if match.ratio < 1.0:
+                print(f"[WHISPER] fuzzy match (HF): heard '{match.heard}' "
+                      f"~ '{match.phrase}' ratio={match.ratio:.2f}")
+            return PhraseDetection(phrase=match.phrase, confidence=confidence)
 
         return None

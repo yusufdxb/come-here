@@ -98,28 +98,20 @@ def main():
     print(f"Found ReSpeaker at device index {respeaker_dev}")
 
     # --- Whisper setup (streaming) ---
-    # Hardware VAD (ReSpeaker firmware) does NOT work when GO2 motors are
-    # running — motor noise overwhelms it, VAD stays permanently False.
-    # Instead, use hop=1000ms and let Whisper's own no_speech_prob filter
-    # motor noise. This was the proven working config from 2026-04-08.
-    print("Loading Whisper (base.en / cpu / int8, no VAD, hop=1000ms)...")
+    # Reads the ReSpeaker DSP channel (ch 0) via mono open — beamformer, AEC,
+    # AGC, and NS are applied in firmware, so no software gain or highpass is
+    # needed. Segmenter uses utterance endpointing, so no hop tuning either.
+    # Motor-noise looseness on the thresholds is kept: Whisper still hears
+    # "come here" at 0.28–0.45 conf and no_speech_prob inflates under motors.
+    print("Loading Whisper (base.en / cpu / int8, DSP ch0, utterance endpointing)...")
     detector = WhisperPhraseDetector(
         model_size="base.en",
         device="cpu",
         compute_type="int8",
         mic_device=respeaker_dev,
-        mic_channels=6,
-        mic_beam_channel=1,
-        mic_gain=40.0,     # raw ch1 peaks ~0.03; at 25x range is ~1m, 40x extends to ~2-3m
-        window_duration_s=1.5,
-        hop_duration_ms=1000,  # 1s hop — limits inference rate, Whisper filters noise
-        end_silence_ms=200,
-        energy_threshold=0.001,
-        confidence_threshold=0.30,  # motor noise degrades logprobs; Whisper hears
-                                    # "come here" at 0.28-0.45 conf with motors on
-        no_speech_threshold=0.75,   # default 0.5 rejects real speech when motors are
-                                    # on (no_speech_prob inflated by motor noise)
-        vad_check_fn=None,  # disabled — firmware VAD dead with motors running
+        confidence_threshold=0.30,
+        no_speech_threshold=0.75,
+        vad_check_fn=None,
     )
 
     # State shared with callback
@@ -200,7 +192,7 @@ def main():
     print("  Say 'come here'!")
     print("  Robot will respond and rotate to you.")
     print(f"  Calibration: DOA offset={29.0}°, "
-          f"mic_gain=40.0, conf>=0.30, no_speech<=0.75")
+          f"ReSpeaker DSP ch0, conf>=0.30, no_speech<=0.75")
     print(f"  Rotation: cmd_z=2.0, est 90°/s")
     print("  Running for 300 seconds (Ctrl+C to stop).")
     print("========================================")

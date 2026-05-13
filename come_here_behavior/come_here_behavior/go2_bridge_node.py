@@ -34,7 +34,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from unitree_api.msg import Request
 
 
@@ -100,6 +100,15 @@ class Go2BridgeNode(Node):
         self._last_was_zero: bool = True  # suppress the first StopMove at startup
         self._vx_lock = threading.Lock()
 
+        # Unified velocity state (from /come_here/cmd_velocity). Republished at
+        # 20 Hz by _velocity_tick — mcf gait shakes at 10 Hz publish rate;
+        # 20 Hz matches what _rotate_worker uses and holds the gait latched.
+        self._vel_vx: float = 0.0
+        self._vel_yaw: float = 0.0
+        self._vel_last_update_s: float = 0.0
+        self._vel_active: bool = False
+        self._vel_lock = threading.Lock()
+
         # Rotation thread control: incrementing generation invalidates older rotations.
         self._rotate_generation: int = 0
         self._rotate_lock = threading.Lock()
@@ -125,11 +134,16 @@ class Go2BridgeNode(Node):
         self.create_subscription(
             String, '/come_here/cmd_say', self._say_cb, 10
         )
+        self.create_subscription(
+            Float64MultiArray, '/come_here/cmd_velocity', self._velocity_cb, 10
+        )
 
         # Forward-velocity control timer
         self._move_timer = self.create_timer(
             1.0 / self._move_rate_hz, self._move_tick
         )
+        # Unified-velocity republish timer at 20 Hz (holds mcf gait latched).
+        self._velocity_timer = self.create_timer(0.05, self._velocity_tick)
 
         self.get_logger().info(
             f'go2_bridge_node started (cmd_z={self._cmd_z}, '
@@ -222,19 +236,109 @@ class Go2BridgeNode(Node):
                 self._sport_pub.publish(make_req(self._stop_move_api_id))
                 self._last_was_zero = True
 
+    # -- cmd_velocity (unified forward + yaw for smooth approach) --
+
+    def _velocity_cb(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 2:
+            return
+        vx: float = float(msg.data[0])
+        yaw_rate: float = float(msg.data[1])
+
+        # Preempt any in-flight rotation worker (from TURN_TO_SOUND) so its
+        # Move(0, 0, z) publishes don't fight our unified command.
+        with self._rotate_lock:
+            self._rotate_generation += 1
+            self._rotate_cancel.set()
+            self._rotate_cancel = threading.Event()
+
+        # Zero-velocity is a stop: publish StopMove synchronously and disarm
+        # the republisher so no stray Move races with a following Sit/Stand.
+        if abs(vx) < 1e-3 and abs(yaw_rate) < 1e-3:
+            with self._vel_lock:
+                self._vel_active = False
+                self._vel_vx = 0.0
+                self._vel_yaw = 0.0
+            if not self._last_was_zero:
+                self._sport_pub.publish(make_req(self._stop_move_api_id))
+                self._last_was_zero = True
+            return
+
+        # Cache state for _velocity_tick to republish at 20 Hz (holds mcf gait).
+        with self._vel_lock:
+            self._vel_vx = vx
+            self._vel_yaw = yaw_rate
+            self._vel_last_update_s = time.time()
+            self._vel_active = True
+
+    def _velocity_tick(self) -> None:
+        """Republish cached velocity at 20 Hz so mcf gait stays latched.
+
+        Releases the gait with a single StopMove the moment incoming commands
+        stop arriving for >0.5 s (behavior node died / SIT fired / etc.).
+        """
+        with self._vel_lock:
+            if not self._vel_active:
+                return
+            vx = self._vel_vx
+            yaw_rate = self._vel_yaw
+            last_s = self._vel_last_update_s
+
+        # Staleness safety: if behavior stopped publishing, stop the robot.
+        if (time.time() - last_s) > 0.5:
+            with self._vel_lock:
+                self._vel_active = False
+                self._vel_vx = 0.0
+                self._vel_yaw = 0.0
+            if not self._last_was_zero:
+                self._sport_pub.publish(make_req(self._stop_move_api_id))
+                self._last_was_zero = True
+            return
+
+        if abs(vx) < 1e-3 and abs(yaw_rate) < 1e-3:
+            if not self._last_was_zero:
+                self._sport_pub.publish(make_req(self._stop_move_api_id))
+                self._last_was_zero = True
+            return
+
+        self._sport_pub.publish(
+            make_req(self._move_api_id, {'x': vx, 'y': 0.0, 'z': yaw_rate})
+        )
+        self._last_was_zero = False
+
     # -- cmd_sit / cmd_stand --
 
     def _sit_cb(self, msg: Bool) -> None:
         if not msg.data:
             return
-        self.get_logger().info(f'cmd_sit: api_id={self._sit_api_id}')
-        self._sport_pub.publish(make_req(self._sit_api_id))
+        # Disarm the 20 Hz velocity republisher so no Move races with Sit.
+        with self._vel_lock:
+            self._vel_active = False
+            self._vel_vx = 0.0
+            self._vel_yaw = 0.0
+        # Explicit StopMove, then defer Sit ~0.5 s so mcf trot can decelerate
+        # before Sport API receives the Sit api — otherwise Sit is silently
+        # dropped while the gait is still active.
+        self._sport_pub.publish(make_req(self._stop_move_api_id))
+        self._last_was_zero = True
+        self.get_logger().info(f'cmd_sit: stopping, will sit in 0.5s (api={self._sit_api_id})')
+        threading.Thread(target=self._deferred_sport_call,
+                         args=(self._sit_api_id, 0.5, 'sit'),
+                         daemon=True).start()
 
     def _stand_cb(self, msg: Bool) -> None:
         if not msg.data:
             return
+        with self._vel_lock:
+            self._vel_active = False
+            self._vel_vx = 0.0
+            self._vel_yaw = 0.0
         self.get_logger().info(f'cmd_stand: api_id={self._stand_api_id}')
         self._sport_pub.publish(make_req(self._stand_api_id))
+
+    def _deferred_sport_call(self, api_id: int, delay_s: float, label: str) -> None:
+        time.sleep(delay_s)
+        self.get_logger().info(f'cmd_{label} (deferred): api_id={api_id}')
+        self._sport_pub.publish(make_req(api_id))
 
     # -- cmd_say --
 
