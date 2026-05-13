@@ -65,8 +65,11 @@ class AudioNode(Node):
 
         # Wake phrase detector selection
         self.declare_parameter('mic_device', 'hw:0,0')
-        self.declare_parameter('mic_channels', 6)
-        self.declare_parameter('mic_beam_channel', 1)
+        # ReSpeaker ch 0 is the DSP output (beamformer + AEC + AGC + NS). Open
+        # the device mono and PortAudio hands us that channel — raw capsules
+        # (ch 1–5) are the old, range-limited path.
+        self.declare_parameter('mic_channels', 1)
+        self.declare_parameter('mic_beam_channel', 0)
 
         if wake_detector_type == 'whisper':
             from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
@@ -75,7 +78,6 @@ class AudioNode(Node):
             self._wake_detector: WakePhraseDetector = WhisperPhraseDetector(
                 model_size=self.get_parameter('whisper_model_size').value,
                 device=self.get_parameter('whisper_device').value,
-                chunk_duration_s=self.get_parameter('whisper_chunk_duration_s').value,
                 adapter_path=adapter_path,
                 mic_device=self.get_parameter('mic_device').value,
                 mic_channels=self.get_parameter('mic_channels').value,

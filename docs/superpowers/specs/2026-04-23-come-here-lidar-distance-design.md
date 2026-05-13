@@ -1,0 +1,292 @@
+# Come-Here LiDAR Distance Source — Design
+
+**Date:** 2026-04-23
+**Branch:** `lab/2026-04-16-approach-fix`
+**Context:** Resolves blocker #1 from the 2026-04-21 hardware session — pinhole/bbox distance estimate underestimates person range by ~2× when only legs are in frame, causing the GO2 to overshoot `approach_stop_distance_m = 0.8 m` and stop at ~0.4 m.
+
+## Goal
+
+Replace the pinhole/bbox-height distance estimate in `yolo_person_detector.py` with a LiDAR-based range for the detected person, published through the existing `/come_here/person_detection` contract so the behavior FSM is unchanged.
+
+Non-goals:
+- No change to bearing estimation (YOLO bbox center stays authoritative for "which direction").
+- No change to message contract, launch files, or `behavior_node.py`.
+- No camera intrinsics calibration or camera↔lidar TF work.
+- No change to the EMA bearing smoothing (blocker #2 — separate future change).
+
+## Hardware context (verified 2026-04-23 on Jetson `192.168.0.2`)
+
+| Fact | Value |
+|---|---|
+| LiDAR topic | `/utlidar/cloud_base` |
+| Message type | `sensor_msgs/msg/PointCloud2` |
+| Frame | `base_link` (axis-aligned with YOLO bearing, **no TF needed**) |
+| Rate | 15.4 Hz |
+| Points / frame | ~871 (already filtered/downsampled by Unitree stack) |
+| QoS | RELIABLE, KEEP_LAST, depth 1 |
+| Fields | `x, y, z, intensity, ring, time` (point_step 32 bytes) |
+
+Camera stays on `/camera/image_raw` published by standalone `go2_video_publisher.py` (must be launched manually — see RUN_NOTES).
+
+## Approach — bearing cone + torso-height gate
+
+YOLO answers "where is the person" (bearing). LiDAR answers "how far is that bearing" (range). YOLO's bearing filters LiDAR's points, so the returned range is person-specific, not nearest-anything.
+
+Filter points in the most recent cached `/utlidar/cloud_base`:
+
+```
+in_cone   = abs(atan2(y, x) − bearing_rad) < 0.14   # ±8° absorbs bbox jitter
+in_height = (z > 0.3) & (z < 1.8)                   # torso/legs; rejects floor, ceiling, tables
+in_front  = x > 0.2                                 # rejects self-returns
+in_range  = (x*x + y*y) < 25                        # ≤5 m (demo room)
+wedge = in_cone & in_height & in_front & in_range
+```
+
+Gate (must all pass, else fall back to YOLO bbox distance):
+- ≥5 points in wedge
+- Vertical extent `z.max − z.min ≥ 0.6 m` — requires a human-shaped column, not a chair or low obstacle
+
+Distance = `percentile(sqrt(x² + y²), 10)` over wedge points — robust to stray background returns.
+
+## Architecture
+
+One new file, one modified node.
+
+**New:** `come_here_perception/come_here_perception/lidar_distance_resolver.py`
+
+Pure numpy class. Zero ROS deps. Unit-testable with synthetic point clouds.
+
+```python
+class LidarDistanceResolver:
+    def __init__(self, cone_half_rad=0.14, z_min=0.3, z_max=1.8,
+                 x_min=0.2, max_range_m=5.0, min_points=5,
+                 min_vertical_extent_m=0.6, percentile=10.0):
+        ...
+
+    def refine(self, bearing_rad: float, cloud_xyz: np.ndarray | None
+               ) -> float | None:
+        """Return person distance in meters, or None if gate fails.
+
+        cloud_xyz: (N, 3) float32 array in base_link frame, or None.
+        """
+```
+
+**Modified:** `come_here_perception/come_here_perception/perception_node.py`
+
+- Adds param `use_lidar_distance` (default `True`) — kill-switch if hardware misbehaves.
+- Adds subscriber on `/utlidar/cloud_base` with matching RELIABLE / KEEP_LAST / depth=1 QoS.
+- `_on_cloud_base` parses `msg.data` once with a pre-built structured numpy dtype (zero-copy view), extracts the `xyz` columns into a contiguous `(N, 3) float32` array, stores as `self._latest_cloud_xyz` plus timestamp. That's it — no work in the callback path beyond parse+store.
+- In `_tick`, if `detected` and `use_lidar_distance` and cached cloud is not None and <0.5 s old: call `resolver.refine(bearing, cloud_xyz)`. On `None` return, log once at level INFO ("lidar gate failed — falling back to bbox distance") and use YOLO distance. On success, overwrite YOLO distance with LiDAR distance before publishing.
+
+No other files touched. `behavior_node.py`, launch files, message definitions all unchanged.
+
+## Latency
+
+| Stage | Cost |
+|---|---|
+| `np.frombuffer(msg.data, dtype=..)` + `xyz` view (per cloud arrival) | ~0.2 ms |
+| Wedge masks + percentile on ~871 pts (per tick) | ~0.1 ms |
+| Total added CPU vs. today | **<1 ms/tick** |
+| Worst-case cache staleness (cloud just before next frame arrives) | ≤67 ms |
+| End-to-end: image → YOLO → cloud wedge → publish | YOLO (~30-50 ms) + <1 ms = unchanged within noise |
+
+Callback groups: unchanged. `rclpy.spin` single-threaded serializes `_on_image`, `_on_cloud_base`, `_tick` → no race, no locks.
+
+## Fallback & failure modes
+
+| Situation | Behavior |
+|---|---|
+| No cloud received yet | YOLO bbox distance (pre-existing path) |
+| Cloud stale >0.5 s | YOLO bbox distance, log warning once |
+| Gate fails (too few points / too short column) | YOLO bbox distance, log INFO once per transition |
+| `use_lidar_distance = False` param | YOLO bbox distance always (quick hardware kill-switch) |
+| Multi-person same bearing | Returns closer one (acceptable for single-operator demo) |
+
+## Testing
+
+**Unit tests** (`come_here_perception/test/test_lidar_distance_resolver.py`, mock-safe, CI-runnable):
+
+- Synthetic cloud with one human-shaped column at 2.0 m, bearing 0 → resolver returns ~2.0 m.
+- Same cloud, bearing 0.5 rad → returns `None` (person out of cone).
+- Column too short (0.4 m tall) → returns `None` (gate fails).
+- Only 3 points in wedge → returns `None`.
+- Floor-only points (z < 0.3) → returns `None`.
+- Background clutter at 4.5 m + person at 2.0 m → returns ~2.0 m (percentile robust).
+
+**Integration test** (mock mode, no hardware):
+- `PerceptionNode` with `use_mock=False` and `use_lidar_distance=True`, replay a synthetic PointCloud2 + Image pair → verify published distance comes from lidar path.
+
+**Hardware validation** (Jetson, one session):
+1. Start `go2_video_publisher.py`; `ros2 launch come_here_bringup come_here.launch.py use_mock:=false`.
+2. Echo `/come_here/person_detection` at 3 m / 2 m / 1 m with operator standing full-body, legs-only, and upper-body-only.
+3. **Success criteria:** published distance matches tape-measure to ±0.15 m in all three postures (vs. today's 2× underestimate for legs-only).
+4. Run full come-here flow: wake phrase (injected via topic), APPROACH, confirm robot stops inside 0.8 ± 0.1 m instead of 0.4 m.
+
+## Rollback
+
+One-line rollback: launch with `use_lidar_distance:=false` param. No code revert needed.
+
+For full revert: `git revert <commit>` on `lab/2026-04-16-approach-fix` — single commit, touches only `perception_node.py` + new file.
+
+## Out of scope (deferred)
+
+- **Blocker #2** (YOLO bearing jitter EMA smoothing) — separate change.
+- TF-based camera→lidar fusion — current body-frame approach is sufficient without intrinsics.
+- Multi-person disambiguation via clustering — not needed for single-operator demo.
+- Merging `lab/2026-04-16-approach-fix` to `main` — blocked until both blockers resolved.
+
+## Hardware results 2026-04-23
+
+Operator stood toes on tape at 10/7/3 ft marks. Tape 0 at robot front bumper.
+Derived torso-from-LiDAR distance accounts for:
+- toes → torso body offset: ~0.20 m (body mass behind feet when standing)
+- bumper → LiDAR mount offset: ~0.25 m (L1 mounted on top/back of head)
+
+Per-distance steady-state samples (8–10 readings per pose, median shown):
+
+| Tape (toes) | Expected LiDAR-to-torso | LiDAR read | Bbox read | LiDAR err |
+|---|---|---|---|---|
+| 10 ft (3.05 m) | 3.50 m | **3.60 m** | 2.68 m (variable 2.04–2.73) | +0.10 m |
+| 7 ft (2.13 m) | 2.58 m | **2.55 m** | 2.12 m | −0.03 m |
+| 3 ft (0.91 m) | 1.36 m | **1.44 m** | 1.60 m | +0.08 m |
+
+**Result:** LiDAR within ±0.10 m of expected torso distance at all three ranges.
+Bbox is close at 7 ft full-body but **overestimates by ~0.50 m at 3 ft** (wrong direction
+for an approach stop — robot would think user is farther than they are and fail to
+stop in time). Blocker #1 is resolved by the LiDAR path.
+
+### Field-tuned gate thresholds
+
+Discovered during hardware that the spec's original gate (0.6 m vertical extent,
+min 5 points, `z_min=0.3`) was too strict for the GO2 L1 LiDAR's limited vertical
+FOV at close range. Relaxed to:
+
+- `lidar_min_vertical_extent_m = 0.15` (was 0.6)
+- `lidar_min_points = 4` (was 5)
+- `lidar_z_min = 0.1` (was 0.3) — so lower-leg returns count when upper body is
+  outside the L1's vertical FOV at <1.5 m range
+
+All three are exposed as ROS params for further tuning. The wedge + bearing + range
+filters are unchanged (still person-specific via YOLO bearing, not nearest-anything).
+
+### Jetson environmental fixes (applied in perception_node.py / yolo_person_detector.py)
+
+1. **LiDAR publisher clock skew.** Unitree bare-DDS lidar stamps clouds with a
+   clock ~188 days behind Jetson system time. Using `msg.header.stamp` made every
+   cloud look stale. Switched to arrival-time (`get_clock().now()`) as the
+   freshness reference.
+2. **Cloud-callback starvation under single-threaded executor.** On CPU-only YOLO
+   (Jetson driver too old for this torch CUDA build), tick inference runs ~1 Hz
+   and starves cloud callbacks to ~1 Hz instead of the 15 Hz publish rate.
+   Bumped `lidar_max_age_s` default from 0.5 s to 2.0 s to absorb the jitter
+   without false-fallbacks.
+3. **Ultralytics on-import network hang.** No internet on Jetson → pypi update
+   check hangs indefinitely. Baked `YOLO_OFFLINE=true` / `ULTRALYTICS_OFFLINE=true`
+   env-var defaults into `yolo_person_detector.py` at import time.
+
+### Geometric stop-distance implication
+
+With LiDAR now accurate, `approach_stop_distance_m = 0.8 m` stops the robot when
+LiDAR reads 0.8 m to torso. Accounting for offsets, user's toes end up ~0.35 m
+from the bumper at stop. For a demo where operator comfort matters, consider
+bumping the param to ~1.2 m (user's toes ~0.75 m from bumper). Kept at 0.8 m
+for 2026-04-23 session per operator decision.
+
+### Not completed this session
+
+- **Task 7** (full come-here approach → 0.8 m stop regression) deferred — robot
+  battery depleted before the walk-and-stop test. Pick up next session.
+
+---
+
+## Hardware full-loop validation 2026-04-24
+
+Task 7 picked up. LiDAR distance alone did **not** close blocker #2 — a new
+constellation of issues surfaced once the robot was actually walking toward the
+operator. Resolved live over the session; the final run is a clean wake → walk
+→ stop → sit → identify → speak → stand loop.
+
+### What broke during live iteration
+
+1. **ReSpeaker DOA dead (carried from 04-21).** LISTENING waits for
+   `direction_confidence >= 0.5` from `/come_here/audio_direction`. The XMOS
+   DSP is borked so confidence is always ~0. Fix: `skip_turn_to_sound` param
+   (default `false`, set `true` in `behavior_params.yaml` for current hardware
+   reality). LISTENING jumps straight to `SEARCH_FOR_PERSON`.
+2. **YOLO bearing jitter ±0.6 rad frame-to-frame (blocker #2 from 04-21).**
+   Fix: EMA smoothing α=0.3 on `_person_cb`, reset on detection gap.
+3. **Robot walked *through* operator.** Two independent causes:
+   - **LiDAR systematically blind <1 m.** L1 vertical FOV (~±15°) means at
+     0.5–0.8 m the person's chest is above and legs below the slab — cone
+     sees floor/wall behind them, reports 2–4 m, stop never fires. Wider
+     horizontal cone (`cone_half_rad 0.14 → 0.30`) helps at 0.8–1.5 m but
+     doesn't fix the vertical-FOV problem close-in.
+   - **Stop check skipped on `dist == 0`.** When YOLO lost the person at
+     close range (common: fills frame, bbox conf drops), perception published
+     `det=0, dist=0`. Stop condition `dist > 0 and dist <= 0.8` silently
+     didn't trigger — robot walked on lost-timeout (3 s at 0.5 m/s = 1.5 m
+     of blind travel).
+   Fix: added **bbox-fraction close-range trigger** — `bbox_h_frac >= 0.75`
+   fires SIT regardless of LiDAR distance. Camera FOV is wider than LiDAR
+   vertical, and bbox size is monotonic in proximity.
+4. **Safety stop caused shake-in-place.** First attempt halted motion on
+   every `det=0` tick. YOLO flickers at ~every 2–3 frames close-in → 10 Hz
+   `[0,0] / [0.5,0] / [0,0]` setpoint churn → mcf gait can't latch. Fix:
+   **debounce** — require `safety_stop_miss_threshold=3` consecutive det=0
+   ticks (~300 ms) before publishing StopMove.
+5. **mcf gait unreliable at vx=0.5.** Bumped `approach_speed 0.5 → 0.6` for
+   trot-engagement margin (per `GO2 mcf gait envelope` memory).
+6. **mcf didn't latch with 10 Hz Move publish.** `_velocity_cb` in
+   `go2_bridge_node` only published Move on each incoming ROS message (10 Hz).
+   The rotate worker elsewhere in the same file uses 20 Hz (`publish_dt=0.05`).
+   Fix: added `_velocity_tick` 20 Hz timer that re-publishes cached vx/yaw
+   state continuously — holds the gait latched. Staleness >0.5 s auto-issues
+   StopMove so a dead behavior node can't leave the robot running.
+7. **Sit API silently dropped while trot active.** After step 6, mcf was
+   engaged so tightly that a Sit api_id=1009 sent immediately after StopMove
+   was processed *while* the dog was still completing a trot cycle — and
+   ignored. Fix: in `_sit_cb`, publish StopMove synchronously, then spawn a
+   daemon thread that sleeps 0.5 s and publishes Sit. Gives the gait time to
+   decelerate before the transition command arrives.
+8. **Over-rotation in ALIGN.** Previous 0.26 rad align deadband + 1.0/1.2 rad/s
+   yaw meant each ALIGN commit rotated 0.40–0.48 rad, past the person. Fix:
+   tightened `align_threshold 0.26 → 0.15 rad` and lowered yaw rates to
+   0.6/0.6 rad/s — per-commit rotation is now 0.24 rad max.
+
+### Final run — 2026-04-24 17:37 session, 2.5 m start
+
+```
+t=322.27  Wake "come here"
+t=322.33  LISTENING → SEARCH_FOR_PERSON (skip_turn_to_sound)
+t=322.43  SEARCH_FOR_PERSON → APPROACH_PERSON
+t=323.43  WALK bearing=-0.02 dist=3.01 bbox=0.65 vx=0.60
+t=324.43  WALK bearing=+0.19 dist=2.49 bbox=0.67
+t=325.43  WALK bearing=+0.26 dist=2.03 bbox=0.73
+t=325.53  Close-enough: dist=1.84 m bbox_h_frac=0.77 (trigger: bbox)
+t=325.53  cmd_sit: stopping, will sit in 0.5s (api=1009)
+t=326.03  cmd_sit (deferred): api_id=1009  ← robot physically sits
+t=326.73  "I am here" TTS
+t=331.83  cmd_stand
+t=332.43  State: SIT_AND_IDENTIFY → IDLE
+```
+
+**Operator verification: full pipeline executed cleanly — walk, stop, sit,
+speak "I am here", stand.**
+
+### Open/deferred items (not blockers)
+
+- **Slight leftward drift during WALK.** mcf forward gait isn't perfectly
+  symmetric; dog arcs ~0.1–0.2 m left over 3 s of walking. Hardware-level,
+  not software. No fix attempted.
+- **Face detection unreliable at bbox=0.77.** Face detector returned
+  `present=False` at the stop distance. Either face detector threshold is
+  too strict, or stop distance is too close for the face model's expected
+  face size. Consider bumping `bbox_stop_fraction 0.75 → 0.65` to stop a
+  bit further back for face detection, or loosening mediapipe's min_conf.
+- **LiDAR reports high distance at stop.** LiDAR said `dist=1.84 m` when
+  operator was physically ~0.8 m away. Expected — L1 vertical FOV sees floor
+  behind the user, not the user. Bbox-fraction carried the stop trigger.
+- **YOLO is CPU-only.** PyTorch CUDA init fails ("NVIDIA driver too old") so
+  inference runs on Jetson CPU at ~1–2 Hz even at `imgsz=320`. Bearing
+  updates are stale relative to motion. TensorRT/ONNX export is the proper
+  fix; deferred.

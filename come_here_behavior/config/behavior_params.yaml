@@ -2,13 +2,44 @@ behavior_node:
   ros__parameters:
     tick_rate_hz: 10.0
     direction_confidence_threshold: 0.5
+    # 2026-04-30: DOA confirmed publishing on hardware (az ~0.6 rad, conf 0.9)
+    # so TURN_TO_SOUND is back in the loop. If DOA regresses, set true again.
+    skip_turn_to_sound: false
+    # Max time LISTENING will wait for a high-confidence DOA reading before
+    # falling back to SEARCH_FOR_PERSON without rotation.
+    listening_timeout_s: 1.5
+    # Consecutive person-detection frames required before SEARCH commits to
+    # APPROACH. YOLO at 1-2 Hz on CPU produces occasional false positives
+    # mid-rotation; requiring 2 frames filters those without much delay.
+    search_min_consecutive_detections: 2
     person_confidence_threshold: 0.5
     approach_stop_distance_m: 0.8
     search_timeout_s: 10.0
-    approach_speed: 0.3
-    lost_timeout_s: 1.0
+    # mcf gait requires vx >= 0.5 m/s and a stable setpoint held for ~1 s+
+    # to engage a clean trot. 0.5 is on the engagement floor; observed
+    # intermittent shake-in-place when the gait failed to latch. 0.6 gives
+    # margin without being so fast the robot overshoots stop distance.
+    approach_speed: 0.6
+    # Tightened 0.26 -> 0.15 rad (~8.6°) for precise ALIGN convergence.
+    # With the previous 15° deadband + ~1.0 rad/s yaw, ALIGN committed to WALK
+    # before actually facing the person, producing "rotate left, walk past".
+    approach_align_threshold_rad: 0.15
+    # Lowered yaw rates 1.0/1.2 -> 0.6/0.6 rad/s so min_align_s = 0.4 s gives
+    # ~0.24 rad per ALIGN commit instead of 0.4/0.48 rad — less overshoot.
+    approach_ccw_yaw: 0.6
+    approach_cw_yaw: 0.6
+    approach_min_align_s: 0.4
+    approach_min_walk_s: 1.5
+    # EMA alpha on YOLO bbox-center bearing (blocker #2). 0.3 damps the
+    # observed ±0.6 rad frame-to-frame jitter without over-lagging real turns.
+    bearing_ema_alpha: 0.3
+    lost_timeout_s: 3.0
     # SIT_AND_IDENTIFY sequence timing
-    sit_settle_s: 1.0
+    # Time from cmd_sit publish until the physical sit is visibly settled.
+    # go2_bridge inserts a 0.5 s StopMove pre-delay before issuing Sit api_id,
+    # and the Go2's sit motion itself takes ~2-2.5 s. Setting this below the
+    # combined ~3 s causes "I am here" to fire while the dog is still folding.
+    sit_settle_s: 3.0
     face_timeout_s: 1.5
     speak_hold_s: 5.0
     stand_settle_s: 0.5

@@ -2,6 +2,7 @@ perception_node:
   ros__parameters:
     use_mock: true
     publish_rate_hz: 10.0
+    bearing_ema_alpha: 0.3
 
 face_detector_node:
   ros__parameters:
