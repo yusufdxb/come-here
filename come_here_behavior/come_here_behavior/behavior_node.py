@@ -16,7 +16,7 @@ Subscribes:
 
 Publishes:
   /come_here/cmd_rotate             (std_msgs/Float64) - target rotation in radians
-  /come_here/cmd_move               (std_msgs/Float64) - forward velocity command
+  /come_here/cmd_velocity           (std_msgs/Float64MultiArray) [vx, yaw_rate]
   /come_here/cmd_sit                (std_msgs/Bool)
   /come_here/cmd_stand              (std_msgs/Bool)
   /come_here/cmd_say                (std_msgs/String)
@@ -24,6 +24,7 @@ Publishes:
   /come_here/state                  (std_msgs/String)
 """
 
+import math
 from enum import Enum, auto
 
 import rclpy
@@ -162,7 +163,6 @@ class BehaviorNode(Node):
 
         # -- Publishers --
         self._rotate_pub = self.create_publisher(Float64, '/come_here/cmd_rotate', 10)
-        self._move_pub = self.create_publisher(Float64, '/come_here/cmd_move', 10)
         self._velocity_pub = self.create_publisher(
             Float64MultiArray, '/come_here/cmd_velocity', 10
         )
@@ -191,37 +191,61 @@ class BehaviorNode(Node):
             self._transition(State.LISTENING)
 
     def _direction_cb(self, msg: Float64MultiArray):
-        if len(msg.data) >= 2:
-            self._last_azimuth = msg.data[0]
-            self._last_dir_confidence = msg.data[1]
+        if len(msg.data) < 2:
+            return
+        azimuth, confidence = msg.data[0], msg.data[1]
+        # Reject corrupt readings before they become a rotation command: a
+        # non-finite or wildly out-of-range azimuth would otherwise drive a
+        # full-rate spin (a bad DOA value of 50.0 rad => ~2864 deg target).
+        if not (math.isfinite(azimuth) and math.isfinite(confidence)):
+            self.get_logger().warn(
+                f'Ignoring non-finite audio_direction {list(msg.data[:2])}'
+            )
+            return
+        if abs(azimuth) > math.pi:
+            self.get_logger().warn(
+                f'Ignoring out-of-range azimuth {azimuth:.2f} rad (|az| > pi)'
+            )
+            return
+        self._last_azimuth = azimuth
+        self._last_dir_confidence = confidence
 
     def _person_cb(self, msg: Float64MultiArray):
-        if len(msg.data) >= 4:
-            raw_bearing = msg.data[0]
-            detected = bool(msg.data[3])
-            # 5th field added 2026-04-24 for close-range stop trigger. Older
-            # publishers without it → default 0 (trigger inactive).
-            self._person_bbox_h_frac = float(msg.data[4]) if len(msg.data) >= 5 else 0.0
-            # EMA smoothing on bearing to damp YOLO bbox-center jitter (±0.6 rad
-            # frame-to-frame observed). Reset to raw on first sighting after
-            # a detection gap so we don't carry stale bearing.
-            if detected and self._person_detected:
-                a = self._bearing_ema_alpha
-                self._person_bearing = a * raw_bearing + (1.0 - a) * self._person_bearing
-            else:
-                self._person_bearing = raw_bearing
-            self._person_distance = msg.data[1]
-            self._person_confidence = msg.data[2]
-            self._person_detected = detected
-            # Maintain a consecutive-detection counter so SEARCH can require
-            # a minimum number of stable hits before committing to APPROACH.
-            # Resets immediately on any detection gap.
-            if detected and self._person_confidence >= self._person_threshold:
-                self._person_consec_hits += 1
-            else:
-                self._person_consec_hits = 0
-            if detected:
-                self._person_last_seen = self.get_clock().now()
+        if len(msg.data) < 4:
+            return
+        # Drop the whole message if any field is non-finite, since a NaN
+        # bearing would otherwise propagate straight into the approach
+        # controller's yaw command.
+        if not all(math.isfinite(v) for v in msg.data):
+            self.get_logger().warn(
+                'Ignoring person_detection with non-finite values'
+            )
+            return
+        raw_bearing = msg.data[0]
+        detected = bool(msg.data[3])
+        # 5th field added 2026-04-24 for close-range stop trigger. Older
+        # publishers without it → default 0 (trigger inactive).
+        self._person_bbox_h_frac = float(msg.data[4]) if len(msg.data) >= 5 else 0.0
+        # EMA smoothing on bearing to damp YOLO bbox-center jitter (±0.6 rad
+        # frame-to-frame observed). Reset to raw on first sighting after
+        # a detection gap so we don't carry stale bearing.
+        if detected and self._person_detected:
+            a = self._bearing_ema_alpha
+            self._person_bearing = a * raw_bearing + (1.0 - a) * self._person_bearing
+        else:
+            self._person_bearing = raw_bearing
+        self._person_distance = msg.data[1]
+        self._person_confidence = msg.data[2]
+        self._person_detected = detected
+        # Maintain a consecutive-detection counter so SEARCH can require
+        # a minimum number of stable hits before committing to APPROACH.
+        # Resets immediately on any detection gap.
+        if detected and self._person_confidence >= self._person_threshold:
+            self._person_consec_hits += 1
+        else:
+            self._person_consec_hits = 0
+        if detected:
+            self._person_last_seen = self.get_clock().now()
 
     def _face_cb(self, msg: FaceDetection):
         self._last_face_result = msg
@@ -491,14 +515,32 @@ class BehaviorNode(Node):
             self._approach_phase_start = None
 
     def _stop_motion(self):
-        move_msg = Float64()
-        move_msg.data = 0.0
-        self._move_pub.publish(move_msg)
+        """Halt all locomotion by publishing a zero velocity on cmd_velocity.
+
+        cmd_velocity is the topic the GO2 bridge's gait republisher acts on; a
+        [0.0, 0.0] message disarms that republisher and triggers a synchronous
+        StopMove. Publishing to cmd_move instead (the previous behaviour) left
+        the cmd_velocity republisher armed, so the robot kept walking on its
+        last setpoint until the bridge's staleness timer tripped ~0.5 s later.
+        """
+        stop = Float64MultiArray()
+        stop.data = [0.0, 0.0]
+        self._velocity_pub.publish(stop)
 
     def _seconds_since(self, start_time) -> float:
         if start_time is None:
             return 0.0
         return (self.get_clock().now() - start_time).nanoseconds / 1e9
+
+    def destroy_node(self):
+        """Emit a final stop so the robot does not coast on a stale setpoint
+        if the behavior node is killed mid-APPROACH. Best-effort: the bridge's
+        staleness timer remains the hard backstop."""
+        try:
+            self._stop_motion()
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            pass
+        super().destroy_node()
 
 
 def main(args=None):

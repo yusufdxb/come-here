@@ -1,11 +1,13 @@
 """Bridge node: translate behavior commands into GO2 Sport + audiohub API calls.
 
 Subscribes:
-  /come_here/cmd_rotate  (std_msgs/Float64) - target yaw angle in rad (+ = left)
-  /come_here/cmd_move    (std_msgs/Float64) - forward velocity in m/s, 0 = stop
-  /come_here/cmd_sit     (std_msgs/Bool)    - True triggers StandDown
-  /come_here/cmd_stand   (std_msgs/Bool)    - True triggers BalanceStand
-  /come_here/cmd_say     (std_msgs/String)  - phrase to vocalize via audiohub WAV
+  /come_here/cmd_rotate    (std_msgs/Float64)           - target yaw angle in rad (+ = left)
+  /come_here/cmd_velocity  (std_msgs/Float64MultiArray) - [vx, yaw_rate] unified gait command
+  /come_here/cmd_sit       (std_msgs/Bool)              - True triggers Sit
+  /come_here/cmd_stand     (std_msgs/Bool)              - True triggers BalanceStand
+  /come_here/cmd_say       (std_msgs/String)            - phrase to vocalize via audiohub WAV
+  /come_here/estop         (std_msgs/Bool)              - True halts motion and blocks Move
+  /come_here/cmd_move      (std_msgs/Float64)           - DEPRECATED legacy forward-velocity path
 
 Publishes:
   /api/sport/request     (unitree_api/msg/Request) - Sport API requests
@@ -22,11 +24,14 @@ Parameters:
   wav_dir               (str)                  - directory containing <phrase>.wav files
   wav_chunk_size_bytes  (int,   default 16384) - audiohub base64 chunk size
   wav_chunk_delay_s     (float, default 0.15)  - sleep between audiohub chunk publishes
+  max_vx                (float, default 1.0)   - safety clamp on forward speed (m/s)
+  max_yaw_rate          (float, default 2.5)   - safety clamp on yaw rate (rad/s)
 """
 
 import base64
 import datetime
 import json
+import math
 import os
 import random
 import threading
@@ -36,6 +41,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from unitree_api.msg import Request
+
+from come_here_behavior.safety_limits import clamp_velocity
 
 
 def make_req(api_id, params=None):
@@ -74,6 +81,11 @@ class Go2BridgeNode(Node):
         )
         self.declare_parameter('wav_chunk_size_bytes', 16384)
         self.declare_parameter('wav_chunk_delay_s', 0.15)
+        # Safety clamps: set well above every calibrated setpoint (approach
+        # vx 0.6, approach yaw 0.6, rotate cmd_z 2.0) so they only ever catch
+        # corrupt or runaway values, never normal operation.
+        self.declare_parameter('max_vx', 1.0)
+        self.declare_parameter('max_yaw_rate', 2.5)
 
         self._cmd_z: float = float(self.get_parameter('cmd_z').value)
         self._deg_per_sec: float = float(self.get_parameter('deg_per_sec').value)
@@ -89,6 +101,8 @@ class Go2BridgeNode(Node):
         self._wav_chunk_delay_s: float = float(
             self.get_parameter('wav_chunk_delay_s').value
         )
+        self._max_vx: float = float(self.get_parameter('max_vx').value)
+        self._max_yaw_rate: float = float(self.get_parameter('max_yaw_rate').value)
 
         # -- Publishers --
         self._sport_pub = self.create_publisher(Request, '/api/sport/request', 10)
@@ -118,6 +132,10 @@ class Go2BridgeNode(Node):
         # Audio thread: drop new cmd_say if a previous playback is still streaming.
         self._audio_busy = threading.Event()
 
+        # Emergency stop: when True, every Move publish path is blocked until
+        # an estop=False message is received. Simple bool, GIL-atomic.
+        self._estopped: bool = False
+
         # -- Subscribers --
         self.create_subscription(
             Float64, '/come_here/cmd_rotate', self._rotate_cb, 10
@@ -137,6 +155,9 @@ class Go2BridgeNode(Node):
         self.create_subscription(
             Float64MultiArray, '/come_here/cmd_velocity', self._velocity_cb, 10
         )
+        self.create_subscription(
+            Bool, '/come_here/estop', self._estop_cb, 10
+        )
 
         # Forward-velocity control timer
         self._move_timer = self.create_timer(
@@ -153,7 +174,12 @@ class Go2BridgeNode(Node):
     # -- cmd_rotate --
 
     def _rotate_cb(self, msg: Float64) -> None:
+        if self._estopped:
+            return
         target_rad: float = float(msg.data)
+        if not math.isfinite(target_rad):
+            self.get_logger().warn(f'Ignoring non-finite cmd_rotate {target_rad}')
+            return
         target_deg: float = abs(target_rad * 180.0 / 3.141592653589793)
         duration: float = max(0.3, min(target_deg / self._deg_per_sec, 4.0))
         sign: float = 1.0 if target_rad > 0 else -1.0
@@ -195,11 +221,12 @@ class Go2BridgeNode(Node):
         params = {'x': 0.0, 'y': 0.0, 'z': z_cmd}
 
         while (time.time() - start) < duration:
-            if cancel_event.is_set():
-                # A newer rotation preempted us — do NOT publish StopMove,
-                # the newer worker is already driving the robot.
+            if cancel_event.is_set() or self._estopped:
+                # A newer rotation preempted us, or estop fired. Do NOT
+                # publish StopMove here: the preempting worker or the estop
+                # handler owns the robot's state.
                 self.get_logger().info(
-                    f'rotate gen={generation} preempted at '
+                    f'rotate gen={generation} halted at '
                     f'{time.time() - start:.2f}s'
                 )
                 return
@@ -223,6 +250,8 @@ class Go2BridgeNode(Node):
             self._current_vx = float(msg.data)
 
     def _move_tick(self) -> None:
+        if self._estopped:
+            return
         with self._vx_lock:
             vx: float = self._current_vx
         if abs(vx) > 1e-3:
@@ -241,8 +270,14 @@ class Go2BridgeNode(Node):
     def _velocity_cb(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 2:
             return
-        vx: float = float(msg.data[0])
-        yaw_rate: float = float(msg.data[1])
+        if self._estopped:
+            return
+        # Clamp externally-sourced velocity to safe magnitudes. A non-finite
+        # component collapses the whole command to a stop (0.0, 0.0).
+        vx, yaw_rate = clamp_velocity(
+            float(msg.data[0]), float(msg.data[1]),
+            self._max_vx, self._max_yaw_rate,
+        )
 
         # Preempt any in-flight rotation worker (from TURN_TO_SOUND) so its
         # Move(0, 0, z) publishes don't fight our unified command.
@@ -276,6 +311,8 @@ class Go2BridgeNode(Node):
         Releases the gait with a single StopMove the moment incoming commands
         stop arriving for >0.5 s (behavior node died / SIT fired / etc.).
         """
+        if self._estopped:
+            return
         with self._vel_lock:
             if not self._vel_active:
                 return
@@ -304,6 +341,32 @@ class Go2BridgeNode(Node):
             make_req(self._move_api_id, {'x': vx, 'y': 0.0, 'z': yaw_rate})
         )
         self._last_was_zero = False
+
+    # -- estop --
+
+    def _estop_cb(self, msg: Bool) -> None:
+        """Emergency stop. estop=True halts the robot immediately and blocks
+        every Move publish path until an estop=False message is received."""
+        if msg.data:
+            self._estopped = True
+            with self._vel_lock:
+                self._vel_active = False
+                self._vel_vx = 0.0
+                self._vel_yaw = 0.0
+            with self._vx_lock:
+                self._current_vx = 0.0
+            with self._rotate_lock:
+                self._rotate_generation += 1
+                self._rotate_cancel.set()
+                self._rotate_cancel = threading.Event()
+            self._sport_pub.publish(make_req(self._stop_move_api_id))
+            self._last_was_zero = True
+            self.get_logger().warn(
+                'ESTOP ENGAGED: motion halted, Move commands blocked'
+            )
+        else:
+            self._estopped = False
+            self.get_logger().warn('ESTOP RELEASED: motion commands re-enabled')
 
     # -- cmd_sit / cmd_stand --
 
@@ -402,6 +465,17 @@ class Go2BridgeNode(Node):
             self.get_logger().error(f'cmd_say: playback error for "{phrase}": {exc}')
         finally:
             self._audio_busy.clear()
+
+    def destroy_node(self):
+        """Emit a final StopMove so the GO2 does not hold its last gait
+        setpoint if the bridge process is killed."""
+        try:
+            with self._vel_lock:
+                self._vel_active = False
+            self._sport_pub.publish(make_req(self._stop_move_api_id))
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            pass
+        super().destroy_node()
 
 
 def main(args=None):
