@@ -57,3 +57,7 @@ go2_bridge_node:
     wav_dir: /home/unitree/come-here/come_here_audio/scripts
     wav_chunk_size_bytes: 16384
     wav_chunk_delay_s: 0.15
+    # Safety clamps (skeptic-review C4): set above all calibrated setpoints
+    # so they only catch corrupt/runaway values, never normal operation.
+    max_vx: 1.0
+    max_yaw_rate: 2.5
