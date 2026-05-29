@@ -35,7 +35,7 @@ jobs:
       - name: colcon build
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           source /opt/ros/humble/setup.bash
           # The Unitree SDK (unitree_api) is not available in CI, so rosdep is
           # skipped: all other declared deps (rclpy, std_msgs, sensor_msgs,
@@ -49,7 +49,7 @@ jobs:
       - name: pytest (per package, SDK-gated tests skip)
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           source /opt/ros/humble/setup.bash
           source install/setup.bash
           overall=0
