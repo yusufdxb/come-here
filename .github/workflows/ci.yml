@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: colcon build + pytest (ROS 2 Humble)
+    runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build and test tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3-colcon-common-extensions \
+            python3-pip
+          # numpy is pinned to match the dev machine; the test suite imports it
+          # directly (ring buffer, bearing smoother). Heavier perception deps
+          # (cv2, ultralytics, mediapipe, whisper) are lazily imported in source
+          # and mocked in tests, so they are intentionally not installed in CI.
+          pip3 install --no-cache-dir "numpy==1.26.4"
+
+      - name: colcon build
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/humble/setup.bash
+          # The Unitree SDK (unitree_api) is not available in CI, so rosdep is
+          # skipped: all other declared deps (rclpy, std_msgs, sensor_msgs,
+          # launch, launch_ros) ship with the ros-base image and come_here_msgs
+          # is built from this workspace.
+          colcon build \
+            --base-paths . \
+            --event-handlers console_direct+
+          echo "BUILD_OK"
+
+      - name: pytest (per package, SDK-gated tests skip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          overall=0
+          for pkg in come_here_audio come_here_behavior come_here_perception come_here_bringup; do
+            echo "==================== ${pkg} ===================="
+            # Run from inside the package so each package's own `test/` package
+            # is isolated (every package ships a test/__init__.py, which would
+            # otherwise collide across packages during a single pytest session).
+            ( cd "${pkg}" && PYTHONPATH="${PWD}:${PYTHONPATH:-}" \
+                python3 -m pytest test \
+                  -p no:cacheprovider \
+                  -v \
+                  --junit-xml="${GITHUB_WORKSPACE}/test-results/${pkg}.xml" ) || overall=1
+          done
+          exit "${overall}"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/*.xml
+          if-no-files-found: ignore
