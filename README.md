@@ -6,7 +6,7 @@
 
 An audio-visual approach system for the [Unitree GO2](https://www.unitree.com/go2) quadruped. The robot hears the phrase *"come here,"* estimates the speaker's direction from a microphone array, rotates toward them, locates them visually on the onboard camera, walks up, sits down in front of them, and says *"I am here."*
 
-The stack runs entirely on the Jetson Orin NX payload attached to the robot — no external compute, no network dependency at runtime.
+The stack runs entirely on the Jetson Orin NX payload attached to the robot, no external compute, no network dependency at runtime.
 
 ---
 
@@ -29,9 +29,9 @@ Per phase:
 |---|---|
 | Wake | faster-whisper (base.en, int8) streams raw ReSpeaker channel 1, a 300 Hz highpass filter rejects motor rumble, and a 3 s cooldown suppresses duplicates. |
 | Direction | ReSpeaker firmware DOA is read over USB HID. The ROS `audio_node` publishes single-shot VAD-gated samples at 10 Hz. A filtered path (3 s window, IQR outlier rejection, circular median at ±π) exists on `ReSpeakerDOAProvider.get_latched_direction` but is not yet wired into the publish loop. |
-| Rotate | The behavior node publishes the latest azimuth on `/come_here/cmd_rotate`. The bridge drives the GO2 Sport API with `Move(0, 0, cmd_z=2.0)` (~90°/s measured) for a duration proportional to the target angle. No deadzone — every rotation command is executed, so small angles still produce a short move. |
+| Rotate | The behavior node publishes the latest azimuth on `/come_here/cmd_rotate`. The bridge drives the GO2 Sport API with `Move(0, 0, cmd_z=2.0)` (~90°/s measured) for a duration proportional to the target angle. No deadzone, every rotation command is executed, so small angles still produce a short move. |
 | Search | YOLO11n filters COCO class 0 (person). Bearing comes from bbox center + camera HFOV; distance comes from bbox height under a pinhole model with a 1.7 m person-height prior. |
-| Approach | 10 Hz visual-servoing loop: while the person is detected, republish the latest bearing on `/come_here/cmd_rotate` and a constant `approach_speed` on `/come_here/cmd_move`. Stops when the distance estimate crosses `approach_stop_distance_m`. Falls back to `SEARCH_FOR_PERSON` if the person is lost for more than `lost_timeout_s`. Yaw control is open-loop per tick — no proportional controller in the MVP. |
+| Approach | 10 Hz visual-servoing loop: while the person is detected, republish the latest bearing on `/come_here/cmd_rotate` and a constant `approach_speed` on `/come_here/cmd_move`. Stops when the distance estimate crosses `approach_stop_distance_m`. Falls back to `SEARCH_FOR_PERSON` if the person is lost for more than `lost_timeout_s`. Yaw control is open-loop per tick, no proportional controller in the MVP. |
 | Sit + identify | Linear 4-substep sequence: sit (Sport API StandDown) → wait → fire a single MediaPipe face-detection inference on the latest frame → speak "I am here" via the GO2 audiohub API → wait → stand (Sport API BalanceStand) → return to IDLE. Face detection is informational in the MVP, not gating. |
 
 ---
@@ -54,7 +54,7 @@ graph TD
     behavior -->|/come_here/cmd_sit, cmd_stand, cmd_say| bridge
 ```
 
-Three functional nodes (audio, perception + face detector, behavior) communicate over typed topics. The behavior node is authoritative — everything downstream consumes its commands.
+Three functional nodes (audio, perception + face detector, behavior) communicate over typed topics. The behavior node is authoritative, everything downstream consumes its commands.
 
 ### Packages
 
@@ -104,21 +104,21 @@ All sensor inputs are behind ABCs with mock and real implementations. This lets 
 
 **Published by `audio_node`:**
 - `/come_here/wake_phrase` (`std_msgs/String`)
-- `/come_here/audio_direction` (`std_msgs/Float64MultiArray` — `[azimuth_rad, confidence]`)
+- `/come_here/audio_direction` (`std_msgs/Float64MultiArray`: `[azimuth_rad, confidence]`)
 
 **Published by `perception_node`:**
-- `/come_here/person_detection` (`std_msgs/Float64MultiArray` — `[bearing_rad, distance_m, confidence, detected]`)
+- `/come_here/person_detection` (`std_msgs/Float64MultiArray`: `[bearing_rad, distance_m, confidence, detected]`)
 
 **Published by `face_detector_node`:**
 - `/come_here/face_detection` (`come_here_msgs/FaceDetection`)
 
 **Published by `behavior_node`:**
-- `/come_here/state` — current state name
-- `/come_here/cmd_rotate` — target yaw angle (rad)
-- `/come_here/cmd_move` — forward velocity (m/s)
-- `/come_here/cmd_sit`, `cmd_stand` — Sport API triggers
-- `/come_here/cmd_say` — text for the audiohub bridge to vocalize
-- `/come_here/face_detect_request` — triggers a single face-detection inference
+- `/come_here/state`: current state name
+- `/come_here/cmd_rotate`: target yaw angle (rad)
+- `/come_here/cmd_move`: forward velocity (m/s)
+- `/come_here/cmd_sit`, `cmd_stand`: Sport API triggers
+- `/come_here/cmd_say`: text for the audiohub bridge to vocalize
+- `/come_here/face_detect_request`: triggers a single face-detection inference
 
 The Sport API and audiohub are wrapped by `go2_bridge_node` (in this repo, under `come_here_behavior/`). The behavior node speaks through the placeholder topics above; the bridge translates them into `/api/sport/request` and `/api/audiohub/request` DDS messages. The bridge is launched automatically when `use_mock:=false` and skipped in mock mode, so `unitree_api` is only required on the robot.
 
@@ -212,9 +212,9 @@ The `WhisperPhraseDetector` class accepts an `adapter_path=` kwarg that points a
 
 Per-package YAML files under each package's `config/`:
 
-- `come_here_audio/config/audio_params.yaml` — mic device, channel, gain, Whisper model/device/compute_type, thresholds, VAD gating
-- `come_here_perception/config/perception_params.yaml` — person detector (mock/YOLO), model path, confidence; face detector (mock/MediaPipe), min confidence
-- `come_here_behavior/config/behavior_params.yaml` — tick rate, direction and person confidence thresholds, approach speed, stop distance, SIT_AND_IDENTIFY timing (`sit_settle_s`, `face_timeout_s`, `speak_hold_s`, `stand_settle_s`), spoken text
+- `come_here_audio/config/audio_params.yaml`: mic device, channel, gain, Whisper model/device/compute_type, thresholds, VAD gating
+- `come_here_perception/config/perception_params.yaml`: person detector (mock/YOLO), model path, confidence; face detector (mock/MediaPipe), min confidence
+- `come_here_behavior/config/behavior_params.yaml`: tick rate, direction and person confidence thresholds, approach speed, stop distance, SIT_AND_IDENTIFY timing (`sit_settle_s`, `face_timeout_s`, `speak_hold_s`, `stand_settle_s`), spoken text
 
 All of these are overridable at launch time via `--ros-args --params-file`.
 
@@ -261,7 +261,7 @@ All of these are overridable at launch time via `--ros-args --params-file`.
 
 ## License
 
-MIT — see individual `package.xml` files.
+MIT, see individual `package.xml` files.
 
 ## Maintainer
 
