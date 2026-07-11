@@ -1,6 +1,6 @@
 # Whisper Fine-Tuning for "Come Here" Detection
 
-Fine-tunes Whisper (base.en) with LoRA on the RTX 5070 to improve
+Fine-tunes Whisper (base.en) with LoRA on an NVIDIA (Blackwell) consumer GPU to improve
 "come here" detection accuracy in noisy/real-world conditions.
 
 ## Quick Start
@@ -51,7 +51,7 @@ audio_node:
 | small.en | 244M | ~0.5 GB | moderate | better |
 | medium.en | 769M | ~1.5 GB | slower | best |
 
-All fit comfortably on the RTX 5070 (12 GB). Start with base.en.
+All fit comfortably on an NVIDIA (Blackwell) consumer GPU. Start with base.en.
 
 ## What This Does NOT Cover
 
