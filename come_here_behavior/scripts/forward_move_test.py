@@ -80,7 +80,7 @@ def main():
             pub.publish(make_req(MOVE_API_ID, {"x": args.vx, "y": 0.0, "z": 0.0}))
             time.sleep(period)
     except KeyboardInterrupt:
-        log("interrupt", "Ctrl+C — stopping")
+        log("interrupt", "Ctrl+C, stopping")
 
     log("stop", f"StopMove api_id={STOP_MOVE_API_ID}")
     pub.publish(make_req(STOP_MOVE_API_ID))

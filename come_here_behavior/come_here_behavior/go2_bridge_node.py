@@ -115,7 +115,7 @@ class Go2BridgeNode(Node):
         self._vx_lock = threading.Lock()
 
         # Unified velocity state (from /come_here/cmd_velocity). Republished at
-        # 20 Hz by _velocity_tick — mcf gait shakes at 10 Hz publish rate;
+        # 20 Hz by _velocity_tick, mcf gait shakes at 10 Hz publish rate;
         # 20 Hz matches what _rotate_worker uses and holds the gait latched.
         self._vel_vx: float = 0.0
         self._vel_yaw: float = 0.0
@@ -379,7 +379,7 @@ class Go2BridgeNode(Node):
             self._vel_vx = 0.0
             self._vel_yaw = 0.0
         # Explicit StopMove, then defer Sit ~0.5 s so mcf trot can decelerate
-        # before Sport API receives the Sit api — otherwise Sit is silently
+        # before Sport API receives the Sit api, otherwise Sit is silently
         # dropped while the gait is still active.
         self._sport_pub.publish(make_req(self._stop_move_api_id))
         self._last_was_zero = True

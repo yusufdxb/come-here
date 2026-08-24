@@ -1,4 +1,4 @@
-"""Safety tests for Go2BridgeNode — skeptic-review Priority 0 fixes.
+"""Safety tests for Go2BridgeNode, skeptic-review Priority 0 fixes.
 
 Requires the Unitree SDK (``unitree_api``). On a machine without it (e.g. a
 dev laptop) the whole module is skipped, because the GO2 bridge imports
@@ -6,9 +6,9 @@ dev laptop) the whole module is skipped, because the GO2 bridge imports
 Jetson or in any colcon workspace that also builds unitree_ros2.
 
 Covers:
-  C2 — /come_here/estop must halt the robot and block subsequent Move publishes
-  C3 — destroy_node() must emit a StopMove on shutdown
-  C4 — cmd_velocity must be clamped; a non-finite component collapses to a stop
+  C2, /come_here/estop must halt the robot and block subsequent Move publishes
+  C3, destroy_node() must emit a StopMove on shutdown
+  C4, cmd_velocity must be clamped; a non-finite component collapses to a stop
 """
 
 import pytest

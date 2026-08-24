@@ -1,6 +1,6 @@
 """Pure numeric safety guards for come-here motion commands.
 
-No ROS dependencies — importable and unit-testable on any machine, including
+No ROS dependencies, importable and unit-testable on any machine, including
 ones without the Unitree SDK. Both the behavior node and the GO2 bridge use
 these helpers so that no externally-sourced number reaches the robot
 unclamped or non-finite.

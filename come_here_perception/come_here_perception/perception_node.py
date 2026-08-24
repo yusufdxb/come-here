@@ -115,7 +115,7 @@ class PerceptionNode(Node):
             )
             self.get_logger().info(f'Subscribed to {cloud_topic} for distance refinement')
         elif use_mock:
-            self.get_logger().info('Mock mode — skipping LiDAR distance refinement')
+            self.get_logger().info('Mock mode, skipping LiDAR distance refinement')
         else:
             self.get_logger().info('LiDAR distance refinement disabled (use_lidar_distance=false)')
 
@@ -150,14 +150,14 @@ class PerceptionNode(Node):
         """
         if msg.point_step != 32:
             self.get_logger().warn(
-                f'cloud_base point_step={msg.point_step}, expected 32 — skipping'
+                f'cloud_base point_step={msg.point_step}, expected 32, skipping'
             )
             return
         arr = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, 8)
         self._latest_cloud_xyz = arr[:, :3].copy()
         # The Unitree bare-DDS lidar stamps with its own unsynchronised clock
         # (~188 days behind Jetson system time in practice). Use arrival time
-        # on the Jetson side instead — simpler and robust to that skew.
+        # on the Jetson side instead, simpler and robust to that skew.
         self._latest_cloud_stamp_s = self.get_clock().now().nanoseconds * 1e-9
         self._cloud_cb_count += 1
 
@@ -194,7 +194,7 @@ class PerceptionNode(Node):
                     self._bbox_fallback_count += 1
                     if not self._lidar_fallback_logged:
                         self.get_logger().info(
-                            f'lidar gate failed (bearing={result.bearing_rad:.2f}) — '
+                            f'lidar gate failed (bearing={result.bearing_rad:.2f}), '
                             f'falling back to bbox distance {result.distance_m:.2f} m'
                         )
                         self._lidar_fallback_logged = True
@@ -202,7 +202,7 @@ class PerceptionNode(Node):
                 self._bbox_fallback_count += 1
                 if not self._lidar_fallback_logged:
                     self.get_logger().info(
-                        f'no fresh cloud (age={cloud_age_s:.2f}s) — bbox distance '
+                        f'no fresh cloud (age={cloud_age_s:.2f}s), bbox distance '
                         f'{result.distance_m:.2f} m'
                     )
                     self._lidar_fallback_logged = True

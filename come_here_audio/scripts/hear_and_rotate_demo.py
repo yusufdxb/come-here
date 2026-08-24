@@ -98,7 +98,7 @@ def main():
     print(f"Found ReSpeaker at device index {respeaker_dev}")
 
     # --- Whisper setup (streaming) ---
-    # Reads the ReSpeaker DSP channel (ch 0) via mono open — beamformer, AEC,
+    # Reads the ReSpeaker DSP channel (ch 0) via mono open, beamformer, AEC,
     # AGC, and NS are applied in firmware, so no software gain or highpass is
     # needed. Segmenter uses utterance endpointing, so no hop tuning either.
     # Motor-noise looseness on the thresholds is kept: Whisper still hears

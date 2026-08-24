@@ -11,7 +11,7 @@ Distance is estimated from the bounding box height using a simple pinhole model.
 import math
 import os
 
-# Force ultralytics into offline mode before import — Jetson lab network
+# Force ultralytics into offline mode before import, Jetson lab network
 # has no DNS/internet and ultralytics' on-import pypi update-check hangs
 # indefinitely without these flags.
 os.environ.setdefault('YOLO_OFFLINE', 'true')

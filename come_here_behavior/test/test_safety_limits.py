@@ -1,4 +1,4 @@
-"""Unit tests for safety_limits — pure numeric motion guards (no ROS)."""
+"""Unit tests for safety_limits, pure numeric motion guards (no ROS)."""
 
 from come_here_behavior.safety_limits import clamp, clamp_velocity
 

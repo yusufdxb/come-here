@@ -18,7 +18,7 @@ Usage:
     # Use a larger base model
     python3 finetune_whisper.py --model openai/whisper-small.en --data-dir data/
 
-Hardware: RTX 5070 (12GB VRAM) -- base.en with LoRA fits comfortably.
+Hardware: an NVIDIA (Blackwell) consumer GPU -- base.en with LoRA fits comfortably.
 """
 
 import argparse

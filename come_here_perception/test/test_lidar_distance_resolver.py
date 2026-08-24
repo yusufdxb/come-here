@@ -29,7 +29,7 @@ def test_person_dead_ahead_at_two_meters():
 def test_person_outside_cone_returns_none():
     resolver = LidarDistanceResolver()
     cloud = _human_column(x_m=2.0, y_m=0.0)
-    # Person dead ahead but we ask about bearing 0.5 rad (~28°) — out of ±8° cone.
+    # Person dead ahead but we ask about bearing 0.5 rad (~28°), out of ±8° cone.
     dist = resolver.refine(bearing_rad=0.5, cloud_xyz=cloud)
     assert dist is None
 
@@ -42,7 +42,7 @@ def test_too_few_points_returns_none():
 
 
 def test_short_column_returns_none():
-    # 30 points but column spans only 0.4 m vertically — fails extent gate (0.6 m).
+    # 30 points but column spans only 0.4 m vertically, fails extent gate (0.6 m).
     resolver = LidarDistanceResolver()
     cloud = _human_column(x_m=2.0, z_lo=0.8, z_hi=1.2, n_points=30)
     dist = resolver.refine(bearing_rad=0.0, cloud_xyz=cloud)
@@ -50,7 +50,7 @@ def test_short_column_returns_none():
 
 
 def test_floor_only_returns_none():
-    # 30 floor points all below z_min — should fail after height mask.
+    # 30 floor points all below z_min, should fail after height mask.
     rng = np.random.default_rng(7)
     n = 30
     xs = rng.uniform(1.0, 3.0, n).astype(np.float32)

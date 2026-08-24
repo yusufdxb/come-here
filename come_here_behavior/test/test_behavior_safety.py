@@ -1,11 +1,11 @@
 """Safety-behavior tests for BehaviorNode (require a ROS 2 runtime).
 
 Covers the skeptic-review Priority 0 fixes:
-  C1 — _stop_motion() must halt locomotion via cmd_velocity (the topic the
+  C1, _stop_motion() must halt locomotion via cmd_velocity (the topic the
        bridge's gait republisher actually acts on), not the vestigial cmd_move.
-  C3 — destroy_node() must emit a stop so the robot does not coast on a stale
+  C3, destroy_node() must emit a stop so the robot does not coast on a stale
        setpoint when the behavior node is killed.
-  C4 — sensor callbacks must reject non-finite / out-of-range values before
+  C4, sensor callbacks must reject non-finite / out-of-range values before
        they become robot motion.
 """
 

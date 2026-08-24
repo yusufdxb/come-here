@@ -22,8 +22,8 @@ class LidarDistanceResolver:
         z_min, z_max: Torso/legs height band in meters (base_link frame).
         x_min: Minimum forward distance to reject self-returns.
         max_range_m: Discard points beyond this horizontal range.
-        min_points: Gate — minimum points required in the wedge.
-        min_vertical_extent_m: Gate — minimum (z.max - z.min) across wedge points.
+        min_points: Gate, minimum points required in the wedge.
+        min_vertical_extent_m: Gate, minimum (z.max - z.min) across wedge points.
         percentile: Percentile of horizontal range taken as the person distance.
     """
 

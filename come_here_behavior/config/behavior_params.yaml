@@ -25,7 +25,7 @@ behavior_node:
     # before actually facing the person, producing "rotate left, walk past".
     approach_align_threshold_rad: 0.15
     # Lowered yaw rates 1.0/1.2 -> 0.6/0.6 rad/s so min_align_s = 0.4 s gives
-    # ~0.24 rad per ALIGN commit instead of 0.4/0.48 rad — less overshoot.
+    # ~0.24 rad per ALIGN commit instead of 0.4/0.48 rad, less overshoot.
     approach_ccw_yaw: 0.6
     approach_cw_yaw: 0.6
     approach_min_align_s: 0.4
@@ -49,7 +49,7 @@ go2_bridge_node:
   ros__parameters:
     cmd_z: 2.0
     deg_per_sec: 90.0
-    sit_api_id: 1009   # Sit (haunches up, head up) — not 1005 StandDown (belly flat)
+    sit_api_id: 1009   # Sit (haunches up, head up), not 1005 StandDown (belly flat)
     stand_api_id: 1002
     move_api_id: 1008
     stop_move_api_id: 1003

@@ -5,9 +5,9 @@ audio_node:
     publish_rate_hz: 10.0
     mock_azimuth_rad: 0.0
     whisper_model_size: base.en            # tiny.en, base.en, small.en, medium.en
-    whisper_device: cpu                    # 'cpu' or 'cuda' — demo uses cpu/int8
+    whisper_device: cpu                    # 'cpu' or 'cuda', demo uses cpu/int8
     whisper_chunk_duration_s: 2.0
     whisper_adapter_path: ''       # path to LoRA adapter (empty = use base model)
     mic_device: 'ReSpeaker'        # sounddevice name substring
-    mic_channels: 1                # open mono — gets ReSpeaker DSP ch 0 (beamformer+AEC+AGC+NS)
+    mic_channels: 1                # open mono, gets ReSpeaker DSP ch 0 (beamformer+AEC+AGC+NS)
     mic_beam_channel: 0            # index within the opened stream

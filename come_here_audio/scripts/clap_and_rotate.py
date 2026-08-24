@@ -3,7 +3,7 @@
 Detects loud transient sounds (claps) via amplitude spike on the raw mic,
 grabs DOA from ReSpeaker, and rotates the GO2 toward the sound source.
 
-Separate fun/test script — does not modify any main project code.
+Separate fun/test script, does not modify any main project code.
 """
 
 import sys, os, time, math, datetime, random, json, struct
@@ -68,7 +68,7 @@ def main():
     print("", flush=True)
     print("=" * 45, flush=True)
     print("  CLAP & ROTATE", flush=True)
-    print("  Clap your hands — robot turns to you!", flush=True)
+    print("  Clap your hands, robot turns to you!", flush=True)
     print("  Ctrl+C to stop.", flush=True)
     print("=" * 45, flush=True)
     print("", flush=True)

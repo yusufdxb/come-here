@@ -127,7 +127,7 @@ class BehaviorNode(Node):
         self._person_confidence = 0.0
         self._person_last_seen = None
         self._search_start_time = None
-        # When LISTENING began — used to time out and fall back to SEARCH if
+        # When LISTENING began, used to time out and fall back to SEARCH if
         # DOA confidence never crosses the threshold.
         self._listening_start_time = None
         # Consecutive-detection counter for SEARCH→APPROACH commit.
@@ -272,13 +272,13 @@ class BehaviorNode(Node):
             if self._last_dir_confidence >= self._dir_threshold:
                 self._transition(State.TURN_TO_SOUND)
                 return
-            # DOA hasn't produced a confident reading yet — wait briefly,
+            # DOA hasn't produced a confident reading yet, wait briefly,
             # then fall back to a passive SEARCH so the loop doesn't stall.
             if (self._listening_start_time is not None
                     and self._seconds_since(self._listening_start_time)
                     > self._listening_timeout_s):
                 self.get_logger().warn(
-                    'LISTENING timed out without DOA confidence — '
+                    'LISTENING timed out without DOA confidence, '
                     'skipping TURN_TO_SOUND'
                 )
                 self._transition(State.SEARCH_FOR_PERSON)
@@ -310,7 +310,7 @@ class BehaviorNode(Node):
                 self.get_logger().warn('Search timed out, returning to IDLE')
                 self._transition(State.IDLE)
                 return
-            # Passive wait — TURN_TO_SOUND has already pointed the dog at the
+            # Passive wait, TURN_TO_SOUND has already pointed the dog at the
             # speaker. Active scan-rotation here would only preempt that
             # calibrated DOA rotate within 100 ms, defeating the purpose.
             return
@@ -342,7 +342,7 @@ class BehaviorNode(Node):
         # Safety stop (debounced): halt motion if detection has been missing
         # for safety_stop_miss_threshold consecutive ticks (default 3 =
         # ~300 ms at 10 Hz). An instant stop on every det=0 frame makes the
-        # mcf gait churn — the gait needs a stable setpoint held for ~1 s+,
+        # mcf gait churn, the gait needs a stable setpoint held for ~1 s+,
         # so short YOLO flickers must not toggle vx.
         if not self._person_detected:
             self._det_miss_count += 1
@@ -354,7 +354,7 @@ class BehaviorNode(Node):
 
         # Close-enough check: trigger sit sequence on either
         #   (a) LiDAR/bbox distance <= stop_distance, or
-        #   (b) YOLO bbox height >= bbox_stop_fraction of frame — close-range
+        #   (b) YOLO bbox height >= bbox_stop_fraction of frame, close-range
         #       proxy that works when LiDAR loses the person in vertical FOV.
         close_by_distance = (
             self._person_distance > 0
@@ -381,7 +381,7 @@ class BehaviorNode(Node):
         if self._approach_phase_start is None:
             self._approach_phase_start = self.get_clock().now()
             # If already within the align deadband at entry, skip the 0.4 s
-            # ALIGN min-hold and start in WALK — otherwise the first 4 ticks
+            # ALIGN min-hold and start in WALK, otherwise the first 4 ticks
             # publish a yaw command even when the operator is already
             # centered, producing a small spurious rotation before walking.
             if abs(self._person_bearing) < self._approach_align_threshold:

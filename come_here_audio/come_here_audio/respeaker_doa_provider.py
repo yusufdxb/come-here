@@ -2,7 +2,7 @@
 
 Uses pyusb to read DOA angle and VAD status from the XMOS XVF3000
 via USB HID control transfers. The audio endpoint (ALSA) is not
-touched — DOA and audio recording coexist on separate USB pipes.
+touched, DOA and audio recording coexist on separate USB pipes.
 
 Supports both single-shot polling (get_direction) and continuous
 background polling (start_continuous / get_latched_direction) for
@@ -149,7 +149,7 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
 
                 self._samples.append((time.monotonic(), azimuth_rad, bool(vad)))
             except Exception:
-                pass  # USB glitch — skip this sample
+                pass  # USB glitch, skip this sample
 
             time.sleep(self._poll_interval)
 

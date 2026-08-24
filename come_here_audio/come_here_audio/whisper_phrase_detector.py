@@ -86,7 +86,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
         min_utterance_sec: float = 0.20,
         max_utterance_sec: float = 4.50,
         vad_check_fn: Optional[Callable[[], bool]] = None,
-        # Deprecated — fixed-hop segmenter was replaced by utterance endpointing.
+        # Deprecated, fixed-hop segmenter was replaced by utterance endpointing.
         # Kept so existing callers (e.g. hear_and_rotate_demo) don't raise TypeError.
         window_duration_s: Optional[float] = None,
         hop_duration_ms: Optional[int] = None,
@@ -189,7 +189,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
         """Open a non-blocking InputStream for continuous capture."""
         import sounddevice as sd
 
-        # Highpass filter at 300Hz — off by default. The ReSpeaker DSP channel
+        # Highpass filter at 300Hz, off by default. The ReSpeaker DSP channel
         # (ch 0) already runs noise suppression; stacking a 300Hz HP on top of
         # it attenuates lower voice formants for no real gain. Only enable when
         # bypassing the DSP (e.g. reading a raw capsule directly).
@@ -217,10 +217,10 @@ class WhisperPhraseDetector(WakePhraseDetector):
     def _audio_callback(self, indata, frames, time_info, status):
         """PortAudio callback: pick channel, optionally filter/gain, write to ring buffer.
 
-        Runs in PortAudio's thread — keep it fast, no allocations beyond the slice.
+        Runs in PortAudio's thread, keep it fast, no allocations beyond the slice.
         With defaults (mic_channels=1, mic_beam_channel=0) this reads the
         ReSpeaker DSP output (beamformer + AEC + AGC + NS applied in firmware)
-        straight through — no software gain, no clip, no highpass needed.
+        straight through, no software gain, no clip, no highpass needed.
         """
         if not self._running:
             return
@@ -234,16 +234,16 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._ring_buffer.write(mono)
 
     def _segmenter_loop(self) -> None:
-        """Utterance endpointing — RMS-gated start, trailing silence closes it.
+        """Utterance endpointing, RMS-gated start, trailing silence closes it.
 
         Matches the Jetson ``go2_voice_tree`` approach: a short analysis frame
         above ``utterance_rms_threshold`` starts an utterance; trailing silence
         of ``silence_to_end_sec`` closes it; hard cap at ``max_utterance_sec``.
-        "Come here" is ~0.6–0.8 s — the previous fixed 1 s hop frequently cut
+        "Come here" is ~0.6–0.8 s, the previous fixed 1 s hop frequently cut
         it mid-phrase; endpointing hands Whisper the whole phrase as one chunk.
 
         Hardware VAD (if ``vad_check_fn`` is set) is logged as advisory only,
-        not a hard gate — when the XMOS firmware misses 1 m speech, Whisper
+        not a hard gate, when the XMOS firmware misses 1 m speech, Whisper
         still sees the audio and can catch it.
         """
         frame_samples = int(0.05 * self._sample_rate)  # 50 ms analysis frame
