@@ -182,3 +182,30 @@ def test_invalid_limits_raise(field, value):
 def test_reject_threshold_below_clamp_limit_raises():
     with pytest.raises(ValueError):
         MotionGate(_limits(max_vx=1.0, reject_vx_above=0.5))
+
+
+# -- inhibit (unverified motion mode) --
+
+def test_inhibit_stops_and_blocks_motion(gate):
+    gate.on_command([0.6, 0.0], now_s=0.0)
+    d = gate.inhibit('motion_mode_unverified')
+    assert (d.action, d.reason) == (STOP, 'inhibited:motion_mode_unverified')
+    assert gate.on_command([0.6, 0.0], now_s=0.1).action == STOP
+    assert gate.on_tick(now_s=0.2).action == NONE
+    assert gate.inhibited
+
+
+def test_clearing_inhibit_still_requires_a_zero_command(gate):
+    gate.inhibit('motion_mode_unverified')
+    gate.inhibit(None)
+    assert not gate.inhibited
+    assert gate.on_command([0.6, 0.0], now_s=1.0).reason == 'rearm_required'
+    gate.on_command([0.0, 0.0], now_s=1.1)
+    assert gate.on_command([0.6, 0.0], now_s=1.2).action == MOVE
+
+
+def test_estop_and_inhibit_are_independent(gate):
+    gate.inhibit('motion_mode')
+    gate.engage_estop()
+    gate.inhibit(None)
+    assert gate.on_command([0.0, 0.0], now_s=0.0).action == NONE  # still e-stopped

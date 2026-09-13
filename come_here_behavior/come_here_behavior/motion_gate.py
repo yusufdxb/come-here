@@ -13,14 +13,16 @@ Rules, all failing closed:
   * an armed command that is not refreshed within ``command_timeout_s`` is
     dropped by the watchdog;
   * the operator e-stop latches: while engaged nothing moves, and after it is
-    released a zero command is required before motion can re-arm.
+    released a zero command is required before motion can re-arm;
+  * an inhibit (for example, an unverified motion mode) blocks motion the same
+    way until it is cleared, and also requires a zero command to re-arm.
 
 Times are plain float seconds from a monotonic clock supplied by the caller.
 """
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 MOVE = 'move'
 STOP = 'stop'
@@ -72,6 +74,7 @@ class MotionGate:
         limits.validate()
         self._limits = limits
         self._estopped = False
+        self._inhibit_reason: Optional[str] = None
         self._rearm_required = False
         self._active = False
         self._vx = 0.0
@@ -81,6 +84,14 @@ class MotionGate:
     @property
     def estopped(self) -> bool:
         return self._estopped
+
+    @property
+    def inhibited(self) -> bool:
+        return self._inhibit_reason is not None
+
+    @property
+    def inhibit_reason(self) -> Optional[str]:
+        return self._inhibit_reason
 
     @property
     def rearm_required(self) -> bool:
@@ -94,6 +105,8 @@ class MotionGate:
         """Evaluate one ``[vx, yaw_rate]`` command."""
         if self._estopped:
             return GateDecision(NONE, reason='estopped')
+        if self._inhibit_reason is not None:
+            return self._disarm(f'inhibited:{self._inhibit_reason}')
         if len(data) != 2:
             return self._disarm('malformed')
         try:
@@ -132,7 +145,7 @@ class MotionGate:
 
     def on_tick(self, now_s: float) -> GateDecision:
         """Periodic republish of the armed command, or a watchdog stop."""
-        if self._estopped or not self._active:
+        if self._estopped or self._inhibit_reason is not None or not self._active:
             return GateDecision(NONE)
         if now_s - self._last_command_s > self._limits.command_timeout_s:
             return self._disarm('watchdog')
@@ -147,6 +160,15 @@ class MotionGate:
         if self._estopped:
             self._estopped = False
             self._rearm_required = True
+
+    def inhibit(self, reason: Optional[str]) -> GateDecision:
+        """Block all motion for ``reason``; ``None`` clears the inhibit."""
+        if reason is None:
+            self._inhibit_reason = None
+            return GateDecision(NONE)
+        self._inhibit_reason = reason
+        self._rearm_required = True
+        return self._disarm(f'inhibited:{reason}')
 
     def disarm(self, reason: str) -> GateDecision:
         return self._disarm(reason)

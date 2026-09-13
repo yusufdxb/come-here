@@ -2,25 +2,31 @@
 
 Motion safety rules live in ``come_here_behavior.motion_gate`` (pure Python,
 unit-tested without ROS): command validation and clamping, rejection of
-combined forward + yaw, a command watchdog, and the latched operator e-stop.
-This node turns gate decisions into Sport API requests. It never sends
-motion_switcher requests.
+combined forward + yaw, a command watchdog, the latched operator e-stop, and an
+inhibit used while the motion mode is unverified. This node turns gate
+decisions into Sport API requests. It never sends SelectMode.
 
 Subscribes:
-  /come_here/cmd_velocity  (std_msgs/Float64MultiArray) [vx, yaw_rate] gait command
-  /come_here/estop         (std_msgs/Bool)   True engages the latched e-stop, False releases it
-  /come_here/cmd_rotate    (std_msgs/Float64) target yaw in rad (+ = left), experimental
-  /come_here/cmd_sit       (std_msgs/Bool)   True triggers Sit, optional
-  /come_here/cmd_stand     (std_msgs/Bool)   True triggers BalanceStand, optional
-  /come_here/cmd_say       (std_msgs/String) phrase to play through the audiohub
+  /come_here/cmd_velocity         (std_msgs/Float64MultiArray) [vx, yaw_rate] gait command
+  /come_here/estop                (std_msgs/Bool)   True engages the latched e-stop, False releases it
+  /come_here/cmd_rotate           (std_msgs/Float64) target yaw in rad (+ = left), experimental
+  /come_here/cmd_sit              (std_msgs/Bool)   True triggers Sit, optional
+  /come_here/cmd_stand            (std_msgs/Bool)   True triggers BalanceStand, optional
+  /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub
+  /api/motion_switcher/response   (unitree_api/msg/Response) CheckMode replies
 
 Publishes:
-  /api/sport/request     (unitree_api/msg/Request) Sport API requests, or
-                         /come_here/dry_run/sport_request when dry_run is true
-  /api/audiohub/request  (unitree_api/msg/Request) audiohub WAV streaming
+  /api/sport/request              (unitree_api/msg/Request) Sport API requests, or
+                                  /come_here/dry_run/sport_request when dry_run is true
+  /api/motion_switcher/request    (unitree_api/msg/Request) read-only CheckMode (api 1001)
+  /api/audiohub/request           (unitree_api/msg/Request) audiohub WAV streaming
+  /come_here/bridge_status        (std_msgs/String) JSON once per second
 
 Parameters:
   dry_run                  (bool,  False) send Sport requests to the dry-run topic only
+  require_motion_mode      (str,   '')    'mcf' or 'ai': refuse motion until CheckMode reports it
+  motion_mode_timeout_s    (float, 5.0)   log a refusal if no CheckMode reply by then
+  motion_mode_recheck_s    (float, 5.0)   re-check period once verified
   max_vx                   (float, 1.0)   clamp on |vx| in m/s
   max_yaw_rate             (float, 2.5)   clamp on |yaw_rate| in rad/s
   reject_vx_above          (float, 2.0)   larger |vx| is treated as corrupt and stops
@@ -32,7 +38,7 @@ Parameters:
   enable_posture_commands  (bool,  True)  accept /come_here/cmd_sit and /come_here/cmd_stand
   cmd_z                    (float, 2.0)   rotation worker yaw rate, capped at max_yaw_rate
   deg_per_sec              (float, 90.0)  measured rotation speed at cmd_z, for duration
-  sit_api_id / stand_api_id / move_api_id / stop_move_api_id  Sport API ids
+  sit_api_id / stand_api_id / move_api_id / stop_move_api_id  Sport API ids (never 1001, Damp)
   wav_dir / wav_chunk_size_bytes / wav_chunk_delay_s          audiohub playback
 """
 
@@ -47,9 +53,18 @@ import time
 
 from rclpy.node import Node
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
-from unitree_api.msg import Request
+from unitree_api.msg import Request, Response
 
 from come_here_behavior.motion_gate import MOVE, NONE, STOP, GateLimits, MotionGate
+from come_here_behavior.motion_mode import (
+    MOTION_SWITCHER_CHECK_MODE_API_ID,
+    MOTION_SWITCHER_REQUEST_TOPIC,
+    MOTION_SWITCHER_RESPONSE_TOPIC,
+    VALID_MOTION_MODES,
+    check_sport_api_ids,
+    mode_verdict,
+    parse_mode_response,
+)
 from come_here_behavior.node_runner import run_node
 
 SPORT_TOPIC = '/api/sport/request'
@@ -81,6 +96,9 @@ class Go2BridgeNode(Node):
 
         # -- Parameters --
         self.declare_parameter('dry_run', False)
+        self.declare_parameter('require_motion_mode', '')
+        self.declare_parameter('motion_mode_timeout_s', 5.0)
+        self.declare_parameter('motion_mode_recheck_s', 5.0)
         self.declare_parameter('cmd_z', 2.0)
         self.declare_parameter('deg_per_sec', 90.0)
         self.declare_parameter('sit_api_id', 1005)
@@ -115,6 +133,19 @@ class Go2BridgeNode(Node):
         self._stand_api_id = int(p('stand_api_id').value)
         self._move_api_id = int(p('move_api_id').value)
         self._stop_move_api_id = int(p('stop_move_api_id').value)
+        # 1001 on the Sport topic is Damp: refuse to start with it configured.
+        check_sport_api_ids(
+            sit_api_id=self._sit_api_id, stand_api_id=self._stand_api_id,
+            move_api_id=self._move_api_id, stop_move_api_id=self._stop_move_api_id,
+        )
+        self._required_mode = str(p('require_motion_mode').value).strip()
+        if self._required_mode and self._required_mode not in VALID_MOTION_MODES:
+            raise ValueError(
+                f'require_motion_mode must be one of {VALID_MOTION_MODES} or empty, '
+                f'got {self._required_mode!r}'
+            )
+        self._mode_timeout_s = float(p('motion_mode_timeout_s').value)
+        self._mode_recheck_s = float(p('motion_mode_recheck_s').value)
         self._wav_dir = str(p('wav_dir').value)
         self._wav_chunk_size = int(p('wav_chunk_size_bytes').value)
         self._wav_chunk_delay_s = float(p('wav_chunk_delay_s').value)
@@ -147,9 +178,10 @@ class Go2BridgeNode(Node):
         self._now = time.monotonic
 
         # -- Publishers --
-        sport_topic = DRY_RUN_SPORT_TOPIC if self._dry_run else SPORT_TOPIC
-        self._sport_pub = self.create_publisher(Request, sport_topic, 10)
+        self._sport_topic = DRY_RUN_SPORT_TOPIC if self._dry_run else SPORT_TOPIC
+        self._sport_pub = self.create_publisher(Request, self._sport_topic, 10)
         self._audio_pub = self.create_publisher(Request, '/api/audiohub/request', 10)
+        self._status_pub = self.create_publisher(String, '/come_here/bridge_status', 10)
 
         # -- Runtime state --
         self._sport_lock = threading.Lock()
@@ -164,6 +196,21 @@ class Go2BridgeNode(Node):
         # Audio thread: drop new cmd_say if a previous playback is still streaming.
         self._audio_busy = threading.Event()
 
+        # Motion mode: refuse motion until CheckMode reports the required mode.
+        self._motion_mode = None
+        self._mode_verified = False
+        self._mode_started_s = self._now()
+        self._mode_last_request_s = -math.inf
+        if self._required_mode:
+            self._gate.inhibit('motion_mode_unverified')
+            self._mode_pub = self.create_publisher(
+                Request, MOTION_SWITCHER_REQUEST_TOPIC, 10
+            )
+            self.create_subscription(
+                Response, MOTION_SWITCHER_RESPONSE_TOPIC, self._mode_response_cb, 10
+            )
+            self._mode_timer = self.create_timer(0.5, self._mode_check_tick)
+
         # -- Subscribers --
         self.create_subscription(
             Float64MultiArray, '/come_here/cmd_velocity', self._velocity_cb, 10
@@ -177,13 +224,15 @@ class Go2BridgeNode(Node):
         self._velocity_timer = self.create_timer(
             1.0 / republish_rate_hz, self._velocity_tick
         )
+        self._status_timer = self.create_timer(1.0, self._publish_status)
 
         if self._dry_run:
             self.get_logger().warn(
-                f'DRY RUN: Sport API requests go to {sport_topic}; the robot will not move'
+                f'DRY RUN: Sport API requests go to {self._sport_topic}; the robot will not move'
             )
         self.get_logger().info(
-            f'go2_bridge_node started: sport_topic={sport_topic} '
+            f'go2_bridge_node started: sport_topic={self._sport_topic} '
+            f'require_motion_mode={self._required_mode or "off"} '
             f'max_vx={limits.max_vx} max_yaw_rate={limits.max_yaw_rate} '
             f'reject_above=({limits.reject_vx_above}, {limits.reject_yaw_rate_above}) '
             f'allow_combined={limits.allow_combined} '
@@ -235,6 +284,64 @@ class Go2BridgeNode(Node):
             self._rotate_cancel.set()
             self._rotate_cancel = threading.Event()
 
+    def _publish_status(self) -> None:
+        status = {
+            'dry_run': self._dry_run,
+            'sport_topic': self._sport_topic,
+            'estopped': self._gate.estopped,
+            'rearm_required': self._gate.rearm_required,
+            'inhibited': self._gate.inhibited,
+            'inhibit_reason': self._gate.inhibit_reason,
+            'required_motion_mode': self._required_mode or None,
+            'motion_mode': self._motion_mode,
+            'motion_mode_verified': self._mode_verified,
+            'moving': self._gate.active,
+        }
+        msg = String()
+        msg.data = json.dumps(status)
+        self._status_pub.publish(msg)
+
+    # -- motion mode (read-only CheckMode) --
+
+    def _mode_check_tick(self) -> None:
+        now = self._now()
+        interval = self._mode_recheck_s if self._mode_verified else 1.0
+        if now - self._mode_last_request_s >= interval:
+            self._mode_last_request_s = now
+            self._mode_pub.publish(make_req(MOTION_SWITCHER_CHECK_MODE_API_ID))
+        if (not self._mode_verified
+                and now - self._mode_started_s > self._mode_timeout_s
+                and now - self._warn_times.get('mode_timeout', -math.inf) >= 5.0):
+            self._warn_times['mode_timeout'] = now
+            self.get_logger().error(
+                f'REFUSING MOTION: no motion_switcher CheckMode reply within '
+                f'{self._mode_timeout_s:.0f}s (required {self._required_mode!r})'
+            )
+
+    def _mode_response_cb(self, msg: Response) -> None:
+        if msg.header.identity.api_id != MOTION_SWITCHER_CHECK_MODE_API_ID:
+            return
+        if msg.header.status.code != 0:
+            self._warn_throttled(
+                'mode_status', f'CheckMode returned status {msg.header.status.code}', 5.0
+            )
+            return
+        name = parse_mode_response(msg.data)
+        ok, text = mode_verdict(name, self._required_mode)
+        self._motion_mode = name
+        if ok:
+            if not self._mode_verified or self._gate.inhibited:
+                self.get_logger().info(f'{text}: motion enabled')
+            self._mode_verified = True
+            self._gate.inhibit(None)
+            return
+        newly_inhibited = not self._gate.inhibited or self._mode_verified
+        self._mode_verified = False
+        self._gate.inhibit('motion_mode')
+        self._preempt_rotation()
+        self._publish_stop(force=newly_inhibited)
+        self.get_logger().error(f'REFUSING MOTION: {text}')
+
     # -- cmd_velocity --
 
     def _velocity_cb(self, msg: Float64MultiArray) -> None:
@@ -264,11 +371,13 @@ class Go2BridgeNode(Node):
                     'ESTOP ENGAGED: StopMove sent, all motion blocked until '
                     '/come_here/estop false'
                 )
+                self._publish_status()
         elif self._gate.estopped:
             self._gate.release_estop()
             self.get_logger().warn(
                 'ESTOP RELEASED: motion stays blocked until a zero cmd_velocity re-arms it'
             )
+            self._publish_status()
 
     # -- cmd_rotate (experimental TURN_TO_SOUND path) --
 
@@ -276,8 +385,8 @@ class Go2BridgeNode(Node):
         if not self._enable_rotate:
             self._warn_throttled('rotate_disabled', 'cmd_rotate ignored: disabled')
             return
-        if self._gate.estopped or self._gate.rearm_required:
-            self._warn_throttled('rotate_blocked', 'cmd_rotate ignored: e-stop latch')
+        if self._gate.estopped or self._gate.rearm_required or self._gate.inhibited:
+            self._warn_throttled('rotate_blocked', 'cmd_rotate ignored: motion blocked')
             return
         target_rad = float(msg.data)
         if not math.isfinite(target_rad) or abs(target_rad) > math.pi:
@@ -309,9 +418,9 @@ class Go2BridgeNode(Node):
         """Publish Move at 20 Hz for ``duration``, then StopMove. Abort on cancel."""
         start = time.monotonic()
         while (time.monotonic() - start) < duration:
-            if cancel_event.is_set() or self._gate.estopped:
-                # A newer command preempted us, or the e-stop fired; whoever
-                # preempted owns the robot's state, so no StopMove here.
+            if cancel_event.is_set() or self._gate.estopped or self._gate.inhibited:
+                # A newer command preempted us, or motion was blocked; whoever
+                # did that owns the robot's state, so no StopMove here.
                 return
             self._publish_move(0.0, self._rotate_yaw_rate * sign)
             time.sleep(0.05)
@@ -331,8 +440,8 @@ class Go2BridgeNode(Node):
         if not self._enable_posture:
             self._warn_throttled('posture_disabled', f'cmd_{label} ignored: disabled')
             return False
-        if self._gate.estopped:
-            self._warn_throttled('posture_estop', f'cmd_{label} ignored: e-stop engaged')
+        if self._gate.estopped or self._gate.inhibited:
+            self._warn_throttled('posture_blocked', f'cmd_{label} ignored: motion blocked')
             return False
         return True
 
@@ -361,8 +470,8 @@ class Go2BridgeNode(Node):
 
     def _deferred_sport_call(self, api_id: int, delay_s: float, label: str) -> None:
         time.sleep(delay_s)
-        if self._gate.estopped:
-            self.get_logger().warn(f'cmd_{label} (deferred) dropped: e-stop engaged')
+        if self._gate.estopped or self._gate.inhibited:
+            self.get_logger().warn(f'cmd_{label} (deferred) dropped: motion blocked')
             return
         self.get_logger().info(f'cmd_{label} (deferred): api_id={api_id}')
         with self._sport_lock:

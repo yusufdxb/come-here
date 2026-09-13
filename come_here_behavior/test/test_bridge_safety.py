@@ -258,3 +258,88 @@ def test_destroy_node_publishes_stopmove():
     pub = n._sport_pub
     n.destroy_node()
     assert pub.msgs[-1].header.identity.api_id == STOP_MOVE_API_ID
+
+
+# -- motion mode: read-only CheckMode, motion refused unless mcf --
+
+def _mode_response(name, code=0, api_id=1001):
+    from unitree_api.msg import Response
+    r = Response()
+    r.header.identity.api_id = api_id
+    r.header.status.code = code
+    r.data = json.dumps({'form': '0', 'name': name})
+    return r
+
+
+@pytest.fixture
+def mode_node():
+    n = _make_node(require_motion_mode='mcf')
+    n._mode_pub = FakePub()
+    yield n
+    n.destroy_node()
+
+
+def test_motion_refused_until_mcf_is_verified(mode_node):
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    mode_node._velocity_tick()
+    assert _moves(mode_node) == []
+    mode_node._mode_response_cb(_mode_response('mcf'))
+    mode_node._velocity_cb(_vel(0.0, 0.0))  # a new trial always starts with a zero
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    assert _moves(mode_node) == [{'x': 0.6, 'y': 0.0, 'z': 0.0}]
+
+
+def test_wrong_mode_refuses_motion(mode_node):
+    mode_node._mode_response_cb(_mode_response('ai'))
+    mode_node._velocity_cb(_vel(0.0, 0.0))
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    assert _moves(mode_node) == []
+
+
+def test_failed_check_mode_status_does_not_enable_motion(mode_node):
+    mode_node._mode_response_cb(_mode_response('mcf', code=7002))
+    mode_node._velocity_cb(_vel(0.0, 0.0))
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    assert _moves(mode_node) == []
+
+
+def test_mode_leaving_mcf_stops_the_robot(mode_node):
+    mode_node._mode_response_cb(_mode_response('mcf'))
+    mode_node._velocity_cb(_vel(0.0, 0.0))
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    mode_node._mode_response_cb(_mode_response('ai'))
+    assert _api_ids(mode_node)[-1] == STOP_MOVE_API_ID
+    mark = _mark(mode_node)
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    mode_node._velocity_tick()
+    assert MOVE_API_ID not in _api_ids(mode_node, mark)
+
+
+def test_check_mode_never_reaches_the_sport_topic(mode_node):
+    for _ in range(3):
+        mode_node._mode_check_tick()
+        mode_node._now.t += 1.1
+    assert [r.header.identity.api_id for r in mode_node._mode_pub.msgs] == [1001, 1001, 1001]
+    mode_node._mode_response_cb(_mode_response('mcf'))
+    mode_node._velocity_cb(_vel(0.0, 0.0))
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    mode_node._estop_cb(_bool(True))
+    assert 1001 not in _api_ids(mode_node)  # 1001 on /api/sport/request is Damp
+
+
+def test_sport_api_1001_refuses_to_start():
+    with pytest.raises(ValueError):
+        Go2BridgeNode(parameter_overrides=[Parameter('stop_move_api_id', value=1001)])
+
+
+def test_normal_mode_requirement_refuses_to_start():
+    with pytest.raises(ValueError):
+        Go2BridgeNode(parameter_overrides=[Parameter('require_motion_mode', value='normal')])
+
+
+def test_bridge_status_reports_the_estop_latch(node):
+    node._status_pub = FakePub()
+    node._estop_cb(_bool(True))
+    status = json.loads(node._status_pub.msgs[-1].data)
+    assert status['estopped'] is True
+    assert status['dry_run'] is False
