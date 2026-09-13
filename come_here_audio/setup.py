@@ -11,6 +11,9 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', ['config/audio_params.yaml']),
         ('share/' + package_name + '/launch', ['launch/audio.launch.py']),
+        # Speech played through the GO2 audiohub; the bridge looks up <phrase>.wav.
+        ('share/' + package_name + '/sounds',
+         ['scripts/i_am_coming.wav', 'scripts/i_am_here.wav']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

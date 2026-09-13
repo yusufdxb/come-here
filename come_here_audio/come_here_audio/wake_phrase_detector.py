@@ -7,6 +7,7 @@ See also whisper_phrase_detector.py for the Whisper-based implementation.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -14,6 +15,10 @@ class PhraseDetection:
     """Result of wake phrase detection."""
     phrase: str
     confidence: float  # 0.0 to 1.0
+    transcript: str = ''
+    ratio: float = 1.0                     # fuzzy-match similarity
+    t_speech_end: Optional[float] = None   # monotonic time the speech ended
+    infer_ms: Optional[float] = None       # Whisper inference time
 
 
 class WakePhraseDetector(ABC):

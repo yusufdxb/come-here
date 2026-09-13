@@ -95,6 +95,22 @@ class RingBuffer:
                     self._buf[:n - first],
                 ])
 
+    def read_since(self, position: int):
+        """Atomically return the samples written after ``position`` and the new end.
+
+        Returns ``(samples, end)`` where ``end`` is the total written count.
+        If capture overtook the reader, only the retained samples are
+        returned; the caller detects the loss from ``end - len(samples) > position``.
+        """
+        with self._lock:
+            end = self._total_written
+            n = min(max(0, end - position), self._capacity, end)
+            start = (self._write_pos - n) % self._capacity
+            if start + n <= self._capacity:
+                return self._buf[start:start + n].copy(), end
+            first = self._capacity - start
+            return np.concatenate([self._buf[start:], self._buf[:n - first]]), end
+
 
 class LatestOnlyQueue:
     """Single-slot queue that always holds the most recent item.
