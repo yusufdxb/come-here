@@ -49,6 +49,11 @@ walking budget sized for the 2.5 m start mark.
 
 - The operator holds the Unitree remote the whole time. It is the primary stop.
 - A second person sits at the e-stop console (Enter engages the e-stop).
+- Nobody else may stand closer to the robot than the caller, or beside the caller in the
+  camera view: the robot walks to the largest person box it sees. Keep the audience
+  behind the robot or well behind the caller.
+- Run the launch directly in the SSH terminal, not inside tmux or nohup. If the
+  connection drops, the nodes get a hangup and the bridge sends StopMove.
 - Clear corridor: 4 m long and 2 m wide in front of the robot. Only the caller inside it.
 - The robot must be standing, in its default `mcf` mode. Never change the motion
   mode, and never send `SelectMode` "normal" (it wedges the robot until a power cycle).
@@ -146,11 +151,26 @@ T3  python3 scripts/short_walk_test.py        # 0.6 m/s for 1.5 s
 
 Pass: clean trot about 0.9 m forward, no yaw, clean stop, stays stopped.
 
+Then check that the ALIGN turn rate actually steps:
+
+```bash
+T3  python3 scripts/short_walk_test.py --yaw 0.6      # turn left in place
+T3  python3 scripts/short_walk_test.py --yaw -0.6     # turn right in place
+```
+
+Pass: the feet step and the robot turns in both directions, not just a body twist. If
+0.6 only twists the body, raise `approach_ccw_yaw` / `approach_cw_yaw` in
+`professor_demo.yaml` (0.8 or 1.0; the bridge caps yaw at 1.0), repeat this check, and
+relaunch. With `--symlink-install` the YAML edit needs no rebuild.
+
 ### Stage E: centered "come here" (MOVES THE ROBOT)
 
 Caller on the 2.5 m mark, centered, full body in view. Say "come here".
 Expected: "I am coming", then WALK (a short ALIGN is fine), stop about 0.8 m away,
-stays stopped. Measure the gap from the robot's front to the caller's toes, then:
+stays stopped. A missed detection makes the robot stop, wait for two fresh detections
+and walk again: an occasional pause is expected, frequent pauses mean the detection
+rate is too low (recheck Stage B). Measure the gap from the robot's front to the
+caller's toes, then:
 
 ```bash
 T3  ros2 run come_here_behavior trial_report --mark PASS --distance 0.85
@@ -188,6 +208,7 @@ mid-walk (the robot stops within about half a second and waits; it gives up afte
 | Launch crashed or stuck | Ctrl+C T1 (sends StopMove), `pgrep -af lib/come_here_` to confirm nothing is left, relaunch |
 | Bridge refuses motion (mode) | The robot is not in `mcf`. Restore it with the remote or power cycle. Never SelectMode "normal" |
 | E-stop engaged | `release` in T2; the next "come here" starts a fresh trial |
+| SSH connection dropped | The launch stops and the bridge sends StopMove. Reconnect, source `demo_env.sh`, relaunch |
 
 ## Evidence
 
