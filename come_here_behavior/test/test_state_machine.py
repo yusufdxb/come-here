@@ -1,4 +1,4 @@
-"""Basic state enum tests. Full integration tests require ROS 2 runtime."""
+"""State enum contract: /come_here/state publishes these names."""
 
 from come_here_behavior.behavior_node import State
 
@@ -8,17 +8,16 @@ def test_all_states_exist():
         'IDLE',
         'LISTENING',
         'TURN_TO_SOUND',
-        'SEARCH_FOR_PERSON',
-        'APPROACH_PERSON',
+        'ACQUIRE_PERSON',
+        'ALIGN',
+        'WALK',
+        'ARRIVED',
         'SIT_AND_IDENTIFY',
     }
-    actual = {s.name for s in State}
-    assert actual == expected
+    assert {s.name for s in State} == expected
 
 
-def test_sit_and_identify_is_terminal_sequence_state():
-    # This is a documentation test: SIT_AND_IDENTIFY should exist and be
-    # distinct from IDLE / APPROACH_PERSON. It represents the linear
-    # sit -> face-detect -> speak -> stand -> IDLE sequence.
-    assert State.SIT_AND_IDENTIFY != State.IDLE
-    assert State.SIT_AND_IDENTIFY != State.APPROACH_PERSON
+def test_align_and_walk_are_separate_states():
+    # ALIGN (yaw only) and WALK (forward only) are distinct so the published
+    # state shows which single-axis phase the robot is in.
+    assert State.ALIGN != State.WALK
