@@ -74,7 +74,7 @@ def generate_launch_description():
             respawn=True,
             respawn_delay=2.0,
             condition=IfCondition(PythonExpression([
-                "'", camera, "' == 'true' and '", use_mock, "' == 'false'",
+                "'", camera, "'.lower() == 'true' and '", use_mock, "'.lower() == 'false'",
             ])),
         ),
         Node(

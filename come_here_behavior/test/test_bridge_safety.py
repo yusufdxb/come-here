@@ -303,6 +303,18 @@ def test_failed_check_mode_status_does_not_enable_motion(mode_node):
     assert _moves(mode_node) == []
 
 
+def test_unreadable_check_mode_reply_neither_enables_nor_stops(mode_node):
+    mode_node._mode_response_cb(_mode_response('mcf'))
+    mode_node._velocity_cb(_vel(0.0, 0.0))
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    garbled = _mode_response('mcf')
+    garbled.data = 'not json'
+    mark = _mark(mode_node)
+    mode_node._mode_response_cb(garbled)
+    mode_node._velocity_cb(_vel(0.6, 0.0))
+    assert _api_ids(mode_node, mark) == [MOVE_API_ID]
+
+
 def test_mode_leaving_mcf_stops_the_robot(mode_node):
     mode_node._mode_response_cb(_mode_response('mcf'))
     mode_node._velocity_cb(_vel(0.0, 0.0))

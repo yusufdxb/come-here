@@ -24,10 +24,15 @@ def _raise_keyboard_interrupt(signum, frame):
 
 
 def run_node(node_factory, args=None) -> None:
-    """Create a node with ``node_factory()``, spin it, and tear it down safely."""
+    """Create a node with ``node_factory()``, spin it, and tear it down safely.
+
+    SIGHUP is handled too: a dropped SSH session or closed terminal hangs up
+    the launch, and the default SIGHUP action kills the process without the
+    final stop (measured: bridge exited -1, last message Move 0.6).
+    """
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
-    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_keyboard_interrupt)
     node = None
     try:
         node = node_factory()
@@ -36,8 +41,8 @@ def run_node(node_factory, args=None) -> None:
         pass
     finally:
         # A repeated signal must not interrupt the final stop publish.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()

@@ -42,7 +42,7 @@ pytestmark = pytest.mark.skipif(not _ROS_AVAILABLE, reason='ROS 2 not sourced')
 DOMAIN_ID = 60 + os.getpid() % 30
 STOP_MOVE_API_ID = 1003
 SPORT_TOPICS = ('/api/sport/request', '/come_here/dry_run/sport_request')
-SIGNALS = [signal.SIGINT, signal.SIGTERM]
+SIGNALS = [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]  # SIGHUP: dropped SSH session
 
 
 def _executable(package: str, name: str):
@@ -103,7 +103,7 @@ def _signal_process(cmd, node, executor, topics, sig):
     return output
 
 
-@pytest.mark.parametrize('sig', SIGNALS, ids=['sigint', 'sigterm'])
+@pytest.mark.parametrize('sig', SIGNALS, ids=['sigint', 'sigterm', 'sighup'])
 def test_behavior_node_publishes_stop_on_signal(listener, sig):
     exe = _executable('come_here_behavior', 'behavior_node')
     if exe is None:
@@ -125,7 +125,7 @@ def test_behavior_node_publishes_stop_on_signal(listener, sig):
 
 
 @pytest.mark.skipif(not _SDK_AVAILABLE, reason='unitree_api not installed')
-@pytest.mark.parametrize('sig', SIGNALS, ids=['sigint', 'sigterm'])
+@pytest.mark.parametrize('sig', SIGNALS, ids=['sigint', 'sigterm', 'sighup'])
 def test_bridge_publishes_stopmove_on_signal(listener, sig):
     exe = _executable('come_here_behavior', 'go2_bridge_node')
     if exe is None:

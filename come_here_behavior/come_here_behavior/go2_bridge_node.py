@@ -327,6 +327,11 @@ class Go2BridgeNode(Node):
             )
             return
         name = parse_mode_response(msg.data)
+        if name is None:
+            # An unreadable reply proves nothing either way: keep the current
+            # state rather than stopping a trial on a garbled message.
+            self._warn_throttled('mode_parse', f'Ignoring unreadable CheckMode reply: {msg.data!r}', 5.0)
+            return
         ok, text = mode_verdict(name, self._required_mode)
         self._motion_mode = name
         if ok:

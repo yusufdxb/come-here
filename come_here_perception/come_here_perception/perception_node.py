@@ -58,8 +58,9 @@ class PerceptionNode(Node):
         self.declare_parameter('use_lidar_distance', True)
         self.declare_parameter('lidar_cloud_topic', '/utlidar/cloud_base')
         self.declare_parameter('lidar_max_age_s', 2.0)
-        # A camera frame older than this is treated as no frame at all.
-        self.declare_parameter('max_frame_age_s', 1.0)
+        # A camera frame older than this is treated as no frame at all. Short:
+        # until it expires nothing is published, so the robot walks on.
+        self.declare_parameter('max_frame_age_s', 0.5)
         # 1.0 = pass-through. The behavior node owns bearing smoothing; a
         # second EMA here (re-added by an April merge, never run on hardware)
         # doubles the lag the ALIGN deadband was tuned against.

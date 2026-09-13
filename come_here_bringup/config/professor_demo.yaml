@@ -49,7 +49,7 @@ perception_node:
     model_path: /home/unitree/come-here/models/yolo11n.pt
     confidence: 0.45                 # YOLO person confidence floor
     yolo_imgsz: 320
-    max_frame_age_s: 1.0             # older camera frame -> explicit not-detected
+    max_frame_age_s: 0.5             # older camera frame -> not-detected; preflight needs >= 3 Hz
     bearing_ema_alpha: 1.0           # raw bearing; the single EMA is in behavior_node
     use_lidar_distance: true
     lidar_cloud_topic: /utlidar/cloud_base
