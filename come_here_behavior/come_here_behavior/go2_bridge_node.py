@@ -479,23 +479,10 @@ class Go2BridgeNode(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = Go2BridgeNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # A second SIGINT can land during teardown or during interpreter
-        # shutdown (e.g. threading._shutdown). Ignore it for the rest of the
-        # process so shutdown stays quiet.
-        import signal
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            node.destroy_node()
-        except KeyboardInterrupt:
-            pass
-        rclpy.try_shutdown()
+    # run_node keeps the ROS context alive until destroy_node() has published
+    # the final StopMove (see node_runner for the measured C3 failure).
+    from come_here_behavior.node_runner import run_node
+    run_node(Go2BridgeNode, args=args)
 
 
 if __name__ == '__main__':
