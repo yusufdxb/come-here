@@ -131,20 +131,22 @@ def test_bridge_publishes_stopmove_on_signal(listener, sig):
     if exe is None:
         pytest.skip('go2_bridge_node not installed; build the workspace first')
     node, executor = listener
-    api_ids = []
+    api_ids = {topic: [] for topic in SPORT_TOPICS}
     for topic in SPORT_TOPICS:
         node.create_subscription(
             Request, topic,
-            lambda m: api_ids.append(m.header.identity.api_id), 10,
+            lambda m, t=topic: api_ids[t].append(m.header.identity.api_id), 10,
         )
     output = _signal_process(
         [exe, '--ros-args', '-p', 'dry_run:=true'],
         node, executor, SPORT_TOPICS, sig,
     )
+    dry_run_ids = api_ids['/come_here/dry_run/sport_request']
     got_stop = _spin_until(
-        executor, lambda: STOP_MOVE_API_ID in api_ids, 3.0,
+        executor, lambda: STOP_MOVE_API_ID in dry_run_ids, 3.0,
     )
     assert got_stop, (
         f'no StopMove observed after {sig.name}; api_ids={api_ids}; '
         f'node output tail:\n{output[-2000:]}'
     )
+    assert api_ids['/api/sport/request'] == [], 'dry run leaked onto the real Sport topic'

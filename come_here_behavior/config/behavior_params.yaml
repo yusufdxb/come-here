@@ -47,17 +47,24 @@ behavior_node:
 
 go2_bridge_node:
   ros__parameters:
+    dry_run: false
     cmd_z: 2.0
     deg_per_sec: 90.0
     sit_api_id: 1009   # Sit (haunches up, head up), not 1005 StandDown (belly flat)
     stand_api_id: 1002
     move_api_id: 1008
     stop_move_api_id: 1003
-    move_control_rate_hz: 10.0
     wav_dir: /home/unitree/come-here/come_here_audio/scripts
     wav_chunk_size_bytes: 16384
     wav_chunk_delay_s: 0.15
-    # Safety clamps (skeptic-review C4): set above all calibrated setpoints
-    # so they only catch corrupt/runaway values, never normal operation.
+    # Motion gate (skeptic-review C4 + watchdog). Clamp limits sit above all
+    # calibrated setpoints; larger values are rejected as corrupt.
     max_vx: 1.0
     max_yaw_rate: 2.5
+    reject_vx_above: 2.0
+    reject_yaw_rate_above: 4.0
+    allow_combined_motion: false
+    cmd_velocity_timeout_s: 0.5
+    republish_rate_hz: 20.0
+    enable_rotate_command: true     # TURN_TO_SOUND uses cmd_rotate
+    enable_posture_commands: true   # SIT_AND_IDENTIFY uses cmd_sit / cmd_stand
