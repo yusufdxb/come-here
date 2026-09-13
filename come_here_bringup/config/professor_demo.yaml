@@ -1,0 +1,125 @@
+# Class demo configuration: "come here" -> find the caller -> ALIGN/WALK -> stop.
+#
+#   ros2 launch come_here_bringup professor_demo.launch.py              # dry run, no motion
+#   ros2 launch come_here_bringup professor_demo.launch.py dry_run:=false
+#
+# Scenario: one caller, starting on a tape mark 2.5 m in front of a standing
+# GO2 (mcf mode), inside the front camera view. Everything not needed for that
+# is off: no TURN_TO_SOUND/DOA, no sit, no face detection, no arrival speech.
+# Values marked "hw 2026-04-24" are the ones the last full hardware run used.
+
+audio_node:
+  ros__parameters:
+    use_mock: false                  # launch argument use_mock overrides
+    wake_detector: whisper
+    enable_doa: false                # ReSpeaker DOA register observed stuck; not used
+    publish_rate_hz: 10.0
+    health_period_s: 5.0             # /come_here/audio_health and a log line
+    whisper_model_size: base.en
+    whisper_device: cpu
+    whisper_compute_type: int8
+    whisper_cpu_threads: 2           # uncapped CTranslate2 starved the camera on the Orin
+    whisper_adapter_path: ""
+    whisper_confidence_threshold: 0.4
+    whisper_no_speech_threshold: 0.5
+    whisper_vad_filter: true
+    phrase_ratio_threshold: 0.80     # fuzzy "come here" match ("come hear" passes)
+    wake_cooldown_s: 3.0             # one utterance cannot fire twice
+    mic_device: ReSpeaker            # resolved by name; the 6-channel array is preferred
+    mic_prefer_far_field: true
+    mic_channels: 1
+    mic_beam_channel: 0              # DSP beamformed output
+    mic_gain: 1.0
+    respeaker_profile: far_field     # launch argument respeaker_profile overrides
+    adaptive_gate: true              # launch argument adaptive_gate overrides
+    gate_snr_margin: 2.0             # gate = max(gate_floor_rms, noise_floor * margin)
+    gate_floor_rms: 0.003
+    calibration_s: 1.0               # room measured before listening; keep quiet at startup
+    preroll_sec: 0.25
+    utterance_rms_threshold: 0.015   # fixed gate, used only with adaptive_gate:=false
+    segment_peak_threshold: 0.02
+    silence_to_end_sec: 0.70
+    min_utterance_sec: 0.20
+    max_utterance_sec: 4.50
+
+perception_node:
+  ros__parameters:
+    use_mock: false                  # launch argument use_mock overrides
+    publish_rate_hz: 10.0            # upper bound; YOLO runs once per new camera frame
+    model_path: /home/unitree/come-here/models/yolo11n.pt
+    confidence: 0.45                 # YOLO person confidence floor
+    yolo_imgsz: 320
+    max_frame_age_s: 1.0             # older camera frame -> explicit not-detected
+    bearing_ema_alpha: 1.0           # raw bearing; the single EMA is in behavior_node
+    use_lidar_distance: true
+    lidar_cloud_topic: /utlidar/cloud_base
+    lidar_max_age_s: 2.0
+    lidar_min_vertical_extent_m: 0.15
+    lidar_min_points: 4
+    lidar_z_min: 0.1
+    lidar_cone_half_rad: 0.30
+
+behavior_node:
+  ros__parameters:
+    tick_rate_hz: 10.0
+    trial_log_enabled: true
+    trial_log_dir: ~/come_here_trials   # launch argument trial_log_dir overrides
+    # Demo scope
+    skip_turn_to_sound: true         # caller starts in camera view; DOA not used
+    arrival_mode: stop               # stop and stay stopped; no sit / face / stand
+    arrival_hold_s: 2.0
+    wake_speak_text: "I am coming"   # audiohub playback, on its own thread
+    speak_text: ""                   # no arrival speech
+    direction_confidence_threshold: 0.5
+    listening_timeout_s: 1.5
+    # Acquisition
+    person_confidence_threshold: 0.5
+    search_min_consecutive_detections: 2   # two fresh frames before any motion
+    search_timeout_s: 10.0           # no caller acquired -> IDLE
+    max_person_bearing_rad: 1.0      # larger bearings are corrupt, not people
+    max_person_distance_m: 10.0
+    # Lost person: stop, then ACQUIRE_PERSON needs 2 new frames to resume
+    lost_debounce_s: 0.3             # the 3-tick debounce, hw 2026-04-24
+    person_stale_timeout_s: 1.5      # no valid detection at all -> stop
+    # Bearing and ALIGN/WALK (hw 2026-04-24)
+    bearing_ema_alpha: 0.3
+    approach_align_threshold_rad: 0.15    # ALIGN -> WALK inside this
+    approach_realign_threshold_rad: 0.30  # WALK -> ALIGN only beyond this
+    approach_min_align_s: 0.4
+    approach_min_walk_s: 1.5
+    approach_speed: 0.6              # mcf clean trot needs >= 0.5
+    approach_ccw_yaw: 0.6
+    approach_cw_yaw: 0.6
+    # Stopping
+    bbox_stop_fraction: 0.75         # close-range stop; stopped ~0.8 m, hw 2026-04-24
+    approach_stop_distance_m: 0.8    # LiDAR/pinhole distance, read long while walking
+    max_walk_distance_m: 2.0         # launch argument; = caller start distance - 0.5 m
+    approach_timeout_s: 20.0
+    # Unused in arrival_mode stop
+    sit_settle_s: 3.0
+    face_timeout_s: 1.5
+    speak_hold_s: 5.0
+    stand_settle_s: 0.5
+
+go2_bridge_node:
+  ros__parameters:
+    dry_run: true                    # launch argument dry_run overrides
+    require_motion_mode: mcf         # refuse all motion unless CheckMode reports mcf
+    motion_mode_timeout_s: 5.0
+    max_vx: 0.7                      # clamp; the demo commands 0.6
+    max_yaw_rate: 1.0                # clamp; the demo commands 0.6
+    reject_vx_above: 1.5             # beyond this a command is corrupt: stop
+    reject_yaw_rate_above: 3.0
+    allow_combined_motion: false     # mcf degrades on vx + yaw together
+    cmd_velocity_timeout_s: 0.5      # watchdog
+    republish_rate_hz: 20.0          # mcf gait latching, hw 2026-04-24
+    enable_rotate_command: false     # TURN_TO_SOUND is off
+    enable_posture_commands: false   # no sit / stand
+    cmd_z: 1.0
+    deg_per_sec: 90.0
+    sit_api_id: 1009
+    stand_api_id: 1002
+    move_api_id: 1008
+    stop_move_api_id: 1003
+    wav_chunk_size_bytes: 16384
+    wav_chunk_delay_s: 0.15
