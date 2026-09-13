@@ -25,14 +25,14 @@ import sys
 # name -> (id, offset, kind, default, description)
 PARAMETERS = {
     'AGCONOFF': (19, 0, int, 1, 'automatic gain control, 0 off 1 on'),
-    'AGCMAXGAIN': (19, 1, float, 1000.0, 'max AGC gain factor, 1000 = 60 dB'),
+    'AGCMAXGAIN': (19, 1, float, 31.6, 'max AGC gain factor, 31.6 = 30 dB, 1000 = 60 dB'),
     'AGCDESIREDLEVEL': (19, 2, float, 0.005, 'target output power, 0.005 = -23 dBov'),
     'AGCGAIN': (19, 3, float, 1.0, 'current AGC gain factor'),
     'AGCTIME': (19, 4, float, 0.5, 'AGC ramp time constant, seconds'),
     'STATNOISEONOFF': (19, 8, int, 1, 'stationary noise suppression, 0 off 1 on'),
     'GAMMA_NS': (19, 9, float, 1.0, 'over-subtraction factor for stationary noise'),
     'MIN_NS': (19, 10, float, 0.15, 'gain floor for noise suppression'),
-    'GAMMAVAD_SR': (19, 39, float, 3.5, 'VAD threshold in dB; lower hears further'),
+    'GAMMAVAD_SR': (19, 39, float, 1.5, 'VAD threshold, raw value (1.5 is about 3.5 dB)'),
     'VOICEACTIVITY': (19, 32, int, 0, 'read-only: firmware VAD right now'),
     'HPFONOFF': (18, 27, int, 0, 'high-pass filter 0 off, 1 70Hz, 2 125Hz, 3 180Hz'),
     'DOAANGLE': (21, 0, int, 0, 'read-only: direction of arrival, degrees'),
@@ -42,19 +42,19 @@ READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'DOAANGLE')
 
 # For a caller a few metres in front of the robot:
 #   AGCONOFF 1         the DSP's own gain ride is the cheapest far-field win
-#   AGCMAXGAIN 1000    allow the full 60 dB
+#   AGCMAXGAIN 1000    allow the full 60 dB instead of the 30 dB default
 #   AGCDESIREDLEVEL    a hotter target than -23 dBov, so a distant talker lands
 #                      well above the software gate
-#   GAMMAVAD_SR 2.0    firmware VAD threshold (advisory in come-here)
 #   STATNOISEONOFF 1   keep stationary suppression: the robot hums
 #   GAMMA_NS 1.0       but do not over-subtract, which eats quiet consonants
 #   MIN_NS 0.15        leave a gain floor so suppressed frames are not silence
 #   HPFONOFF 1         70 Hz, below voice and above most chassis rumble
+# GAMMAVAD_SR is left at its firmware default: its raw units are not dB, and
+# 2.0 raw would RAISE the VAD threshold from about 3.5 dB to about 6 dB.
 FAR_FIELD_PROFILE = {
     'AGCONOFF': 1,
     'AGCMAXGAIN': 1000.0,
     'AGCDESIREDLEVEL': 0.03,
-    'GAMMAVAD_SR': 2.0,
     'STATNOISEONOFF': 1,
     'GAMMA_NS': 1.0,
     'MIN_NS': 0.15,

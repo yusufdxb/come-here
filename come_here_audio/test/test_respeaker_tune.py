@@ -9,9 +9,17 @@ import struct
 
 import pytest
 
-usb = pytest.importorskip('usb.util')
+from come_here_audio import respeaker_tune as tune
 
-from come_here_audio import respeaker_tune as tune  # noqa: E402
+try:
+    import usb.util  # noqa: F401  (respeaker_tune imports it inside each call)
+    _PYUSB_AVAILABLE = True
+except ImportError:
+    _PYUSB_AVAILABLE = False
+
+# A module-level pytest.importorskip would mark the shared `test` package
+# skipped and silently drop every sibling test file from the run.
+pytestmark = pytest.mark.skipif(not _PYUSB_AVAILABLE, reason='pyusb not installed')
 
 
 class FakeDevice:
@@ -77,7 +85,31 @@ def test_far_field_profile_only_writes_writable_parameters():
         assert name not in tune.READ_ONLY
 
 
-def test_far_field_profile_turns_agc_on_and_lowers_vad_threshold():
+def test_defaults_match_the_published_firmware_defaults():
+    # respeaker/usb_4_mic_array tuning.py: AGCMAXGAIN defaults to 31.6 (30 dB)
+    # and GAMMAVAD_SR to 1.5 raw (about 3.5 dB), so --restore-defaults restores them.
+    assert tune.PARAMETERS['AGCMAXGAIN'][3] == 31.6
+    assert tune.PARAMETERS['GAMMAVAD_SR'][3] == 1.5
+
+
+def test_far_field_profile_turns_agc_on_and_uncaps_it():
     assert tune.FAR_FIELD_PROFILE['AGCONOFF'] == 1
-    assert tune.FAR_FIELD_PROFILE['AGCMAXGAIN'] >= 1000.0
-    assert tune.FAR_FIELD_PROFILE['GAMMAVAD_SR'] < tune.PARAMETERS['GAMMAVAD_SR'][3]
+    assert tune.FAR_FIELD_PROFILE['AGCMAXGAIN'] > tune.PARAMETERS['AGCMAXGAIN'][3]
+
+
+def test_far_field_profile_leaves_the_vad_threshold_alone():
+    # 2.0 raw would raise the firmware VAD threshold, not lower it.
+    assert 'GAMMAVAD_SR' not in tune.FAR_FIELD_PROFILE
+
+
+# Published min/max from the tuning table, checked against every profile value.
+OFFICIAL_RANGES = {
+    'AGCONOFF': (0, 1), 'AGCMAXGAIN': (1, 1000), 'AGCDESIREDLEVEL': (1e-8, 0.99),
+    'STATNOISEONOFF': (0, 1), 'GAMMA_NS': (0, 3), 'MIN_NS': (0, 1), 'HPFONOFF': (0, 3),
+}
+
+
+def test_far_field_profile_values_are_inside_the_published_ranges():
+    for name, value in tune.FAR_FIELD_PROFILE.items():
+        low, high = OFFICIAL_RANGES[name]
+        assert low <= value <= high, name
