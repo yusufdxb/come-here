@@ -230,3 +230,78 @@ def test_centered_caller_lost_caller_and_estop(stack):
     assert h.trials[1]['lost_events'] == 1
 
     assert h.real == [], 'dry run published on the real /api/sport/request'
+
+
+def test_bridge_verifies_mcf_over_dds(tmp_path, monkeypatch):
+    """The bridge with the demo config refuses motion until the motion switcher says mcf."""
+    from unitree_api.msg import Response
+
+    bridge = _executable('go2_bridge_node')
+    if bridge is None:
+        pytest.skip('come_here_behavior not installed; build the workspace first')
+    monkeypatch.setenv('ROS_DOMAIN_ID', str(DOMAIN_ID))
+    monkeypatch.setenv('ROS_LOCALHOST_ONLY', '1')
+    proc = subprocess.Popen(
+        [bridge, '--ros-args', '--params-file', str(CONFIG),
+         '-p', 'dry_run:=true', '-p', f'wav_dir:={tmp_path}'],
+        env=dict(os.environ, PYTHONUNBUFFERED='1'),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    h = Harness()
+    checks, statuses = [], []
+    h.node.create_subscription(Request, '/api/motion_switcher/request',
+                               lambda m: checks.append(m.header.identity.api_id), 10)
+    h.node.create_subscription(String, '/come_here/bridge_status',
+                               lambda m: statuses.append(json.loads(m.data)), 10)
+    response_pub = h.node.create_publisher(Response, '/api/motion_switcher/response', 10)
+    velocity_pub = h.node.create_publisher(Float64MultiArray, '/come_here/cmd_velocity', 10)
+
+    def send(vx, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            velocity_pub.publish(Float64MultiArray(data=[vx, 0.0]))
+            h.spin(0.1)
+
+    def reply(mode):
+        msg = Response()
+        msg.header.identity.api_id = 1001
+        msg.header.status.code = 0
+        msg.data = json.dumps({'form': '0', 'name': mode})
+        response_pub.publish(msg)
+
+    try:
+        assert h.spin_until(lambda: checks and statuses, 20.0), 'bridge sent no CheckMode'
+        h.spin(1.5)
+        assert set(checks) == {1001}
+        assert statuses[-1]['inhibited'] is True
+        assert statuses[-1]['motion_mode_verified'] is False
+
+        send(0.0, 0.3)
+        send(0.6, 1.0)
+        assert h.moves() == [], 'moved before mcf was verified'
+
+        reply('mcf')
+        assert h.spin_until(lambda: statuses[-1]['motion_mode_verified'] is True, 5.0)
+        verified_at = time.monotonic()
+        send(0.0, 0.3)
+        send(0.6, 1.0)
+        moves = h.moves(since=verified_at)
+        assert moves and all(m == {'x': 0.6, 'y': 0.0, 'z': 0.0} for _t, m in moves)
+
+        changed_at = time.monotonic()
+        reply('ai')
+        assert h.spin_until(lambda: h.stops(since=changed_at), 3.0), 'no StopMove on mode change'
+        send(0.6, 1.0)
+        assert h.moves(since=changed_at + 0.3) == [], 'moved after the mode left mcf'
+        assert h.spin_until(lambda: statuses[-1]['inhibited'] is True, 3.0)
+
+        assert all(api_id != 1001 for _t, api_id, _p in h.dry), '1001 on a Sport topic'
+        assert h.real == [], 'dry run published on the real /api/sport/request'
+    finally:
+        h.close()
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
