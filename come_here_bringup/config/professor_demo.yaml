@@ -3,16 +3,25 @@
 #   ros2 launch come_here_bringup professor_demo.launch.py              # dry run, no motion
 #   ros2 launch come_here_bringup professor_demo.launch.py dry_run:=false
 #
-# Scenario: one caller, starting on a tape mark 2.5 m in front of a standing
-# GO2 (mcf mode), inside the front camera view. Everything not needed for that
-# is off: no TURN_TO_SOUND/DOA, no sit, no face detection, no arrival speech.
+# Scenario: one caller 1.5 to 2.5 m from a standing GO2 (mcf mode), not
+# necessarily in the camera view: the robot hears "come here", turns toward
+# the voice (software DOA on the raw ReSpeaker capsules, closed-loop turn on
+# odometry yaw), finds the caller with YOLO, ALIGN/WALK, stops about 0.8 m
+# away. No sit, no face detection, no arrival speech.
 # Values marked "hw 2026-04-24" are the ones the last full hardware run used.
+# Launch arguments: skip_turn_to_sound:=true restores the camera-only demo.
 
 audio_node:
   ros__parameters:
     use_mock: false                  # launch argument use_mock overrides
     wake_detector: whisper
-    enable_doa: false                # ReSpeaker DOA register observed stuck; not used
+    enable_doa: false                # firmware DOAANGLE polling: register observed stuck
+    doa_source: software             # SRP-PHAT on raw capsules, per wake utterance
+    respeaker_frame_offset_deg: 0.0  # launch argument doa_offset_deg; calibrate: doa_probe.py
+    doa_mirror: false                # launch argument doa_mirror; true if left/right swap
+    doa_grid_deg: 2.0
+    doa_peak_full_scale: 0.25        # SRP peak counted as full confidence; see probe
+    doa_firmware_advisory: true      # log the firmware DOAANGLE next to ours
     publish_rate_hz: 10.0
     health_period_s: 5.0             # /come_here/audio_health and a log line
     whisper_model_size: base.en
@@ -27,7 +36,7 @@ audio_node:
     wake_cooldown_s: 3.0             # one utterance cannot fire twice
     mic_device: ReSpeaker            # resolved by name; the 6-channel array is preferred
     mic_prefer_far_field: true
-    mic_channels: 1
+    mic_channels: 6                  # ch0 DSP beam for Whisper, ch1-4 raw capsules for DOA
     mic_beam_channel: 0              # DSP beamformed output
     mic_gain: 1.0
     respeaker_profile: far_field     # launch argument respeaker_profile overrides
@@ -65,12 +74,14 @@ behavior_node:
     trial_log_enabled: true
     trial_log_dir: ~/come_here_trials   # launch argument trial_log_dir overrides
     # Demo scope
-    skip_turn_to_sound: true         # caller starts in camera view; DOA not used
+    skip_turn_to_sound: false        # launch argument; true = camera-only demo
     arrival_mode: stop               # stop and stay stopped; no sit / face / stand
     arrival_hold_s: 2.0
     wake_speak_text: "I am coming"   # audiohub playback, on its own thread
     speak_text: ""                   # no arrival speech
-    direction_confidence_threshold: 0.5
+    direction_confidence_threshold: 0.5   # launch argument; below it: no turn, camera only
+    direction_max_age_s: 3.0         # a bearing older than this belongs to another utterance
+    turn_min_rad: 0.2                # caller within 11 deg of ahead: skip the turn
     listening_timeout_s: 1.5
     # Acquisition
     person_confidence_threshold: 0.5
@@ -113,10 +124,16 @@ go2_bridge_node:
     allow_combined_motion: false     # mcf degrades on vx + yaw together
     cmd_velocity_timeout_s: 0.5      # watchdog
     republish_rate_hz: 20.0          # mcf gait latching, hw 2026-04-24
-    enable_rotate_command: false     # TURN_TO_SOUND is off
+    enable_rotate_command: true      # TURN_TO_SOUND
     enable_posture_commands: false   # no sit / stand
-    cmd_z: 1.0
-    deg_per_sec: 90.0
+    cmd_z: 1.0                       # turn rate; mcf steps cleanly CCW at 1.0 (hw 2026-04-17)
+    deg_per_sec: 57.0                # timed fallback only (1.0 rad/s nominal), unmeasured
+    rotate_closed_loop: true         # turn until /utlidar/robot_odom yaw moved by the target
+    odom_topic: /utlidar/robot_odom
+    odom_max_age_s: 0.5
+    rotate_deadband_rad: 0.12        # about 7 deg; the visual ALIGN finishes the job
+    rotate_timeout_s: 6.0
+    rotate_prefer_ccw_beyond_rad: 2.6   # beyond 150 deg turn left the long way
     sit_api_id: 1009
     stand_api_id: 1002
     move_api_id: 1008

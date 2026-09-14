@@ -84,14 +84,30 @@ def test_launch_and_config_agree_on_walk_budget(launch_description, config):
 def test_demo_scope_is_minimal(config):
     behavior = _params(config, 'behavior_node')
     bridge = _params(config, 'go2_bridge_node')
-    assert behavior['skip_turn_to_sound'] is True
     assert behavior['arrival_mode'] == 'stop'
     assert behavior['speak_text'] == ''
-    assert bridge['enable_rotate_command'] is False
     assert bridge['enable_posture_commands'] is False
     assert bridge['allow_combined_motion'] is False
     assert bridge['require_motion_mode'] == 'mcf'
-    assert _params(config, 'audio_node')['enable_doa'] is False
+
+
+def test_turn_to_sound_uses_software_doa_and_closed_loop_turns(config, launch_description):
+    audio = _params(config, 'audio_node')
+    behavior = _params(config, 'behavior_node')
+    bridge = _params(config, 'go2_bridge_node')
+    assert audio['doa_source'] == 'software'
+    assert audio['enable_doa'] is False              # the stuck firmware register stays off
+    assert audio['mic_channels'] == 6                # raw capsules needed for DOA
+    assert audio['mic_beam_channel'] == 0            # Whisper keeps the DSP beam
+    assert behavior['skip_turn_to_sound'] is False
+    assert behavior['direction_max_age_s'] > 0
+    assert bridge['enable_rotate_command'] is True
+    assert bridge['rotate_closed_loop'] is True
+    assert bridge['odom_topic'] == '/utlidar/robot_odom'
+    assert bridge['cmd_z'] <= bridge['max_yaw_rate']
+    args = {e.name: e for e in launch_description.entities if isinstance(e, DeclareLaunchArgument)}
+    assert args['skip_turn_to_sound'].default_value[0].text == 'false'
+    assert float(args['doa_offset_deg'].default_value[0].text) == audio['respeaker_frame_offset_deg']
 
 
 def test_single_bearing_smoothing_layer(config):

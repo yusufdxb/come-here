@@ -9,7 +9,9 @@ decisions into Sport API requests. It never sends SelectMode.
 Subscribes:
   /come_here/cmd_velocity         (std_msgs/Float64MultiArray) [vx, yaw_rate] gait command
   /come_here/estop                (std_msgs/Bool)   True engages the latched e-stop, False releases it
-  /come_here/cmd_rotate           (std_msgs/Float64) target yaw in rad (+ = left), experimental
+  /come_here/cmd_rotate           (std_msgs/Float64) turn in place by this angle (+ = left);
+                                  closed loop on odometry yaw, see rotate_controller.py
+  <odom_topic>                    (nav_msgs/Odometry) robot yaw for closed-loop turns
   /come_here/cmd_sit              (std_msgs/Bool)   True triggers Sit, optional
   /come_here/cmd_stand            (std_msgs/Bool)   True triggers BalanceStand, optional
   /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub
@@ -37,7 +39,14 @@ Parameters:
   enable_rotate_command    (bool,  True)  accept /come_here/cmd_rotate
   enable_posture_commands  (bool,  True)  accept /come_here/cmd_sit and /come_here/cmd_stand
   cmd_z                    (float, 2.0)   rotation worker yaw rate, capped at max_yaw_rate
-  deg_per_sec              (float, 90.0)  measured rotation speed at cmd_z, for duration
+  deg_per_sec              (float, 90.0)  measured rotation speed at cmd_z, for the timed
+                                          fallback when odometry is missing
+  rotate_closed_loop       (bool,  True)  turn until odometry yaw has moved by the target
+  odom_topic               (str)          nav_msgs/Odometry source, /utlidar/robot_odom
+  odom_max_age_s           (float, 0.5)   older odometry ends a closed-loop turn (stop)
+  rotate_deadband_rad      (float, 0.12)  done inside this remaining angle
+  rotate_timeout_s         (float, 6.0)   hard bound on any turn
+  rotate_prefer_ccw_beyond_rad (float, 2.6) targets beyond this turn left, the long way
   sit_api_id / stand_api_id / move_api_id / stop_move_api_id  Sport API ids (never 1001, Damp)
   wav_dir / wav_chunk_size_bytes / wav_chunk_delay_s          audiohub playback
 """
@@ -51,7 +60,9 @@ import random
 import threading
 import time
 
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from unitree_api.msg import Request, Response
 
@@ -66,6 +77,7 @@ from come_here_behavior.motion_mode import (
     parse_mode_response,
 )
 from come_here_behavior.node_runner import run_node
+from come_here_behavior.rotate_controller import RotateController
 
 SPORT_TOPIC = '/api/sport/request'
 DRY_RUN_SPORT_TOPIC = '/come_here/dry_run/sport_request'
@@ -124,6 +136,12 @@ class Go2BridgeNode(Node):
         # (hardware, 2026-04-24).
         self.declare_parameter('republish_rate_hz', 20.0)
         self.declare_parameter('enable_rotate_command', True)
+        self.declare_parameter('rotate_closed_loop', True)
+        self.declare_parameter('odom_topic', '/utlidar/robot_odom')
+        self.declare_parameter('odom_max_age_s', 0.5)
+        self.declare_parameter('rotate_deadband_rad', 0.12)
+        self.declare_parameter('rotate_timeout_s', 6.0)
+        self.declare_parameter('rotate_prefer_ccw_beyond_rad', 2.6)
         self.declare_parameter('enable_posture_commands', True)
 
         p = self.get_parameter
@@ -192,6 +210,20 @@ class Go2BridgeNode(Node):
         self._rotate_generation = 0
         self._rotate_lock = threading.Lock()
         self._rotate_cancel = threading.Event()
+        self._rotate_closed_loop = bool(p('rotate_closed_loop').value)
+        self._odom_max_age_s = float(p('odom_max_age_s').value)
+        self._rotate_deadband_rad = float(p('rotate_deadband_rad').value)
+        self._rotate_timeout_s = float(p('rotate_timeout_s').value)
+        self._rotate_prefer_ccw_beyond_rad = float(p('rotate_prefer_ccw_beyond_rad').value)
+        self._odom_lock = threading.Lock()
+        self._odom_yaw = None
+        self._odom_stamp_s = None
+        self._rotate_result_pub = self.create_publisher(String, '/come_here/rotate_result', 10)
+        if self._enable_rotate and self._rotate_closed_loop:
+            # Best effort matches the GO2's own publishers whatever their reliability.
+            self.create_subscription(
+                Odometry, str(p('odom_topic').value), self._odom_cb, qos_profile_sensor_data
+            )
 
         # Audio thread: drop new cmd_say if a previous playback is still streaming.
         self._audio_busy = threading.Event()
@@ -296,6 +328,7 @@ class Go2BridgeNode(Node):
             'motion_mode': self._motion_mode,
             'motion_mode_verified': self._mode_verified,
             'moving': self._gate.active,
+            'odom_age_s': self._odom_age_s(),
         }
         msg = String()
         msg.data = json.dumps(status)
@@ -397,9 +430,24 @@ class Go2BridgeNode(Node):
         if not math.isfinite(target_rad) or abs(target_rad) > math.pi:
             self._warn_throttled('rotate_bad', f'cmd_rotate ignored: invalid {target_rad}')
             return
-        target_deg = abs(math.degrees(target_rad))
-        duration = max(0.3, min(target_deg / self._deg_per_sec, 4.0))
-        sign = 1.0 if target_rad > 0 else -1.0
+        now = self._now()
+        start_yaw = None
+        if self._rotate_closed_loop:
+            yaw, stamp = self._latest_yaw()
+            if yaw is not None and now - stamp <= self._odom_max_age_s:
+                start_yaw = yaw
+            else:
+                self.get_logger().warn(
+                    'cmd_rotate: no fresh odometry, falling back to the timed turn '
+                    f'({self._deg_per_sec:.0f} deg/s calibration)')
+        controller = RotateController(
+            target_rad, self._rotate_yaw_rate, now, start_yaw,
+            deadband_rad=self._rotate_deadband_rad,
+            timeout_s=self._rotate_timeout_s,
+            odom_max_age_s=self._odom_max_age_s,
+            fallback_deg_per_sec=self._deg_per_sec,
+            prefer_ccw_beyond_rad=self._rotate_prefer_ccw_beyond_rad,
+        )
         # The rotation replaces any armed velocity command.
         self._gate.disarm('rotate')
 
@@ -411,33 +459,68 @@ class Go2BridgeNode(Node):
             cancel_event = self._rotate_cancel
             threading.Thread(
                 target=self._rotate_worker,
-                args=(my_gen, sign, duration, target_rad, cancel_event),
+                args=(my_gen, controller, target_rad, cancel_event),
                 daemon=True,
             ).start()
 
         self.get_logger().info(
-            f'cmd_rotate: {target_rad:+.2f} rad, dur={duration:.2f}s, gen={my_gen}'
+            f'cmd_rotate: {target_rad:+.2f} rad, '
+            f'{"closed loop" if controller.closed_loop else "timed"} '
+            f'{"left" if controller.sign > 0 else "right"} '
+            f'{math.degrees(controller.magnitude_rad):.0f} deg at '
+            f'{self._rotate_yaw_rate:.2f} rad/s, gen={my_gen}'
         )
 
-    def _rotate_worker(self, generation, sign, duration, target_rad, cancel_event):
-        """Publish Move at 20 Hz for ``duration``, then StopMove. Abort on cancel."""
+    def _odom_cb(self, msg) -> None:
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        if not math.isfinite(yaw):
+            return
+        with self._odom_lock:
+            self._odom_yaw = yaw
+            self._odom_stamp_s = self._now()
+
+    def _latest_yaw(self):
+        with self._odom_lock:
+            return self._odom_yaw, self._odom_stamp_s
+
+    def _odom_age_s(self):
+        _, stamp = self._latest_yaw()
+        return None if stamp is None else round(self._now() - stamp, 3)
+
+    def _rotate_worker(self, generation, controller, target_rad, cancel_event):
+        """Drive the RotateController at 20 Hz, then StopMove. Abort on cancel."""
         start = time.monotonic()
-        while (time.monotonic() - start) < duration:
+        while True:
             if cancel_event.is_set() or self._gate.estopped or self._gate.inhibited:
                 # A newer command preempted us, or motion was blocked; whoever
                 # did that owns the robot's state, so no StopMove here.
                 return
-            self._publish_move(0.0, self._rotate_yaw_rate * sign)
+            yaw, stamp = self._latest_yaw()
+            step = controller.step(self._now(), yaw, stamp)
+            if step.done:
+                break
+            self._publish_move(0.0, step.yaw_rate)
             time.sleep(0.05)
 
         with self._rotate_lock:
             if generation != self._rotate_generation:
                 return
         self._publish_stop(force=True)
-        self.get_logger().info(
-            f'rotate gen={generation} done: {target_rad:+.2f} rad in '
-            f'{time.monotonic() - start:.2f}s'
-        )
+        result = {
+            'target_rad': round(target_rad, 3),
+            'mode': 'closed_loop' if controller.closed_loop else 'timed',
+            'reason': step.reason,
+            'turned_rad': round(controller.turned_rad, 3) if controller.closed_loop else None,
+            'seconds': round(time.monotonic() - start, 2),
+        }
+        msg = String()
+        msg.data = json.dumps(result)
+        self._rotate_result_pub.publish(msg)
+        log = self.get_logger().info if step.reason in ('reached', 'timed', 'overshoot') \
+            else self.get_logger().warn
+        log(f'rotate gen={generation} {step.reason}: target {target_rad:+.2f} rad, '
+            f'turned {result["turned_rad"]} rad in {result["seconds"]}s ({result["mode"]})')
 
     # -- cmd_sit / cmd_stand (optional post-arrival sequence) --
 

@@ -66,6 +66,22 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'trial_log_dir', default_value='~/come_here_trials',
         ),
+        DeclareLaunchArgument(
+            'skip_turn_to_sound', default_value='false',
+            description='true: no turn toward the voice, the caller must start in camera view',
+        ),
+        DeclareLaunchArgument(
+            'doa_offset_deg', default_value='0.0',
+            description='software DOA mount offset, from scripts/doa_probe.py (caller ahead)',
+        ),
+        DeclareLaunchArgument(
+            'doa_mirror', default_value='false',
+            description='true if the probe reports left callers as right',
+        ),
+        DeclareLaunchArgument(
+            'direction_confidence_threshold', default_value='0.5',
+            description='DOA confidence needed to turn; below it the demo is camera only',
+        ),
 
         ExecuteProcess(
             cmd=['python3', '-u', LaunchConfiguration('camera_script')],
@@ -85,6 +101,10 @@ def generate_launch_description():
                 'respeaker_profile': LaunchConfiguration('respeaker_profile'),
                 'adaptive_gate': ParameterValue(
                     LaunchConfiguration('adaptive_gate'), value_type=bool),
+                'respeaker_frame_offset_deg': ParameterValue(
+                    LaunchConfiguration('doa_offset_deg'), value_type=float),
+                'doa_mirror': ParameterValue(
+                    LaunchConfiguration('doa_mirror'), value_type=bool),
             }],
             output='screen',
             respawn=True,
@@ -109,6 +129,10 @@ def generate_launch_description():
                 'max_walk_distance_m': ParameterValue(
                     LaunchConfiguration('max_walk_distance_m'), value_type=float),
                 'trial_log_dir': LaunchConfiguration('trial_log_dir'),
+                'skip_turn_to_sound': ParameterValue(
+                    LaunchConfiguration('skip_turn_to_sound'), value_type=bool),
+                'direction_confidence_threshold': ParameterValue(
+                    LaunchConfiguration('direction_confidence_threshold'), value_type=float),
             }],
             output='screen',
         ),

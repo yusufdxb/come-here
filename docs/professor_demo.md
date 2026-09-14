@@ -15,7 +15,10 @@ validated. Record failures, not just successes.
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-    IDLE --> ACQUIRE_PERSON: "come here" heard
+    IDLE --> LISTENING: "come here" heard
+    LISTENING --> TURN_TO_SOUND: voice bearing confident, beyond 0.2 rad
+    LISTENING --> ACQUIRE_PERSON: voice ahead, or no confident bearing in 1.5 s
+    TURN_TO_SOUND --> ACQUIRE_PERSON: turn commanded (closed loop on odometry)
     ACQUIRE_PERSON --> ALIGN: 2 fresh detections, off-center
     ACQUIRE_PERSON --> WALK: 2 fresh detections, centered
     ALIGN --> WALK: bearing inside 0.15 rad
@@ -30,10 +33,10 @@ stateDiagram-v2
 | Process | Role |
 |---|---|
 | camera publisher script | GO2 front camera to `/camera/image_raw` |
-| `audio_node` | ReSpeaker beam channel, adaptive gate, Whisper `base.en`, publishes `/come_here/wake_phrase` |
+| `audio_node` | ReSpeaker beam channel, adaptive gate, Whisper `base.en`, publishes `/come_here/wake_phrase`; software DOA on the four raw capsules of the same utterance, publishes `/come_here/audio_direction` |
 | `perception_node` | YOLO person detection, one result per new camera frame |
 | `behavior_node` | the state machine above, trial log |
-| `go2_bridge_node` | Sport API Move/StopMove at 20 Hz; validation, watchdog, e-stop latch, mcf check |
+| `go2_bridge_node` | Sport API Move/StopMove at 20 Hz; validation, watchdog, e-stop latch, mcf check; closed-loop turn in place on `/utlidar/robot_odom` yaw |
 
 Motion rules the robot's stock `mcf` gait needs: ALIGN turns in place (yaw
 only) and WALK goes straight (forward only, 0.6 m/s). No command ever mixes
@@ -44,6 +47,38 @@ frame height, which stopped the robot about 0.8 m away on the last hardware
 run. Backstops, all of which also stop the robot: caller lost for 0.3 s, no
 valid detection for 1.5 s, a dead camera, 20 s approach limit, and a 2.0 m
 walking budget sized for the 2.5 m start mark.
+
+## Turn toward the voice
+
+The caller does not have to start in the camera view. When Whisper matches
+"come here", the audio node computes the bearing of that same utterance from
+the ReSpeaker's four raw capsules (SRP-PHAT, `come_here_audio/srp_doa.py`)
+and publishes it a few milliseconds before the wake. The behavior node then
+turns the robot by that bearing and only afterwards looks for a person.
+
+Why software and not the array's DOAANGLE register: the register was dead
+for a week in April and was seen stuck in September. The software estimate
+needs no USB control transfer and no firmware voice detector, and it belongs
+to exactly the samples that triggered the wake, so a chair scraping two
+seconds earlier cannot aim the robot.
+
+Why closed loop: an open-loop turn (rate times duration) on the `mcf` gait
+is not repeatable (the rate takes time to latch, left and right differ). The
+bridge now turns until the odometry yaw has changed by the target, within
+0.12 rad, with a 6 s bound. If odometry is missing or goes stale mid-turn
+the turn stops at once (stale) or falls back to the timed guess (missing at
+the start, warned in the log). The visual ALIGN cleans up the last degrees.
+
+Fail-safe by design: a bearing with confidence under
+`direction_confidence_threshold` (0.5) or older than 3 s is ignored and the
+demo continues exactly as the camera-only version. `skip_turn_to_sound:=true`
+restores the camera-only demo outright.
+
+Calibration (two numbers, from `scripts/doa_probe.py`, no motion):
+`doa_offset_deg` is minus the array bearing the probe prints for a caller
+straight ahead; `doa_mirror:=true` if a caller on the robot's left prints as
+right. Both are launch arguments. The array frame follows the ODAS geometry
+for this device (capsules at 32 mm on the +/-x and +/-y axes).
 
 ## Safety rules
 
@@ -131,6 +166,21 @@ T3  ros2 topic echo /come_here/dry_run/sport_request
 Pass: Move parameters are `{"x": 0.6, "y": 0.0, "z": 0.0}` or yaw-only; walking up
 to the robot produces `ARRIVED` and a StopMove (api_id 1003). Nothing moves.
 
+### Stage B2: voice bearing (still dry run, no motion)
+
+Stop the launch (the probe needs the microphone), then
+`python3 scripts/doa_probe.py --seconds 90`. Caller at 1.5 m says "come here"
+three times from each of: ahead, left, behind, right. Note the array bearing,
+robot bearing and confidence of every line. Set `doa_offset_deg` from the
+ahead median (the probe prints it), rerun with `--offset-deg` and, if left
+reads as right, `--mirror`. Pass: all four positions within 20 degrees with
+confidence at or above the threshold. Then relaunch the dry run with the
+arguments and repeat once through the real pipeline: the launch log shows
+`direction +N deg (...)` on the wake line and `Rotating toward sound` (dry
+run: no motion). If confidences stay under 0.5 in the lab, lower
+`direction_confidence_threshold` only to the level the probe supports, never
+below the value that separates a real bearing from a no-estimate.
+
 ### Stage C: stop path on the live bridge (robot standing, no motion commanded)
 
 ```bash
@@ -162,6 +212,17 @@ Pass: the feet step and the robot turns in both directions, not just a body twis
 0.6 only twists the body, raise `approach_ccw_yaw` / `approach_cw_yaw` in
 `professor_demo.yaml` (0.8 or 1.0; the bridge caps yaw at 1.0), repeat this check, and
 relaunch. With `--symlink-install` the YAML edit needs no rebuild.
+
+### Stage D2: one closed-loop turn (MOVES THE ROBOT)
+
+Remote in hand, 1.5 m clear all round, nobody speaking.
+`python3 scripts/rotate_test.py --deg 90`, then `--deg -90`, then `--deg 170`.
+Each prints the odometry yaw change against the target and the bridge's
+result line (`reached`, `overshoot`, `timeout`, `odom_stale`). Pass: within
+15 degrees, feet stepping not twisting, robot still at the end. If a
+direction only twists at 1.0 rad/s, this is the `mcf` limit measured in
+April; do not raise `max_yaw_rate` on demo day, prefer `rotate_prefer_ccw_beyond_rad`
+lower so more turns go left.
 
 ### Stage E: centered "come here" (MOVES THE ROBOT)
 
@@ -223,4 +284,6 @@ Operator verdicts go to `trial_marks.jsonl` through `trial_report --mark`.
 Everything that changes demo behavior is in
 `come_here_bringup/config/professor_demo.yaml`, with a comment per value. Launch
 arguments: `dry_run` (default true), `use_mock`, `camera`, `camera_script`,
-`respeaker_profile`, `adaptive_gate`, `max_walk_distance_m`, `trial_log_dir`.
+`respeaker_profile`, `adaptive_gate`, `max_walk_distance_m`, `trial_log_dir`,
+`skip_turn_to_sound` (default false), `doa_offset_deg`, `doa_mirror`,
+`direction_confidence_threshold`.

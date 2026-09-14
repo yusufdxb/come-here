@@ -41,12 +41,12 @@ import math
 import queue
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
 from come_here_audio.phrase_matcher import match_trigger
-from come_here_audio.ring_buffer import LatestOnlyQueue, RingBuffer
+from come_here_audio.ring_buffer import LatestOnlyQueue, MultiRingBuffer, RingBuffer
 from come_here_audio.wake_phrase_detector import PhraseDetection, WakePhraseDetector
 
 # Guarded imports
@@ -91,6 +91,10 @@ class WhisperPhraseDetector(WakePhraseDetector):
         phrase_ratio_threshold: float = 0.80,
         mic_gain: float = 1.0,
         highpass_filter: bool = False,
+        # Software DOA: an estimator with .estimate(samples x mics) and the
+        # capture channels that carry the raw capsules (ReSpeaker: 1..4).
+        doa_estimator=None,
+        doa_channels: Sequence[int] = (1, 2, 3, 4),
         ring_buffer_duration_s: float = 6.0,
         # Utterance endpointing
         utterance_rms_threshold: float = 0.015,
@@ -120,6 +124,13 @@ class WhisperPhraseDetector(WakePhraseDetector):
             raise ValueError('Whisper capture requires sample_rate=16000')
         if not 0 <= mic_beam_channel < mic_channels:
             raise ValueError('mic_beam_channel must be within mic_channels')
+        doa_channels = [int(c) for c in doa_channels]
+        if doa_estimator is not None:
+            if any(not 0 <= c < mic_channels for c in doa_channels):
+                raise ValueError('doa_channels must be within mic_channels')
+            n_mics = getattr(doa_estimator, 'n_mics', len(doa_channels))
+            if n_mics != len(doa_channels):
+                raise ValueError(f'doa_estimator expects {n_mics} mics, got {len(doa_channels)} channels')
         for name, value in (
             ('utterance_rms_threshold', utterance_rms_threshold),
             ('silence_to_end_sec', silence_to_end_sec),
@@ -151,6 +162,10 @@ class WhisperPhraseDetector(WakePhraseDetector):
         self._mic_device = mic_device
         self._mic_channels = mic_channels
         self._mic_beam_channel = mic_beam_channel
+        self._doa_estimator = doa_estimator
+        self._doa_channels = doa_channels
+        self._raw_ring: Optional[MultiRingBuffer] = None
+        self._last_doa = None
         self._sample_rate = sample_rate
         self._confidence_threshold = confidence_threshold
         self._no_speech_threshold = no_speech_threshold
@@ -234,6 +249,8 @@ class WhisperPhraseDetector(WakePhraseDetector):
 
         buf_samples = int(self._ring_buffer_duration_s * self._sample_rate)
         self._ring_buffer = RingBuffer(capacity=buf_samples)
+        if self._doa_estimator is not None:
+            self._raw_ring = MultiRingBuffer(buf_samples, len(self._doa_channels))
         self._segment_queue = LatestOnlyQueue()
         self._reset_segmenter()
 
@@ -291,6 +308,9 @@ class WhisperPhraseDetector(WakePhraseDetector):
         if status:
             self._capture_status_count += 1
             print(f'[AUDIO] capture status: {status}')
+        if self._raw_ring is not None:
+            # Same frames, same count: absolute positions line up with the mono ring.
+            self._raw_ring.write(indata[:, self._doa_channels])
         mono = indata[:, self._mic_beam_channel].copy()
         if self._hp_sos is not None:
             from scipy.signal import sosfilt
@@ -430,7 +450,10 @@ class WhisperPhraseDetector(WakePhraseDetector):
                               f'len={len(segment) / self._sample_rate:.2f}s '
                               f'gate={self.effective_rms_threshold():.4f}{vad_note}')
                         speech_end_s = now - (end - self._seg_last_speech) / self._sample_rate
-                        self._segment_queue.put((segment, speech_end_s))
+                        self._segment_queue.put((
+                            segment, speech_end_s,
+                            (self._seg_utterance_start, self._seg_last_speech),
+                        ))
                     if hit_max and self._adaptive_gate:
                         # Ran to max length: the room itself is above the gate.
                         self._recalibrate_noise_floor()
@@ -445,7 +468,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
         """Pull segments from queue, run Whisper, fire callbacks on match."""
         while self._running:
             try:
-                segment, t_speech_end = self._segment_queue.get(timeout=0.5)
+                segment, t_speech_end, span = self._segment_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -457,6 +480,8 @@ class WhisperPhraseDetector(WakePhraseDetector):
                 continue
 
             rms = float(np.sqrt(np.mean(segment ** 2)))
+            # Direction first: cheap, and it belongs to exactly these samples.
+            doa = self._estimate_doa(span)
             t_infer_start = time.monotonic()
             if self._use_hf:
                 detection = self._transcribe_hf(segment)
@@ -473,6 +498,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
                 self._last_detection_time = now
                 detection.t_speech_end = t_speech_end
                 detection.infer_ms = infer_ms
+                detection.doa = doa
 
                 print(f"[WHISPER] MATCH: '{detection.phrase}' "
                       f"conf={detection.confidence:.2f} "
@@ -484,6 +510,33 @@ class WhisperPhraseDetector(WakePhraseDetector):
             else:
                 print(f"[WHISPER] no match | peak={peak:.3f} rms={rms:.4f} "
                       f"infer={infer_ms:.0f}ms")
+
+    def _estimate_doa(self, span):
+        """Direction of the utterance at ring positions ``span``; None without an estimator."""
+        if self._doa_estimator is None or self._raw_ring is None or span is None:
+            return None
+        start, end = int(span[0]), int(span[1])
+        raw = self._raw_ring.read_range(start, end)
+        if len(raw) < end - start:
+            print(f'[DOA] raw ring lost {end - start - len(raw)} samples of the utterance')
+        try:
+            est = self._doa_estimator.estimate(raw)
+        except Exception as exc:  # noqa: BLE001 - a bearing must never kill the wake path
+            print(f'[DOA] estimate failed: {exc}')
+            return None
+        if est is None:
+            print('[DOA] no estimate: clip too short or silent')
+        else:
+            print(f'[DOA] array {math.degrees(est.azimuth_rad):+.0f} deg '
+                  f'conf={est.confidence:.2f} peak={est.peak:.3f} '
+                  f'contrast={est.contrast:.2f} frames={est.frames_used}')
+        self._last_doa = est
+        return est
+
+    @property
+    def last_doa(self):
+        """Most recent software DOA estimate (any utterance, matched or not)."""
+        return self._last_doa
 
     def check(self) -> PhraseDetection | None:
         """Polling interface."""

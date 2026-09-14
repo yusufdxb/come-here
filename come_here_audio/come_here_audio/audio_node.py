@@ -6,8 +6,11 @@ Publishes:
                               transcript, speech_end_to_publish_s, infer_ms, gate
   /come_here/audio_health     (std_msgs/String) JSON every health_period_s: mic,
                               capture age, rms, noise floor, gate
-  /come_here/audio_direction  (std_msgs/Float64MultiArray) [azimuth, confidence],
-                              only when enable_doa is true
+  /come_here/audio_direction  (std_msgs/Float64MultiArray) [azimuth, confidence].
+                              doa_source software: one message per wake, the
+                              bearing of the utterance Whisper matched, from the
+                              raw ReSpeaker capsules (srp_doa). doa_source
+                              firmware: the array's DOAANGLE register, polled.
 
 Subscribes:
   /come_here/mock_trigger     (std_msgs/Bool) mock wake phrase trigger
@@ -17,6 +20,7 @@ need pyusb, sounddevice or faster-whisper.
 """
 
 import json
+import math
 import time
 
 from rclpy.node import Node
@@ -42,7 +46,12 @@ class AudioNode(Node):
         p('wake_detector', 'mock')  # 'mock' or 'whisper'
         p('publish_rate_hz', 10.0)
         p('health_period_s', 5.0)
-        p('enable_doa', True)
+        p('enable_doa', True)             # legacy: firmware register polling
+        p('doa_source', 'none')           # 'software' | 'firmware' | 'none'
+        p('doa_mirror', False)            # array mounted capsules-down
+        p('doa_grid_deg', 2.0)
+        p('doa_peak_full_scale', 0.25)    # SRP peak that counts as full confidence
+        p('doa_firmware_advisory', True)  # also log DOAANGLE next to the software bearing
         p('mock_azimuth_rad', 0.0)
         p('respeaker_frame_offset_deg', 0.0)
         p('whisper_model_size', 'base.en')
@@ -82,24 +91,70 @@ class AudioNode(Node):
         self._mic_label = 'mock'
 
         # Direction provider
+        doa_source = str(g('doa_source')).lower()
+        if doa_source not in ('software', 'firmware', 'none'):
+            raise ValueError(f"doa_source must be software, firmware or none, got {doa_source!r}")
+        if doa_source == 'none' and bool(g('enable_doa')):
+            doa_source = 'firmware'
+        self._doa_source = doa_source
+        self._doa_offset_deg = float(g('respeaker_frame_offset_deg'))
+        self._doa_mirror = bool(g('doa_mirror'))
+        self._doa_firmware_dev = None
         self._direction_provider: AudioDirectionProvider | None = None
         if use_mock:
             self._direction_provider = MockAudioProvider(fixed_azimuth_rad=g('mock_azimuth_rad'))
             self.get_logger().info('Using MOCK audio direction provider')
-        elif g('enable_doa'):
+        elif doa_source == 'firmware':
             from come_here_audio.respeaker_doa_provider import ReSpeakerDOAProvider
             self._direction_provider = ReSpeakerDOAProvider(
                 frame_offset_deg=g('respeaker_frame_offset_deg')
             )
             self.get_logger().info('Using RESPEAKER audio direction provider')
+        elif doa_source == 'software':
+            self.get_logger().info('Software DOA (SRP-PHAT on the raw capsules) per wake utterance')
         else:
-            self.get_logger().info('DOA disabled (enable_doa=false)')
+            self.get_logger().info('DOA disabled (doa_source=none)')
 
         # Wake phrase detector
         if not use_mock and g('wake_detector') == 'whisper':
             self._apply_respeaker_profile(str(g('respeaker_profile')))
-            mic_index = self._resolve_mic(str(g('mic_device')), bool(g('mic_prefer_far_field')),
-                                          int(g('mic_channels')))
+            mic_channels = int(g('mic_channels'))
+            doa_estimator = None
+            doa_channels = ()
+            if doa_source == 'software':
+                from come_here_audio.srp_doa import RESPEAKER_V2_RAW_CHANNELS, SrpPhatDoa
+                doa_channels = RESPEAKER_V2_RAW_CHANNELS
+                needed = max(doa_channels) + 1
+                if mic_channels < needed:
+                    self.get_logger().info(
+                        f'software DOA needs the raw capsules: capturing {needed} channels '
+                        f'(mic_channels was {mic_channels})')
+                    mic_channels = needed
+                doa_estimator = SrpPhatDoa(
+                    grid_deg=float(g('doa_grid_deg')),
+                    peak_full_scale=float(g('doa_peak_full_scale')),
+                )
+                if bool(g('doa_firmware_advisory')):
+                    try:
+                        from come_here_audio import respeaker_tune
+                        self._doa_firmware_dev = respeaker_tune.find_device()
+                    except Exception as exc:  # noqa: BLE001 - advisory only
+                        self.get_logger().warn(f'firmware DOAANGLE advisory unavailable: {exc}')
+            try:
+                mic_index = self._resolve_mic(str(g('mic_device')),
+                                              bool(g('mic_prefer_far_field')), mic_channels)
+            except RuntimeError as exc:
+                if doa_estimator is None or 'input channels' not in str(exc):
+                    raise
+                # 1-channel firmware on the array: keep the wake path alive, lose DOA.
+                self.get_logger().error(
+                    f'SOFTWARE DOA DISABLED, the array is not streaming its raw capsules: {exc}. '
+                    'Flash the 6-channel ReSpeaker firmware to get turn-to-sound back.')
+                doa_estimator = None
+                doa_channels = ()
+                mic_channels = int(g('mic_channels'))
+                mic_index = self._resolve_mic(str(g('mic_device')),
+                                              bool(g('mic_prefer_far_field')), mic_channels)
             from come_here_audio.whisper_phrase_detector import WhisperPhraseDetector
             adapter_path = g('whisper_adapter_path') or None
             self._wake_detector: WakePhraseDetector = WhisperPhraseDetector(
@@ -109,9 +164,11 @@ class AudioNode(Node):
                 cpu_threads=int(g('whisper_cpu_threads')),
                 adapter_path=adapter_path,
                 mic_device=mic_index,
-                mic_channels=int(g('mic_channels')),
+                mic_channels=mic_channels,
                 mic_beam_channel=int(g('mic_beam_channel')),
                 mic_gain=float(g('mic_gain')),
+                doa_estimator=doa_estimator,
+                doa_channels=doa_channels,
                 confidence_threshold=float(g('whisper_confidence_threshold')),
                 no_speech_threshold=float(g('whisper_no_speech_threshold')),
                 phrase_ratio_threshold=float(g('phrase_ratio_threshold')),
@@ -131,7 +188,9 @@ class AudioNode(Node):
             self._detector_name = 'whisper'
             self.get_logger().info(
                 f'Using WHISPER wake detector ({g("whisper_model_size")}, '
-                f'cpu_threads={g("whisper_cpu_threads")}, adaptive_gate={g("adaptive_gate")})'
+                f'cpu_threads={g("whisper_cpu_threads")}, adaptive_gate={g("adaptive_gate")}, '
+                f'software_doa={doa_estimator is not None} '
+                f'offset={self._doa_offset_deg:+.1f} deg mirror={self._doa_mirror})'
             )
         else:
             self._wake_detector = MockWakePhraseDetector()
@@ -226,6 +285,27 @@ class AudioNode(Node):
         if hasattr(self._wake_detector, 'capture_health'):
             health = self._wake_detector.capture_health()
             detail.update({k: health[k] for k in ('noise_floor', 'rms_gate')})
+        doa_note = ''
+        estimate = getattr(detection, 'doa', None)
+        if estimate is not None:
+            from come_here_audio.srp_doa import to_robot_frame
+            azimuth = to_robot_frame(estimate.azimuth_rad, self._doa_offset_deg, self._doa_mirror)
+            detail.update(estimate.as_dict())
+            detail['doa_robot_deg'] = round(math.degrees(azimuth), 1)
+            firmware_deg = self._read_firmware_doa()
+            if firmware_deg is not None:
+                detail['doa_firmware_deg'] = firmware_deg
+            # Direction before the wake: the FSM stores it and LISTENING picks it up.
+            direction = Float64MultiArray()
+            direction.data = [float(azimuth), float(estimate.confidence)]
+            self._dir_pub.publish(direction)
+            doa_note = (f', direction {math.degrees(azimuth):+.0f} deg '
+                        f'(array {math.degrees(estimate.azimuth_rad):+.0f}, '
+                        f'conf {estimate.confidence:.2f}'
+                        + (f', firmware {firmware_deg}' if firmware_deg is not None else '')
+                        + ')')
+        elif self._doa_source == 'software':
+            doa_note = ', direction unavailable'
         detail_msg = String()
         detail_msg.data = json.dumps(detail)
         self._detail_pub.publish(detail_msg)
@@ -235,7 +315,18 @@ class AudioNode(Node):
         self.get_logger().info(
             f'Wake phrase detected: "{detection.phrase}" (confidence={detection.confidence:.2f}, '
             f'heard="{detection.transcript}", latency={detail["speech_end_to_publish_s"]}s)'
+            + doa_note
         )
+
+    def _read_firmware_doa(self):
+        """The array's own DOAANGLE (degrees) for the lab log, or None. Never raises."""
+        if self._doa_firmware_dev is None:
+            return None
+        try:
+            from come_here_audio import respeaker_tune
+            return int(respeaker_tune.read_parameter(self._doa_firmware_dev, 'DOAANGLE'))
+        except Exception:  # noqa: BLE001
+            return None
 
     def _health_tick(self):
         health = {'detector': self._detector_name, 'mic': self._mic_label}

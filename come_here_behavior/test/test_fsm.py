@@ -512,6 +512,45 @@ def test_turn_to_sound_path_rotates_then_acquires():
     assert sim.rotates == [0.8]
 
 
+def test_direction_published_just_after_the_wake_still_turns():
+    sim = Sim(skip_turn_to_sound=False)
+    sim.wake()
+    sim.run(0.3)
+    sim.fsm.on_direction(-1.2, 0.8, sim.t)
+    sim.run(0.3)
+    assert sim.transitions[:3] == ['LISTENING', 'TURN_TO_SOUND', 'ACQUIRE_PERSON']
+    assert sim.rotates == [-1.2]
+    assert sim.fsm.status  # trial still open
+
+
+def test_a_stale_direction_from_an_earlier_utterance_is_ignored():
+    sim = Sim(skip_turn_to_sound=False, direction_max_age_s=3.0)
+    sim.fsm.on_direction(1.0, 0.9, sim.t)
+    sim.run(5.0)                       # quiet for longer than direction_max_age_s
+    sim.wake()
+    sim.run(2.0)
+    assert sim.transitions == ['LISTENING', 'ACQUIRE_PERSON']
+    assert sim.rotates == []
+
+
+def test_a_caller_already_ahead_is_not_turned_toward():
+    sim = Sim(skip_turn_to_sound=False, turn_min_rad=0.2)
+    sim.fsm.on_direction(0.1, 0.9, sim.t)
+    sim.wake()
+    sim.run(0.3)
+    assert sim.transitions == ['LISTENING', 'ACQUIRE_PERSON']
+    assert sim.rotates == []
+
+
+def test_the_turn_is_recorded_in_the_trial_summary():
+    sim = Sim(skip_turn_to_sound=False)
+    sim.fsm.on_direction(0.8, 0.9, sim.t)
+    sim.wake()
+    sim.run(12.0)                      # no person: search timeout ends the trial
+    assert sim.summaries[-1]['turn_rad'] == 0.8
+    assert sim.summaries[-1]['turn_confidence'] == 0.9
+
+
 def test_turn_to_sound_falls_back_without_confident_direction():
     sim = Sim(skip_turn_to_sound=False)
     sim.wake()

@@ -355,3 +355,82 @@ def test_bridge_status_reports_the_estop_latch(node):
     status = json.loads(node._status_pub.msgs[-1].data)
     assert status['estopped'] is True
     assert status['dry_run'] is False
+
+
+# -- closed-loop turn on odometry --
+
+def _odom(yaw):
+    from nav_msgs.msg import Odometry
+    m = Odometry()
+    m.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    m.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    return m
+
+
+def test_rotate_turns_until_odometry_yaw_reaches_the_target():
+    import threading
+    n = _make_node(dry_run=True, cmd_z=1.0, max_yaw_rate=1.0, rotate_deadband_rad=0.05)
+    n._now = time.monotonic          # the worker needs real time for odometry ages
+    try:
+        n._odom_cb(_odom(0.0))
+        state = {'yaw': 0.0, 'stop': False}
+
+        def robot():
+            # A fake GO2: integrates the last commanded yaw rate at 1 rad/s scale.
+            last = time.monotonic()
+            while not state['stop']:
+                time.sleep(0.01)
+                now = time.monotonic()
+                moves = _moves(n)
+                if moves and not n._last_was_zero:
+                    state['yaw'] += moves[-1]['z'] * (now - last)
+                last = now
+                n._odom_cb(_odom(state['yaw']))
+
+        t = threading.Thread(target=robot, daemon=True)
+        t.start()
+        msg = Float64()
+        msg.data = math.radians(60)
+        n._rotate_cb(msg)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not n._last_was_zero:
+            time.sleep(0.02)
+        state['stop'] = True
+        t.join(1.0)
+        assert n._last_was_zero, 'turn never issued StopMove'
+        assert 0.95 < math.degrees(state['yaw']) / 60.0 < 1.15
+        assert all(m['x'] == 0.0 and m['z'] > 0 for m in _moves(n))
+        assert any(r.header.identity.api_id == STOP_MOVE_API_ID
+                   for r in n._sport_pub.msgs)  # StopMove closes the turn
+    finally:
+        n.destroy_node()
+
+
+def test_rotate_stops_when_odometry_goes_stale():
+    n = _make_node(dry_run=True, cmd_z=1.0, max_yaw_rate=1.0, odom_max_age_s=0.2)
+    n._now = time.monotonic
+    try:
+        n._odom_cb(_odom(0.0))
+        msg = Float64()
+        msg.data = math.radians(90)
+        n._rotate_cb(msg)                 # odometry never updates again
+        time.sleep(0.6)
+        assert n._last_was_zero
+        moves = _moves(n)
+        assert 1 <= len(moves) <= 8       # about 0.2 s of Moves, then StopMove
+    finally:
+        n.destroy_node()
+
+
+def test_rotate_without_odometry_falls_back_to_the_timed_turn():
+    n = _make_node(dry_run=True, cmd_z=1.0, max_yaw_rate=1.0, deg_per_sec=90.0)
+    n._now = time.monotonic
+    try:
+        msg = Float64()
+        msg.data = math.radians(45)         # 0.5 s at 90 deg/s
+        n._rotate_cb(msg)
+        time.sleep(0.9)
+        assert n._last_was_zero
+        assert 6 <= len(_moves(n)) <= 12
+    finally:
+        n.destroy_node()

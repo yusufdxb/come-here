@@ -93,6 +93,19 @@ case "$mic" in
 esac
 
 echo "== processes"
+# Another stack on this Jetson holds the microphone (ALSA gives a capture
+# device to one process) and may command the robot; it must be down first.
+holders=""
+for pid in $(fuser /dev/snd/pcm*c 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$'); do
+  name="$(ps -o comm= -p "$pid" 2>/dev/null)"
+  [ "$name" = "audio_node" ] && [ "$LIVE" = 1 ] && continue
+  holders="$holders $name($pid)"
+done
+[ -z "$holders" ] && pass "no other process holds a microphone capture device" \
+  || fail "microphone held by another stack, stop it first:$holders"
+other_launch="$(pgrep -af 'ros2 launch' | grep -v -e pgrep -e come_here || true)"
+[ -z "$other_launch" ] && pass "no other ros2 launch running" \
+  || fail "another ros2 launch is running (it may own the Sport API): $(echo "$other_launch" | head -1 | cut -c1-90)"
 running="$(pgrep -af 'lib/come_here_(audio|perception|behavior)/|go2_video_publisher' | grep -v -e pgrep -e demo_preflight || true)"
 if [ "$LIVE" = 0 ]; then
   [ -z "$running" ] && pass "no come-here processes already running" || fail "already running (stop them first): $running"
@@ -129,6 +142,10 @@ if [ "$LIVE" = 1 ]; then
     at_least 1.0 "${age:-99}" && pass "microphone capturing (age ${age}s, gate $(json_field "$audio" rms_gate), floor $(json_field "$audio" noise_floor))" \
       || fail "microphone capture stalled (age ${age}s)"
     [ "$calibrated" = "True" ] && pass "wake gate calibrated" || warn "wake gate not calibrated yet"
+    case "$(json_field "$audio" mic)" in
+      *6ch*) pass "audio_node captures 6 channels (raw capsules available for DOA)" ;;
+      *) warn "audio_node mic is not 6-channel: software DOA is off, the demo is camera only" ;;
+    esac
   else
     fail "no /come_here/audio_health from audio_node"
   fi
@@ -138,6 +155,13 @@ if [ "$LIVE" = 1 ]; then
       || fail "bridge has NOT verified motion mode: $bridge"
     [ "$(json_field "$bridge" estopped)" = "False" ] && pass "e-stop not engaged" || warn "e-stop engaged"
     [ "$(json_field "$bridge" dry_run)" = "True" ] && pass "bridge in dry run" || warn "bridge is LIVE (dry_run false)"
+    odom_age="$(json_field "$bridge" odom_age_s)"
+    if [ -z "$odom_age" ] || [ "$odom_age" = "None" ]; then
+      fail "bridge sees no /utlidar/robot_odom: turns would fall back to the timed guess"
+    else
+      at_least 0.5 "$odom_age" && pass "bridge odometry fresh (age ${odom_age}s): closed-loop turns available" \
+        || fail "bridge odometry stale (age ${odom_age}s)"
+    fi
   else
     fail "no /come_here/bridge_status from go2_bridge_node"
   fi

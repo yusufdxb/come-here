@@ -69,6 +69,8 @@ class FsmConfig:
     skip_turn_to_sound: bool = True
     direction_confidence_threshold: float = 0.5
     listening_timeout_s: float = 1.5
+    direction_max_age_s: float = 3.0    # a bearing older than this is another utterance
+    turn_min_rad: float = 0.2           # caller already ahead: skip the turn
     # Person acquisition.
     person_confidence_threshold: float = 0.5
     search_min_consecutive_detections: int = 2
@@ -111,7 +113,7 @@ class FsmConfig:
                 raise ValueError(f'{name} must be finite and > 0, got {value}')
 
         for name in (
-            'listening_timeout_s', 'search_timeout_s', 'max_person_bearing_rad',
+            'listening_timeout_s', 'direction_max_age_s', 'search_timeout_s', 'max_person_bearing_rad',
             'max_person_distance_m', 'person_stale_timeout_s',
             'approach_align_threshold_rad', 'approach_realign_threshold_rad',
             'approach_speed', 'approach_ccw_yaw', 'approach_cw_yaw',
@@ -120,7 +122,7 @@ class FsmConfig:
         ):
             positive(name)
         for name in (
-            'lost_debounce_s', 'approach_min_align_s', 'approach_min_walk_s',
+            'turn_min_rad', 'lost_debounce_s', 'approach_min_align_s', 'approach_min_walk_s',
             'arrival_hold_s', 'sit_settle_s', 'face_timeout_s', 'speak_hold_s',
             'stand_settle_s',
         ):
@@ -216,6 +218,8 @@ class TrialStats:
     final_bearing_rad: Optional[float] = None
     final_person_confidence: Optional[float] = None
     face_present: Optional[bool] = None
+    turn_rad: Optional[float] = None       # TURN_TO_SOUND command, if any
+    turn_confidence: Optional[float] = None
 
     def summary(self, end_s: float) -> dict:
         def rel(t):
@@ -258,6 +262,8 @@ class TrialStats:
             'final_bbox_h_frac': rnd(self.final_bbox_h_frac),
             'final_bearing_rad': rnd(self.final_bearing_rad),
             'final_person_confidence': rnd(self.final_person_confidence),
+            'turn_rad': rnd(self.turn_rad),
+            'turn_confidence': rnd(self.turn_confidence),
             'face_present': self.face_present,
             'success': self.stop_reason in ARRIVED_REASONS and not self.estop,
         }
@@ -274,6 +280,7 @@ class ComeHereFsm:
 
         self._last_azimuth = 0.0
         self._last_dir_confidence = 0.0
+        self._last_dir_s: Optional[float] = None
 
         self._last_person_msg_s: Optional[float] = None
         self._reset_person_tracking()
@@ -351,6 +358,7 @@ class ComeHereFsm:
             return cmds
         self._last_azimuth = azimuth_rad
         self._last_dir_confidence = confidence
+        self._last_dir_s = now
         return cmds
 
     def on_person(self, obs: Optional[PersonObservation], now: float) -> Commands:
@@ -448,7 +456,11 @@ class ComeHereFsm:
             self._tick_listening(now, cmds)
         elif state == State.TURN_TO_SOUND:
             cmds.rotate_rad = self._last_azimuth
-            cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad')
+            if self._trial is not None:
+                self._trial.turn_rad = self._last_azimuth
+                self._trial.turn_confidence = self._last_dir_confidence
+            cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad '
+                            f'(confidence {self._last_dir_confidence:.2f})')
             self._enter(State.ACQUIRE_PERSON, now, cmds, 'rotate sent')
         elif state == State.ACQUIRE_PERSON:
             self._tick_acquire(now, cmds)
@@ -494,8 +506,14 @@ class ComeHereFsm:
 
     def _tick_listening(self, now: float, cmds: Commands) -> None:
         cfg = self.config
-        if self._last_dir_confidence >= cfg.direction_confidence_threshold:
-            self._enter(State.TURN_TO_SOUND, now, cmds, 'direction confident')
+        fresh = (self._last_dir_s is not None
+                 and now - self._last_dir_s <= cfg.direction_max_age_s)
+        if fresh and self._last_dir_confidence >= cfg.direction_confidence_threshold:
+            if abs(self._last_azimuth) < cfg.turn_min_rad:
+                self._enter(State.ACQUIRE_PERSON, now, cmds,
+                            f'sound ahead ({self._last_azimuth:+.2f} rad), no turn')
+            else:
+                self._enter(State.TURN_TO_SOUND, now, cmds, 'direction confident')
         elif now - self._state_since > cfg.listening_timeout_s:
             self._enter(State.ACQUIRE_PERSON, now, cmds, 'no confident direction')
 
