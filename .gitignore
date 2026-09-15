@@ -26,3 +26,6 @@ LATENCY_*.md
 
 # Model weights that tools download into the working directory
 *.pt
+
+# Boot service live flag (per robot, never committed)
+.come_here_live
