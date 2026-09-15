@@ -17,11 +17,13 @@ audio_node:
     wake_detector: whisper
     enable_doa: false                # firmware DOAANGLE polling: register observed stuck
     doa_source: software             # SRP-PHAT on raw capsules, per wake utterance
-    respeaker_frame_offset_deg: 0.0  # launch argument doa_offset_deg; calibrate: doa_probe.py
+    respeaker_frame_offset_deg: 0.0  # used only with doa_calibration_path:='' (launch doa_offset_deg)
     doa_mirror: false                # launch argument doa_mirror; true if left/right swap
     doa_grid_deg: 2.0
     doa_peak_full_scale: 0.25        # SRP peak counted as full confidence; see probe
-    doa_firmware_advisory: true      # log the firmware DOAANGLE next to ours
+    doa_firmware_advisory: false     # the register read blocks the executor (100 s USB timeout)
+    doa_calibration_path: ~/come_here_trials/doa_calibration.json   # scripts/calibrate_doa.py
+    require_doa_calibration: true    # no file -> no bearing published, loud ERROR, no turn
     publish_rate_hz: 10.0
     health_period_s: 5.0             # /come_here/audio_health and a log line
     whisper_model_size: base.en
@@ -29,8 +31,8 @@ audio_node:
     whisper_compute_type: int8
     whisper_cpu_threads: 2           # uncapped CTranslate2 starved the camera on the Orin
     whisper_adapter_path: ""
-    whisper_confidence_threshold: 0.4
-    whisper_no_speech_threshold: 0.5
+    whisper_confidence_threshold: 0.3   # ODIN lab: far-field phrase heard at 0.28-0.45; 0.4 missed Apr 21
+    whisper_no_speech_threshold: 0.75   # ODIN lab: no_speech_prob inflates with the robot powered
     whisper_vad_filter: true
     phrase_ratio_threshold: 0.80     # fuzzy "come here" match ("come hear" passes)
     wake_cooldown_s: 3.0             # one utterance cannot fire twice

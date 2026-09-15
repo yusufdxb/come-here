@@ -21,6 +21,7 @@ need pyusb, sounddevice or faster-whisper.
 
 import json
 import math
+import os
 import time
 
 from rclpy.node import Node
@@ -54,6 +55,12 @@ class AudioNode(Node):
         p('doa_firmware_advisory', True)  # also log DOAANGLE next to the software bearing
         p('mock_azimuth_rad', 0.0)
         p('respeaker_frame_offset_deg', 0.0)
+        # scripts/calibrate_doa.py writes this file; when it loads, it replaces
+        # respeaker_frame_offset_deg / doa_mirror. '' = use those two parameters.
+        p('doa_calibration_path', '')
+        # true: without a loaded calibration file no bearing is published, so the
+        # robot never turns on an uncentered array (loud ERROR, not a silent bypass).
+        p('require_doa_calibration', False)
         p('whisper_model_size', 'base.en')
         p('whisper_device', 'cpu')
         p('whisper_compute_type', 'int8')
@@ -99,6 +106,9 @@ class AudioNode(Node):
         self._doa_source = doa_source
         self._doa_offset_deg = float(g('respeaker_frame_offset_deg'))
         self._doa_mirror = bool(g('doa_mirror'))
+        self._doa_calibration = self._load_doa_calibration(
+            str(g('doa_calibration_path')), bool(g('require_doa_calibration')),
+            doa_source, use_mock)
         self._doa_firmware_dev = None
         self._direction_provider: AudioDirectionProvider | None = None
         if use_mock:
@@ -215,6 +225,48 @@ class AudioNode(Node):
         self._health_timer = self.create_timer(float(g('health_period_s')), self._health_tick)
         self.get_logger().info(f'Audio node started at {rate_hz} Hz')
 
+    def _load_doa_calibration(self, path: str, required: bool, doa_source: str,
+                              use_mock: bool) -> str:
+        """Apply scripts/calibrate_doa.py output. Returns a label for logs and health.
+
+        'file (<measured_at>)': offset and mirror came from the file.
+        'parameters': no file requested; yaml / launch offset and mirror are used.
+        'MISSING': a file was required and did not load; no bearing is published.
+        """
+        if use_mock or doa_source != 'software':
+            return 'n/a'
+        if not path:
+            self.get_logger().info(
+                f'DOA calibration from parameters: offset {self._doa_offset_deg:+.1f} deg '
+                f'mirror {self._doa_mirror}')
+            return 'parameters'
+        full = os.path.expanduser(path)
+        try:
+            with open(full) as f:
+                cal = json.load(f)
+            offset = float(cal['offset_deg'])
+            mirror = cal['mirror']
+            if not math.isfinite(offset) or not isinstance(mirror, bool):
+                raise ValueError(f'bad values offset_deg={offset!r} mirror={mirror!r}')
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            reason = f'{type(exc).__name__}: {exc}'
+        else:
+            self._doa_offset_deg, self._doa_mirror = offset, mirror
+            measured = cal.get('measured_at', '?')
+            self.get_logger().info(
+                f'DOA calibration loaded from {full}: offset {offset:+.1f} deg mirror {mirror} '
+                f'(measured {measured}, ahead std {cal.get("ahead_circ_std_deg", "?")} deg)')
+            return f'file ({measured})'
+        if required:
+            self.get_logger().error(
+                f'DOA NOT CALIBRATED ({full}: {reason}). No bearing will be published, so the '
+                'robot will NOT turn toward the voice. Run: python3 scripts/calibrate_doa.py')
+            return 'MISSING'
+        self.get_logger().warn(
+            f'DOA calibration file not loaded ({full}: {reason}); using parameters: '
+            f'offset {self._doa_offset_deg:+.1f} deg mirror {self._doa_mirror}')
+        return 'parameters'
+
     def _apply_respeaker_profile(self, profile: str) -> None:
         """Push a DSP profile to the array. Never fatal: a mic that records beats
         a node that does not start, and the profile is an optimisation."""
@@ -295,11 +347,14 @@ class AudioNode(Node):
             firmware_deg = self._read_firmware_doa()
             if firmware_deg is not None:
                 detail['doa_firmware_deg'] = firmware_deg
+            detail['doa_calibration'] = self._doa_calibration
             # Direction before the wake: the FSM stores it and LISTENING picks it up.
-            direction = Float64MultiArray()
-            direction.data = [float(azimuth), float(estimate.confidence)]
-            self._dir_pub.publish(direction)
-            doa_note = (f', direction {math.degrees(azimuth):+.0f} deg '
+            if self._doa_calibration != 'MISSING':
+                direction = Float64MultiArray()
+                direction.data = [float(azimuth), float(estimate.confidence)]
+                self._dir_pub.publish(direction)
+            doa_note = ('' if self._doa_calibration != 'MISSING'
+                        else ', DOA UNCALIBRATED: bearing NOT published') + (f', direction {math.degrees(azimuth):+.0f} deg '
                         f'(array {math.degrees(estimate.azimuth_rad):+.0f}, '
                         f'conf {estimate.confidence:.2f}'
                         + (f', firmware {firmware_deg}' if firmware_deg is not None else '')
@@ -329,7 +384,8 @@ class AudioNode(Node):
             return None
 
     def _health_tick(self):
-        health = {'detector': self._detector_name, 'mic': self._mic_label}
+        health = {'detector': self._detector_name, 'mic': self._mic_label,
+                  'doa_calibration': self._doa_calibration}
         if hasattr(self._wake_detector, 'capture_health'):
             health.update(self._wake_detector.capture_health())
         msg = String()
@@ -337,6 +393,10 @@ class AudioNode(Node):
         self._health_pub.publish(msg)
         if health.get('capture_age_s', 0.0) > 2.0:
             self.get_logger().error(f'Microphone capture stalled: {health}')
+        if self._doa_calibration == 'MISSING':
+            self.get_logger().error(
+                'DOA NOT CALIBRATED: the robot will not turn toward the voice. '
+                'Run: python3 scripts/calibrate_doa.py')
         elif self._detector_name == 'whisper':
             self.get_logger().info(
                 f'audio: rms={health["rms"]} noise_floor={health["noise_floor"]} '
