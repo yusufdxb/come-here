@@ -91,5 +91,22 @@ def test_the_wrapper_sources_the_ros_env_outside_set_u(wrapper):
     assert 'ROS_DISTRO' in wrapper[source_at:]
 
 
+def test_live_mode_waits_until_the_robot_is_standing(wrapper):
+    # Lying is about 0.07 m and sitting about 0.25 m: a wake phrase must never
+    # command a walk from either.
+    guard = wrapper.index('/sportmodestate')
+    assert guard < wrapper.index('exec ros2 launch')
+    assert '0.28' in wrapper
+    assert 'not standing' in wrapper
+
+
+def test_the_installer_uses_the_account_that_owns_the_checkout():
+    # Run under sudo, `id -un` is root: the service would run as root.
+    text = INSTALLER.read_text()
+    assert 'SUDO_USER' in text
+    assert 'refusing to install a service that runs as root' in text
+    assert 'getent passwd' in text
+
+
 def test_the_live_flag_is_never_committed():
     assert '.come_here_live' in (REPO / '.gitignore').read_text()

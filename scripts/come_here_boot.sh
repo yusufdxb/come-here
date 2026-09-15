@@ -54,7 +54,17 @@ fi
 
 if [ -f "$LIVE_FLAG" ]; then
   DRY_RUN=false
-  log "LIVE: $LIVE_FLAG present, the robot will move on a wake phrase"
+  # Live mode only while the robot is already standing. Booting next to a
+  # charger, lying down (body height about 0.07 m) or sitting (about 0.25 m),
+  # a wake phrase would otherwise command a walk from the floor. Standing
+  # measures about 0.32 m. systemd retries, so standing the robot up is all
+  # the operator has to do.
+  height="$("$ROOT/scripts/topic_probe.py" sport /sportmodestate 5 2>/dev/null || true)"
+  if [ -z "$height" ] || ! awk -v h="$height" 'BEGIN { exit !(h + 0 >= 0.28) }'; then
+    log "NOT READY: robot body height '${height:-unknown}' is not standing (>= 0.28 m); systemd will retry"
+    exit 1
+  fi
+  log "LIVE: $LIVE_FLAG present and the robot is standing (body height ${height} m)"
 else
   DRY_RUN=true
   log "DRY RUN: no $LIVE_FLAG, Sport API requests go to /come_here/dry_run/sport_request"

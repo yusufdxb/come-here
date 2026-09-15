@@ -3,6 +3,7 @@
 
     topic_probe.py rate TOPIC TYPE SECONDS   # prints the measured rate in Hz
     topic_probe.py json TOPIC TIMEOUT        # prints one std_msgs/String payload
+    topic_probe.py sport TOPIC TIMEOUT       # prints body_height from SportModeState
 
 Running as a separate process is the point: it proves an operator shell can
 actually see the launched nodes, not just that the nodes exist.
@@ -69,11 +70,36 @@ def grab_json(topic, timeout):
     return 0
 
 
+def body_height(topic, timeout):
+    """Print the robot's body height in metres, or nothing when it is unknown.
+
+    The boot service uses this to keep live mode from starting while the robot
+    is lying down (about 0.07 m) or sitting (about 0.25 m); standing is about
+    0.32 m. No message at all prints nothing and exits non-zero, which the
+    caller must treat as "not standing", never as "fine".
+    """
+    from unitree_go.msg import SportModeState
+    rclpy, node = _node('come_here_sport_probe')
+    got = []
+    node.create_subscription(SportModeState, topic, lambda m: got.append(m.body_height), 10)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not got:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    node.destroy_node()
+    rclpy.try_shutdown()
+    if not got:
+        return 1
+    print(f'{got[0]:.3f}')
+    return 0
+
+
 def main(argv):
     if len(argv) == 4 and argv[0] == 'rate':
         return rate(argv[1], argv[2], float(argv[3]))
     if len(argv) == 3 and argv[0] == 'json':
         return grab_json(argv[1], float(argv[2]))
+    if len(argv) == 3 and argv[0] == 'sport':
+        return body_height(argv[1], float(argv[2]))
     print(__doc__)
     return 2
 

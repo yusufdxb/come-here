@@ -18,7 +18,20 @@ UNIT_DST=/etc/systemd/system/come-here.service
 [ -f "$UNIT_SRC" ] || { echo "missing $UNIT_SRC"; exit 1; }
 [ -x "$ROOT/scripts/come_here_boot.sh" ] || { echo "$ROOT/scripts/come_here_boot.sh is not executable"; exit 1; }
 
-sed -e "s|@ROOT@|$ROOT|g" -e "s|@USER@|$(id -un)|g" -e "s|@HOME@|$HOME|g" "$UNIT_SRC" \
+# Run under sudo, `id -un` is root and $HOME is /root: the service would then
+# run as root and log into /root. The account that owns the checkout is the one
+# that must run the stack, so resolve it from SUDO_USER.
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[ -n "$TARGET_HOME" ] || { echo "cannot resolve the home directory of $TARGET_USER"; exit 1; }
+if [ "$TARGET_USER" = root ] && [ "${COME_HERE_ALLOW_ROOT:-0}" != 1 ]; then
+  echo "refusing to install a service that runs as root."
+  echo "run this from the robot account: sudo $0 ${*:-}"
+  exit 1
+fi
+echo "service will run as $TARGET_USER (home $TARGET_HOME)"
+
+sed -e "s|@ROOT@|$ROOT|g" -e "s|@USER@|$TARGET_USER|g" -e "s|@HOME@|$TARGET_HOME|g" "$UNIT_SRC" \
   | sudo tee "$UNIT_DST" >/dev/null
 sudo systemctl daemon-reload
 echo "installed $UNIT_DST"
@@ -34,4 +47,4 @@ if [ -f "$ROOT/.come_here_live" ]; then
 else
   echo "no live flag: the service starts in dry run (no motion)"
 fi
-echo "logs: journalctl -u come-here -f   and   $HOME/come_here_trials/boot_service.log"
+echo "logs: journalctl -u come-here -f   and   $TARGET_HOME/come_here_trials/boot_service.log"
