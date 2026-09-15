@@ -110,8 +110,19 @@ def test_far_field_profile_lowers_the_vad_threshold():
 OFFICIAL_RANGES = {
     'AGCONOFF': (0, 1), 'AGCMAXGAIN': (1, 1000), 'AGCDESIREDLEVEL': (1e-8, 0.99),
     'STATNOISEONOFF': (0, 1), 'GAMMA_NS': (0, 3), 'MIN_NS': (0, 1), 'HPFONOFF': (0, 3),
-    'GAMMAVAD_SR': (0, 60),
+    'GAMMAVAD_SR': (0, 60), 'AGCGAIN': (1, 1000),
 }
+
+
+def test_agc_gain_is_writable_and_seeded_by_the_far_field_profile():
+    # SDK tuning.py: 'AGCGAIN': (19, 3, 'float', 1000, 1, 'rw', ...). Lab 09-15:
+    # a cold array (gain 1.25) never opened the gate for a 2.5 m talker.
+    assert 'AGCGAIN' not in tune.READ_ONLY
+    assert tune.PARAMETERS['AGCGAIN'][:3] == (19, 3, float)
+    device = FakeDevice()
+    tune.write_parameter(device, 'AGCGAIN', 10.0)
+    assert device.calls[-1][4] == struct.pack(b'ifi', 3, 10.0, 0)
+    assert tune.FAR_FIELD_PROFILE['AGCGAIN'] == 10.0
 
 
 def test_far_field_profile_values_are_inside_the_published_ranges():

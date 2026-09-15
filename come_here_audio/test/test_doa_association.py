@@ -254,3 +254,65 @@ def test_control_transfer_timeout_is_milliseconds_not_microseconds():
         f'stalls the direction thread instead of failing fast'
     )
     assert rdp._CTRL_TIMEOUT > 0
+
+
+# mark_held_register: the register never moved during the utterance (lab 09-15).
+from come_here_audio.doa_association import HELD_CONFIDENCE, mark_held_register  # noqa: E402
+
+
+def _held_case(inside_az):
+    noise = [(998.0 + 0.05 * i, 2.84, True) for i in range(20)]   # +163 deg before speech
+    speech = [(999.3 + 0.05 * i, az, True) for i, az in enumerate(inside_az)]
+    return noise + speech
+
+
+def test_a_bearing_the_register_held_from_before_the_speech_is_flagged():
+    entries = _held_case([2.84, 2.83, 2.86, 2.84])
+    sel = select_direction(entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    marked = mark_held_register(sel, entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    assert marked.held_register is True
+    assert marked.n_changed == 0
+    assert marked.held_rad == pytest.approx(2.84)
+    assert marked.confidence == sel.confidence      # flag only, by default
+
+
+def test_rejection_caps_a_held_bearing_below_the_turn_threshold():
+    entries = _held_case([2.84, 2.83, 2.86, 2.84])
+    sel = select_direction(entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    marked = mark_held_register(sel, entries, speech_end_s=SPEECH_END,
+                                speech_start_s=999.2, reject_held=True)
+    assert marked.confidence == pytest.approx(HELD_CONFIDENCE)
+    assert marked.confidence < 0.4
+
+
+def test_a_talker_who_moves_the_register_is_not_flagged_even_with_rejection():
+    entries = _held_case([-1.57, -1.55, -1.60, -1.58])
+    sel = select_direction(entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    marked = mark_held_register(sel, entries, speech_end_s=SPEECH_END,
+                                speech_start_s=999.2, reject_held=True)
+    assert marked.held_register is False
+    assert marked.n_changed == 4
+    assert marked.confidence == sel.confidence
+    assert marked.azimuth_rad == pytest.approx(-1.57, abs=0.05)
+
+
+def test_small_register_jitter_round_the_held_value_still_counts_as_held():
+    entries = _held_case([2.84 + math.radians(4), 2.84 - math.radians(3)])
+    sel = select_direction(entries, speech_end_s=SPEECH_END, speech_start_s=999.2,
+                           min_active_samples=2)
+    marked = mark_held_register(sel, entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    assert marked.held_register is True
+
+
+def test_without_a_sample_before_the_speech_nothing_is_flagged():
+    entries = [(999.3 + 0.05 * i, 2.84, True) for i in range(5)]
+    sel = select_direction(entries, speech_end_s=SPEECH_END, speech_start_s=999.2)
+    marked = mark_held_register(sel, entries, speech_end_s=SPEECH_END,
+                                speech_start_s=999.2, reject_held=True)
+    assert marked.held_rad is None
+    assert marked.held_register is False
+    assert marked.confidence == sel.confidence
+
+
+def test_none_stays_none():
+    assert mark_held_register(None, [], speech_end_s=SPEECH_END) is None

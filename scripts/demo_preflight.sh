@@ -22,8 +22,13 @@ json_field() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.g
 at_least() { python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)" "$1" "$2"; }
 
 if [ -z "${ROS_DISTRO:-}" ]; then
+  # ROS setup files read unset variables (AMENT_TRACE_SETUP_FILES): under
+  # set -u sourcing them killed this script before it printed anything.
+  set +u
   # shellcheck disable=SC1091
   source "$ROOT/scripts/demo_env.sh" >/dev/null 2>&1
+  set -u
+  [ -n "${ROS_DISTRO:-}" ] || { echo "FAIL: could not source $ROOT/scripts/demo_env.sh"; exit 1; }
 fi
 
 echo "== code"

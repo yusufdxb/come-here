@@ -41,7 +41,7 @@ then rotate back, which is the same correction
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 
@@ -74,6 +74,13 @@ class DoaSelection:
     #: would also flatten a stationary talker, who is the NORMAL case, so the
     #: robot should measure this on hardware before anyone "fixes" it.
     n_distinct: int = 0
+    #: Filled by ``mark_held_register``: the register value just before the
+    #: utterance (None when no sample preceded it), how many window samples
+    #: moved more than HELD_TOLERANCE_RAD away from it (-1 = not checked), and
+    #: whether the register never moved at all during the utterance.
+    held_rad: Optional[float] = None
+    n_changed: int = -1
+    held_register: bool = False
 
 
 def is_valid_azimuth(value) -> bool:
@@ -316,3 +323,58 @@ def select_direction(
             )
 
     return None
+
+
+#: A window sample within this of the pre-speech register value did not move.
+HELD_TOLERANCE_RAD = math.radians(10.0)
+#: Confidence a held bearing is capped to when rejection is on: below the
+#: behaviour's direction_confidence_threshold (0.4), so the robot does not turn.
+HELD_CONFIDENCE = 0.3
+
+
+def mark_held_register(
+    selection: Optional[DoaSelection],
+    samples: Iterable[DoaSample],
+    *,
+    speech_end_s: float,
+    speech_start_s: Optional[float] = None,
+    pre_s: float = 1.0,
+    post_s: float = 0.3,
+    reject_held: bool = False,
+) -> Optional[DoaSelection]:
+    """Flag a bearing the array never re-aimed for during the utterance.
+
+    Lab 2026-09-15: caller at the robot's right (expected about -90 deg); the
+    register already held +163 deg from a noise source behind-left, the
+    firmware VAD fired on that noise 6.5 % of the idle time, and the wake got
+    +163 deg at confidence 0.95. If no sample inside the utterance moved away
+    from the value held before it, the bearing describes whatever the array
+    heard LAST, not necessarily this talker.
+
+    A talker standing where the previous sound came from also leaves the
+    register unmoved, so rejection is opt-in (``reject_held``); the flag is
+    always filled in so lab logs show how often it happens.
+    """
+    if selection is None or selection.source == 'stale_latest':
+        return selection
+    clean = sorted(
+        (float(t), float(az)) for t, az, _ in samples
+        if math.isfinite(t) and is_valid_azimuth(az)
+    )
+    known_span = (speech_start_s is not None
+                  and math.isfinite(speech_start_s)
+                  and speech_start_s <= speech_end_s)
+    start_s = speech_start_s if known_span else speech_end_s - pre_s
+    end_s = speech_end_s + post_s
+    before = [az for t, az in clean if t < start_s]
+    if not before:
+        return replace(selection, held_rad=None, n_changed=-1, held_register=False)
+    held = before[-1]
+    window = [az for t, az in clean if start_s <= t <= end_s]
+    n_changed = sum(1 for az in window if abs(wrap_pi(az - held)) > HELD_TOLERANCE_RAD)
+    is_held = bool(window) and n_changed == 0
+    confidence = selection.confidence
+    if is_held and reject_held:
+        confidence = min(confidence, HELD_CONFIDENCE)
+    return replace(selection, confidence=confidence, held_rad=held,
+                   n_changed=n_changed, held_register=is_held)

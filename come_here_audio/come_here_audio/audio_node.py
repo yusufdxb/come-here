@@ -61,6 +61,11 @@ class AudioNode(Node):
         p('doa_pre_speech_s', 1.0)
         p('doa_post_speech_s', 0.3)
         p('doa_min_active_samples', 3)
+        # true: a bearing the register already held before the utterance (never
+        # moved while the caller spoke) is capped below the turn threshold. Off:
+        # the flag is only logged (a caller where the last sound came from also
+        # leaves the register unmoved).
+        p('doa_reject_held_register', False)
         # scripts/calibrate_doa.py writes this file; when it loads, it replaces
         # respeaker_frame_offset_deg / doa_mirror. '' = use those two parameters.
         p('doa_calibration_path', '')
@@ -217,6 +222,7 @@ class AudioNode(Node):
             'pre_s': float(g('doa_pre_speech_s')),
             'post_s': float(g('doa_post_speech_s')),
             'min_active_samples': int(g('doa_min_active_samples')),
+            'reject_held': bool(g('doa_reject_held_register')),
         }
         if self._direction_provider is not None:
             self._direction_provider.setup()
@@ -344,13 +350,19 @@ class AudioNode(Node):
             'doa_confidence': round(sel.confidence, 3), 'doa_source': sel.source,
             'doa_n_window': sel.n_window, 'doa_n_active': sel.n_active,
             'doa_n_used': sel.n_used, 'doa_n_distinct': sel.n_distinct,
+            'doa_held_deg': (None if sel.held_rad is None
+                             else round(math.degrees(sel.held_rad), 1)),
+            'doa_n_changed': sel.n_changed, 'doa_held_register': sel.held_register,
         })
         direction = Float64MultiArray()
         direction.data = [float(sel.azimuth_rad), float(sel.confidence)]
         self._dir_pub.publish(direction)
+        held = ('' if sel.held_rad is None
+                else f', held before {math.degrees(sel.held_rad):+.0f} deg, {sel.n_changed} moved'
+                + (', HELD REGISTER' if sel.held_register else ''))
         return (f', direction {math.degrees(sel.azimuth_rad):+.0f} deg (built-in, {sel.source}, '
                 f'conf {sel.confidence:.2f}, {sel.n_used}/{sel.n_window} samples, '
-                f'{sel.n_distinct} distinct)')
+                f'{sel.n_distinct} distinct{held})')
 
     def _tick(self):
         if (self._direction_provider is not None

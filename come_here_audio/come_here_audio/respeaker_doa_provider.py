@@ -21,7 +21,7 @@ import usb.core
 import usb.util
 
 from come_here_audio.audio_direction_provider import AudioDirectionProvider, DirectionEstimate
-from come_here_audio.doa_association import select_direction
+from come_here_audio.doa_association import mark_held_register, select_direction
 
 # ReSpeaker Mic Array v2.0 USB IDs
 _VENDOR_ID = 0x2886
@@ -247,15 +247,17 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
         return DirectionEstimate(azimuth_rad=az, confidence=confidence)
 
     def get_direction_near(self, *, speech_end_s, speech_start_s=None, pre_s=1.0, post_s=0.3,
-                           min_active_samples=3, stale_fallback_s=0.0):
+                           min_active_samples=3, stale_fallback_s=0.0, reject_held=False):
         """The bearing of the utterance that ended at speech_end_s (ODIN doa_association).
 
         Samples come from the continuous poll, so a firmware VAD that never
         latches does not lose the direction. Returns a DoaSelection or None;
-        None is no direction, never 0.0 rad.
+        None is no direction, never 0.0 rad. The selection carries the
+        held-register flag (mark_held_register); reject_held caps its confidence.
         """
-        return select_direction(
-            tuple(self._samples),
+        samples = tuple(self._samples)
+        selection = select_direction(
+            samples,
             speech_end_s=speech_end_s,
             speech_start_s=speech_start_s,
             pre_s=pre_s,
@@ -263,6 +265,9 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
             min_active_samples=min_active_samples,
             stale_fallback_s=stale_fallback_s,
         )
+        return mark_held_register(
+            selection, samples, speech_end_s=speech_end_s, speech_start_s=speech_start_s,
+            pre_s=pre_s, post_s=post_s, reject_held=reject_held)
 
     def teardown(self) -> None:
         self._polling = False

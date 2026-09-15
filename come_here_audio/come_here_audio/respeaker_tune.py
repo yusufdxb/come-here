@@ -39,7 +39,9 @@ PARAMETERS = {
     'DOAANGLE': (21, 0, int, 0, 'read-only: direction of arrival, degrees'),
 }
 
-READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'SPEECHDETECTED', 'DOAANGLE')
+# AGCGAIN is 'rw' in the SDK table (respeaker/usb_4_mic_array tuning.py): the
+# current gain can be seeded, and the AGC keeps riding it from there.
+READ_ONLY = ('VOICEACTIVITY', 'SPEECHDETECTED', 'DOAANGLE')
 
 # For a caller a few metres in front of the robot:
 #   AGCONOFF 1         the DSP's own gain ride is the cheapest far-field win
@@ -53,11 +55,18 @@ READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'SPEECHDETECTED', 'DOAANGLE')
 #   GAMMAVAD_SR 2.0    the SDK (usb_4_mic_array/tuning.py) documents this register
 #                      in dB, default 3.5 dB; 2.0 dB is ODIN's far-field value and
 #                      makes the firmware VAD that corroborates DOA hear further
+#   AGCGAIN 10         seed the CURRENT gain. Lab 2026-09-15: after a power
+#                      loss the array sat at 1.25-1.75 for 10+ min and ch0 was
+#                      0.46x the raw capsules (09-14 working session: 3.9x); a
+#                      2.5 m "come here" never opened the gate. Seeded at 10 it
+#                      held for 20 s and ch0 came back to 3.7x. Every launch
+#                      now starts from that state instead of a cold AGC.
 FAR_FIELD_PROFILE = {
     'GAMMAVAD_SR': 2.0,
     'AGCONOFF': 1,
     'AGCMAXGAIN': 1000.0,
     'AGCDESIREDLEVEL': 0.03,
+    'AGCGAIN': 10.0,
     'STATNOISEONOFF': 1,
     'GAMMA_NS': 1.0,
     'MIN_NS': 0.15,
