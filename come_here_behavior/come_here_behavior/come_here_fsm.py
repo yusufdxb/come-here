@@ -144,6 +144,9 @@ class FsmConfig:
     arrival_mode: str = ARRIVAL_STOP
     arrival_hold_s: float = 2.0
     wake_speak_text: str = 'I am coming'
+    # Hold still this long after the wake before the first turn, so the wake
+    # phrase is heard before the robot moves. 0 = turn immediately.
+    wake_speak_hold_s: float = 0.0
     speak_text: str = 'I am here'
     acquired_speak_text: str = ''       # said at the first visual acquisition ('|' = choices)
     # SIT_AND_IDENTIFY timing (arrival_mode: sit_and_identify).
@@ -176,7 +179,7 @@ class FsmConfig:
             'turn_min_rad', 'lost_debounce_s', 'approach_min_align_s', 'approach_min_walk_s',
             'arrival_hold_s', 'sit_settle_s', 'face_timeout_s', 'speak_hold_s',
             'stand_settle_s', 'turn_settle_s', 'final_align_rad', 'final_align_timeout_s',
-            'pre_sit_settle_s',
+            'pre_sit_settle_s', 'wake_speak_hold_s',
         ):
             value = getattr(self, name)
             if not (math.isfinite(value) and value >= 0.0):
@@ -672,6 +675,9 @@ class ComeHereFsm:
 
     def _tick_listening(self, now: float, cmds: Commands) -> None:
         cfg = self.config
+        if (self._wake_s is not None
+                and now - self._wake_s + _TIME_EPS < cfg.wake_speak_hold_s):
+            return                                   # the wake phrase plays before any turn
         fresh = (self._last_dir_s is not None
                  and now - self._last_dir_s <= cfg.direction_max_age_s
                  and (self._wake_s is None

@@ -829,3 +829,25 @@ def test_camera_scan_finds_the_caller_after_a_wrong_voice_bearing():
     sim.run(1.0, person=obs(bearing=0.05), every_ticks=1)
     assert sim.fsm.state in (State.WALK, State.ALIGN)
     assert sim.summaries == []
+
+
+def test_wake_phrase_plays_before_the_first_turn():
+    """Lab 09-15: instant spoken feedback, then motion. The phrase is queued on
+    the wake tick and the robot stays still for wake_speak_hold_s."""
+    sim = Sim(skip_turn_to_sound=False, wake_speak_text='I am coming.', wake_speak_hold_s=1.0)
+    sim.fsm.on_direction(-1.75, 0.95, sim.t)
+    wake_cmds = sim.wake()
+    assert wake_cmds.say == 'I am coming.'
+    assert wake_cmds.velocity == (0.0, 0.0)
+    sim.run(0.8)
+    assert sim.fsm.state == State.LISTENING
+    assert sim.rotates == [] and sim.motion_commands() == []
+    sim.run(0.5)
+    assert sim.fsm.state == State.TURN_TO_SOUND
+    assert sim.rotates == [-1.75]
+    assert sim.says == ['I am coming.']
+
+
+def test_no_hold_by_default_turns_on_the_first_listening_tick():
+    sim = turning_sim(target=-1.75)
+    assert sim.rotates == [-1.75]

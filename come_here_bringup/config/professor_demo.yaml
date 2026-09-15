@@ -88,9 +88,10 @@ behavior_node:
     arrival_mode: sit_and_identify   # stop, settle, sit, face check, speak, stay seated
     arrival_hold_s: 2.0
     # Speech: Aria clips in come_here_audio/scripts, one chosen at random per '|'.
-    wake_speak_text: ""
+    wake_speak_text: "I am coming."  # instant feedback: queued the moment the wake is accepted
+    wake_speak_hold_s: 1.0           # stand still this long so the phrase starts before the turn
     direction_speak_text: ""         # lab 09-14: the long ack queued the acquisition phrase past the walk
-    acquired_speak_text: "There you are.|I see you."
+    acquired_speak_text: "I see you."   # first camera acquisition
     speak_text: "Made it.|Here I am."
     direction_confidence_threshold: 0.4   # launch argument; built-in DOA tiers: 0.95 vad, 0.5-0.85 speech window, 0.45 nearby
     require_direction: true          # no confident DOA -> abort, never walk to a guessed person

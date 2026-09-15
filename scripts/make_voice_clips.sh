@@ -20,6 +20,6 @@ PY
 while IFS= read -r phrase; do
   slug="$(python3 -c "import re,sys; print(re.sub(r'[^a-z0-9]+','_',sys.argv[1].lower()).strip('_'))" "$phrase")"
   edge-tts --voice en-US-AriaNeural --text "$phrase" --write-media "$TMP/$slug.mp3" >/dev/null
-  ffmpeg -loglevel error -y -i "$TMP/$slug.mp3" -ar 16000 -ac 1 -c:a pcm_s16le "$OUT/$slug.wav"
+  ffmpeg -nostdin -loglevel error -y -i "$TMP/$slug.mp3" -ar 16000 -ac 1 -c:a pcm_s16le "$OUT/$slug.wav"
   echo "wrote $OUT/$slug.wav  ($phrase)"
 done < "$TMP/phrases"
