@@ -132,7 +132,10 @@ def stack(tmp_path, monkeypatch):
         # bearing, and arrival_mode stop keeps the IDLE-after-arrival contract.
         subprocess.Popen([behavior] + params + ['-p', f'trial_log_dir:={tmp_path}',
                                                 '-p', 'skip_turn_to_sound:=true',
-                                                '-p', 'arrival_mode:=stop'],
+                                                '-p', 'arrival_mode:=stop',
+                                                # exercise the box stop, not the walk budget
+                                                '-p', 'walk_budget_arrives:=false',
+                                                '-p', 'max_walk_distance_m:=3.0'],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True),
         subprocess.Popen([bridge] + params + ['-p', 'dry_run:=true',
                                               '-p', "require_motion_mode:=''",
@@ -175,7 +178,7 @@ def _approach(h, bearing=0.02, bbox_start=0.55, arrive=True, timeout=12.0):
     while time.monotonic() < deadline:
         walking = bool(h.moves(since=started))
         if arrive and walking:
-            bbox = min(0.8, bbox + 0.03)
+            bbox = min(0.9, bbox + 0.03)   # above the demo stop (0.82, lab 2026-09-14)
         h.person(bearing, bbox)
         h.spin(0.2)
         if arrive and 'ARRIVED' in h.states[states_before:]:

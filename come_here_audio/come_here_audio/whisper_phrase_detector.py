@@ -74,7 +74,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
     event-driven use, register a callback via set_on_detection().
     """
 
-    TRIGGER_PHRASES = {"come here", "come over here"}
+    TRIGGER_PHRASES = {'come here'}  # lab 09-14: 'come over here' matched 'go over here' (false wake); 48/57 hits, 0/14 false
 
     def __init__(
         self,
@@ -450,9 +450,11 @@ class WhisperPhraseDetector(WakePhraseDetector):
                               f'len={len(segment) / self._sample_rate:.2f}s '
                               f'gate={self.effective_rms_threshold():.4f}{vad_note}')
                         speech_end_s = now - (end - self._seg_last_speech) / self._sample_rate
+                        speech_start_s = now - (end - self._seg_utterance_start) / self._sample_rate
                         self._segment_queue.put((
                             segment, speech_end_s,
                             (self._seg_utterance_start, self._seg_last_speech),
+                            speech_start_s,
                         ))
                     if hit_max and self._adaptive_gate:
                         # Ran to max length: the room itself is above the gate.
@@ -468,9 +470,11 @@ class WhisperPhraseDetector(WakePhraseDetector):
         """Pull segments from queue, run Whisper, fire callbacks on match."""
         while self._running:
             try:
-                segment, t_speech_end, span = self._segment_queue.get(timeout=0.5)
+                item = self._segment_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            segment, t_speech_end, span = item[:3]
+            t_speech_start = item[3] if len(item) > 3 else None
 
             peak = float(np.max(np.abs(segment)))
             peak_threshold = self.effective_peak_threshold()
@@ -497,6 +501,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
                     continue
                 self._last_detection_time = now
                 detection.t_speech_end = t_speech_end
+                detection.t_speech_start = t_speech_start
                 detection.infer_ms = infer_ms
                 detection.doa = doa
 

@@ -61,7 +61,7 @@ MOTION_STATES = (State.ALIGN, State.WALK)
 ARRIVAL_STOP = 'stop'
 ARRIVAL_SIT_AND_IDENTIFY = 'sit_and_identify'
 
-ARRIVED_REASONS = ('arrived_bbox', 'arrived_distance')
+ARRIVED_REASONS = ('arrived_bbox', 'arrived_distance', 'arrived_walk_budget')
 
 # Tolerance for duration comparisons, so a 0.3 s debounce on a 10 Hz tick is
 # exactly three ticks despite float rounding.
@@ -130,6 +130,15 @@ class FsmConfig:
     approach_stop_distance_m: float = 0.8
     bbox_stop_fraction: float = 0.75
     max_walk_distance_m: float = 4.0
+    walk_budget_arrives: bool = False   # budget reached with the caller tracked and centered = arrival
+    align_by_rotate: bool = False       # misaligned caller: one odometry turn by the bearing, not yaw velocity
+    max_align_turns: int = 2            # per trial; beyond it a misaligned caller aborts
+    # Voice DOA gives the side; the camera finishes the turn. After a DOA turn,
+    # nobody seen for search_turn_after_s -> one more turn of search_turn_rad the
+    # same way (lab 09-14: caller at 90 deg read +49 deg). 0 disables.
+    search_turn_rad: float = 0.0
+    search_turn_after_s: float = 2.0
+    max_search_turns: int = 2
     approach_timeout_s: float = 30.0
     # Arrival.
     arrival_mode: str = ARRIVAL_STOP
@@ -176,6 +185,11 @@ class FsmConfig:
             raise ValueError('bearing_ema_alpha must be in (0, 1]')
         if not 0.0 <= self.person_confidence_threshold <= 1.0:
             raise ValueError('person_confidence_threshold must be in [0, 1]')
+        if self.max_search_turns < 0 or not (math.isfinite(self.search_turn_rad)
+                                             and 0.0 <= self.search_turn_rad <= math.pi):
+            raise ValueError('search_turn_rad must be in [0, pi] and max_search_turns >= 0')
+        if self.max_align_turns < 0:
+            raise ValueError('max_align_turns must be >= 0')
         if self.search_min_consecutive_detections < 1:
             raise ValueError('search_min_consecutive_detections must be >= 1')
         if self.approach_align_threshold_rad >= self.approach_realign_threshold_rad:
@@ -358,6 +372,13 @@ class ComeHereFsm:
         self._turn_sent = False
         self._turn_result: Optional[Tuple[float, Optional[float], str]] = None
         self._turn_done_s: Optional[float] = None
+        self._turn_target = 0.0
+        self._search_sign = 0.0
+        self._search_turns = 0
+        self._turn_purpose = 'doa'
+        self._align_turns = 0
+        self._search_sign = 0.0
+        self._search_turns = 0
 
     # -- read-only state --
 
@@ -442,6 +463,12 @@ class ComeHereFsm:
         self._turn_result = None
         self._turn_done_s = None
         self._last_face = None
+        self._turn_purpose = 'doa'
+        self._align_turns = 0
+        self._search_sign = 0.0
+        self._search_turns = 0
+        self._search_sign = 0.0
+        self._search_turns = 0
         # An explicit stop first: keeps the robot still and re-arms the bridge
         # after an e-stop release, so motion only ever resumes on a new trial.
         self._command(cmds, now, 0.0, 0.0)
@@ -535,7 +562,7 @@ class ComeHereFsm:
         cmds = Commands()
         if self._state != State.TURN_TO_SOUND or not self._turn_sent or self._turn_result:
             return cmds
-        if not math.isfinite(target_rad) or abs(target_rad - self._last_azimuth) > 0.02:
+        if not math.isfinite(target_rad) or abs(target_rad - self._turn_target) > 0.02:
             cmds.log.append(f'Ignoring rotate_result for another turn (target {target_rad:+.2f})')
             return cmds
         if turned_rad is not None and not math.isfinite(turned_rad):
@@ -648,7 +675,8 @@ class ComeHereFsm:
         fresh = (self._last_dir_s is not None
                  and now - self._last_dir_s <= cfg.direction_max_age_s
                  and (self._wake_s is None
-                      or self._last_dir_s >= self._wake_s - WAKE_DIRECTION_SLACK_S))
+                      or self._last_dir_s >= self._wake_s - max(
+                          WAKE_DIRECTION_SLACK_S, cfg.direction_max_age_s)))
         az_deg = math.degrees(self._last_azimuth)
         if fresh and self._last_dir_confidence >= cfg.direction_confidence_threshold:
             if cfg.direction_speak_text:
@@ -664,6 +692,8 @@ class ComeHereFsm:
             else:
                 self._turn_sent = False
                 self._turn_result = None
+                self._turn_purpose = 'doa'
+                self._search_sign = 1.0 if self._last_azimuth > 0.0 else -1.0
                 self._enter(State.TURN_TO_SOUND, now, cmds, 'direction confident')
         elif now - self._state_since > cfg.listening_timeout_s:
             why = ('no bearing for this utterance' if not fresh else
@@ -681,8 +711,11 @@ class ComeHereFsm:
         trial = self._trial
         if not self._turn_sent:
             self._turn_sent = True
-            cmds.rotate_rad = self._last_azimuth
-            if trial is not None:
+            # The bearing can keep updating during the turn (built-in DOA streams);
+            # the result is matched against the angle actually commanded.
+            self._turn_target = self._last_azimuth
+            cmds.rotate_rad = self._turn_target
+            if trial is not None and self._turn_purpose == 'doa':
                 trial.turn_rad = self._last_azimuth
                 trial.turn_confidence = self._last_dir_confidence
             cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad '
@@ -699,12 +732,12 @@ class ComeHereFsm:
         # Timed (no odometry) turns report no angle: assume the commanded turn.
         residual = 0.0 if turned is None else wrap_pi(target - turned)
         self._gate_center = residual
-        if trial is not None:
+        if trial is not None and self._turn_purpose == 'doa':
             trial.turn_turned_rad = turned
             trial.turn_result_reason = reason
             trial.gate_center_rad = residual
         cmds.log.append(
-            f'DOA->turn: requested {math.degrees(target):+.0f} deg, turned '
+            f'{self._turn_purpose.upper()}->turn: requested {math.degrees(target):+.0f} deg, turned '
             f'{"n/a" if turned is None else f"{math.degrees(turned):+.0f}"} deg ({reason}); '
             f'caller expected at {math.degrees(residual):+.0f} deg in the camera')
         self._reset_person_tracking()
@@ -731,12 +764,31 @@ class ComeHereFsm:
             reason = self._close_enough_reason()
             if reason is not None:
                 self._arrive(now, cmds, reason)
-            elif abs(self._ema_bearing) < cfg.approach_align_threshold_rad:
+            elif abs(self._ema_bearing) < cfg.approach_align_threshold_rad or (
+                    cfg.align_by_rotate
+                    and abs(self._ema_bearing) < cfg.approach_realign_threshold_rad):
                 self._enter(State.WALK, now, cmds, 'person acquired, aligned')
                 self._command(cmds, now, cfg.approach_speed, 0.0)
+            elif cfg.align_by_rotate:
+                self._align_turn(now, cmds, 'person acquired, misaligned')
             else:
                 self._enter(State.ALIGN, now, cmds, 'person acquired, misaligned')
                 self._command(cmds, now, 0.0, self._yaw_toward(self._ema_bearing))
+            return
+        if (cfg.search_turn_rad > 0.0 and self._approach_start is None
+                and self._search_sign != 0.0
+                and self._search_turns < cfg.max_search_turns
+                and (self._last_valid_s is None or self._last_valid_s < self._acquire_since)
+                and now - self._acquire_since + _TIME_EPS >= cfg.search_turn_after_s):
+            self._search_turns += 1
+            self._command(cmds, now, 0.0, 0.0)
+            self._last_azimuth = self._search_sign * cfg.search_turn_rad
+            self._turn_purpose = 'search'
+            self._turn_sent = False
+            self._turn_result = None
+            self._enter(State.TURN_TO_SOUND, now, cmds,
+                        f'nobody in view after the turn: search turn {self._search_turns} of '
+                        f'{cfg.max_search_turns} toward the voice side')
             return
         if now - self._acquire_since > cfg.search_timeout_s:
             reason = 'acquire_timeout' if self._approach_start is None else 'reacquire_timeout'
@@ -766,7 +818,11 @@ class ComeHereFsm:
             self._abort(now, cmds, 'approach_timeout')
             return
         if self._walk_distance_m >= cfg.max_walk_distance_m:
-            self._abort(now, cmds, 'walk_budget')
+            if (cfg.walk_budget_arrives and self._ema_bearing is not None
+                    and abs(self._ema_bearing) <= cfg.approach_realign_threshold_rad):
+                self._arrive(now, cmds, 'arrived_walk_budget')
+            else:
+                self._abort(now, cmds, 'walk_budget')
             return
 
         bearing = self._ema_bearing
@@ -781,6 +837,9 @@ class ComeHereFsm:
         else:
             if (elapsed + _TIME_EPS >= cfg.approach_min_walk_s
                     and abs(bearing) > cfg.approach_realign_threshold_rad):
+                if cfg.align_by_rotate:
+                    self._align_turn(now, cmds, f'realign bearing={bearing:+.2f}')
+                    return
                 self._enter(State.ALIGN, now, cmds, f'realign bearing={bearing:+.2f}')
                 self._command(cmds, now, 0.0, self._yaw_toward(bearing))
             else:
@@ -905,6 +964,22 @@ class ComeHereFsm:
             cmds.trial_summary = self._trial.summary(now)
             self._trial = None
         self._enter(State.IDLE, now, cmds, reason)
+
+    def _align_turn(self, now: float, cmds: Commands, why: str) -> None:
+        """Stop, then one closed-loop odometry turn by the caller's camera bearing."""
+        self._command(cmds, now, 0.0, 0.0)
+        if self._align_turns >= self.config.max_align_turns:
+            cmds.log.append(f'NOT WALKING: caller still misaligned after '
+                            f'{self._align_turns} align turns ({why})')
+            self._abort(now, cmds, 'align_failed')
+            return
+        self._align_turns += 1
+        self._last_azimuth = self._ema_bearing
+        self._turn_purpose = 'align'
+        self._turn_sent = False
+        self._turn_result = None
+        self._enter(State.TURN_TO_SOUND, now, cmds,
+                    f'{why}: align turn {self._align_turns} of {self.config.max_align_turns}')
 
     def _set_sit_phase(self, phase: str, now: float) -> None:
         self._sit_phase = phase

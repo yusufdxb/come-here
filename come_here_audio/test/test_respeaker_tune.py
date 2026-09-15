@@ -86,10 +86,11 @@ def test_far_field_profile_only_writes_writable_parameters():
 
 
 def test_defaults_match_the_published_firmware_defaults():
-    # respeaker/usb_4_mic_array tuning.py: AGCMAXGAIN defaults to 31.6 (30 dB)
-    # and GAMMAVAD_SR to 1.5 raw (about 3.5 dB), so --restore-defaults restores them.
+    # respeaker/usb_4_mic_array tuning.py: AGCMAXGAIN defaults to 31.6 (30 dB).
+    # GAMMAVAD_SR is documented in dB, '[-inf .. 60] dB (default: 3.5dB)', and the
+    # SDK's set_vad_threshold writes the dB value directly.
     assert tune.PARAMETERS['AGCMAXGAIN'][3] == 31.6
-    assert tune.PARAMETERS['GAMMAVAD_SR'][3] == 1.5
+    assert tune.PARAMETERS['GAMMAVAD_SR'][3] == 3.5
 
 
 def test_far_field_profile_turns_agc_on_and_uncaps_it():
@@ -97,15 +98,19 @@ def test_far_field_profile_turns_agc_on_and_uncaps_it():
     assert tune.FAR_FIELD_PROFILE['AGCMAXGAIN'] > tune.PARAMETERS['AGCMAXGAIN'][3]
 
 
-def test_far_field_profile_leaves_the_vad_threshold_alone():
-    # 2.0 raw would raise the firmware VAD threshold, not lower it.
-    assert 'GAMMAVAD_SR' not in tune.FAR_FIELD_PROFILE
+def test_far_field_profile_lowers_the_vad_threshold():
+    # Lab 2026-09-14: the array read GAMMAVAD_SR 15.0 (our reader and the SDK's
+    # tuning.py agree) and VOICEACTIVITY stayed 0 for normal speech at 2 m. ODIN's
+    # far-field value 2.0 dB is below both that and the SDK default.
+    assert tune.FAR_FIELD_PROFILE['GAMMAVAD_SR'] == 2.0
+    assert tune.FAR_FIELD_PROFILE['GAMMAVAD_SR'] < tune.PARAMETERS['GAMMAVAD_SR'][3] < 15.0
 
 
 # Published min/max from the tuning table, checked against every profile value.
 OFFICIAL_RANGES = {
     'AGCONOFF': (0, 1), 'AGCMAXGAIN': (1, 1000), 'AGCDESIREDLEVEL': (1e-8, 0.99),
     'STATNOISEONOFF': (0, 1), 'GAMMA_NS': (0, 3), 'MIN_NS': (0, 1), 'HPFONOFF': (0, 3),
+    'GAMMAVAD_SR': (0, 60),
 }
 
 

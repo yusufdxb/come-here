@@ -55,6 +55,12 @@ class AudioNode(Node):
         p('doa_firmware_advisory', True)  # also log DOAANGLE next to the software bearing
         p('mock_azimuth_rad', 0.0)
         p('respeaker_frame_offset_deg', 0.0)
+        # doa_source firmware: DOAANGLE polled continuously, one bearing per wake
+        # chosen from the samples inside that utterance (ODIN doa_association).
+        p('doa_poll_rate_hz', 20.0)
+        p('doa_pre_speech_s', 1.0)
+        p('doa_post_speech_s', 0.3)
+        p('doa_min_active_samples', 3)
         # scripts/calibrate_doa.py writes this file; when it loads, it replaces
         # respeaker_frame_offset_deg / doa_mirror. '' = use those two parameters.
         p('doa_calibration_path', '')
@@ -207,8 +213,18 @@ class AudioNode(Node):
             self._detector_name = 'mock'
             self.get_logger().info('Using MOCK wake phrase detector')
 
+        self._doa_window = {
+            'pre_s': float(g('doa_pre_speech_s')),
+            'post_s': float(g('doa_post_speech_s')),
+            'min_active_samples': int(g('doa_min_active_samples')),
+        }
         if self._direction_provider is not None:
             self._direction_provider.setup()
+            if hasattr(self._direction_provider, 'get_direction_near'):
+                self._direction_provider.start_continuous(float(g('doa_poll_rate_hz')))
+                self.get_logger().info(
+                    f'Built-in DOA polled at {float(g("doa_poll_rate_hz")):.0f} Hz; one bearing '
+                    f'per wake from the utterance window, offset {self._doa_offset_deg:+.1f} deg')
         self._wake_detector.setup()
 
         self._dir_pub = self.create_publisher(Float64MultiArray, '/come_here/audio_direction', 10)
@@ -309,8 +325,36 @@ class AudioNode(Node):
             self._wake_detector.set_triggered(msg.data)
             self.get_logger().info('Mock wake phrase triggered')
 
+    def _utterance_direction(self, detection, detail):
+        """Built-in DOA for this utterance: publish it before the wake. Returns a log note."""
+        t_end = getattr(detection, 't_speech_end', None)
+        if t_end is None:
+            return ', direction unavailable (no speech timing)'
+        try:
+            sel = self._direction_provider.get_direction_near(
+                speech_end_s=t_end, speech_start_s=getattr(detection, 't_speech_start', None),
+                **self._doa_window)
+        except Exception as exc:  # noqa: BLE001 - a bearing must never kill the wake path
+            return f', direction unavailable ({exc})'
+        if sel is None:
+            detail['doa_source'] = 'none'
+            return ', direction unavailable (no DOA samples in the utterance window)'
+        detail.update({
+            'doa_robot_deg': round(math.degrees(sel.azimuth_rad), 1),
+            'doa_confidence': round(sel.confidence, 3), 'doa_source': sel.source,
+            'doa_n_window': sel.n_window, 'doa_n_active': sel.n_active,
+            'doa_n_used': sel.n_used, 'doa_n_distinct': sel.n_distinct,
+        })
+        direction = Float64MultiArray()
+        direction.data = [float(sel.azimuth_rad), float(sel.confidence)]
+        self._dir_pub.publish(direction)
+        return (f', direction {math.degrees(sel.azimuth_rad):+.0f} deg (built-in, {sel.source}, '
+                f'conf {sel.confidence:.2f}, {sel.n_used}/{sel.n_window} samples, '
+                f'{sel.n_distinct} distinct)')
+
     def _tick(self):
-        if self._direction_provider is not None:
+        if (self._direction_provider is not None
+                and not hasattr(self._direction_provider, 'get_direction_near')):
             estimate = self._direction_provider.get_direction()
             if estimate is not None:
                 msg = Float64MultiArray()
@@ -359,6 +403,9 @@ class AudioNode(Node):
                         f'conf {estimate.confidence:.2f}'
                         + (f', firmware {firmware_deg}' if firmware_deg is not None else '')
                         + ')')
+        elif self._direction_provider is not None and hasattr(
+                self._direction_provider, 'get_direction_near'):
+            doa_note = self._utterance_direction(detection, detail)
         elif self._doa_source == 'software':
             doa_note = ', direction unavailable'
         detail_msg = String()

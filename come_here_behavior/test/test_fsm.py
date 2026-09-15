@@ -645,10 +645,21 @@ def test_required_direction_missing_aborts_without_walking():
     assert sim.motion_commands() == [] and sim.rotates == []
 
 
-def test_a_bearing_measured_well_before_the_wake_is_not_used():
-    sim = Sim(skip_turn_to_sound=False, direction_max_age_s=3.0)
+def test_a_bearing_from_the_utterance_before_recognition_latency_is_used():
+    # Built-in DOA reports only while the caller speaks; Whisper publishes the
+    # wake about 2.5 s after speech ends. That bearing must still count.
+    sim = Sim(skip_turn_to_sound=False, direction_max_age_s=5.0)
     sim.fsm.on_direction(1.0, 0.9, sim.t)
-    sim.run(2.0)                                            # younger than max age, older than slack
+    sim.run(2.6)
+    sim.wake()
+    sim.run(0.3)
+    assert sim.rotates == [1.0]
+
+
+def test_a_bearing_older_than_max_age_is_not_used():
+    sim = Sim(skip_turn_to_sound=False, direction_max_age_s=5.0)
+    sim.fsm.on_direction(1.0, 0.9, sim.t)
+    sim.run(5.5)
     sim.wake()
     sim.run(2.0)
     assert sim.rotates == []
@@ -711,3 +722,90 @@ def test_estop_during_the_seated_finish_ends_the_trial():
     sim.run(0.3, person=obs(bbox=0.8))
     sim.estop(True)
     assert sim.fsm.state == State.IDLE and sim.cmd == (0.0, 0.0)
+
+
+def test_walk_budget_with_caller_centered_arrives_and_sits():
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, max_walk_distance_m=1.0,
+                      walk_budget_arrives=True)
+    sim.run(3.0, person=obs(bearing=0.0, bbox=0.6), every_ticks=1)
+    assert sim.fsm.state == State.SIT_AND_IDENTIFY
+    sim.run(1.2)
+    assert sim.sits == 1
+
+
+def test_walk_budget_without_the_flag_still_aborts():
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, max_walk_distance_m=1.0)
+    sim.run(3.0, person=obs(bearing=0.0, bbox=0.6), every_ticks=1)
+    assert sim.fsm.state == State.IDLE and sim.sits == 0
+    assert sim.summaries[-1]['stop_reason'] == 'walk_budget'
+
+
+def test_align_by_rotate_turns_once_by_the_bearing_then_walks():
+    sim = Sim(align_by_rotate=True)
+    sim.wake()
+    sim.run(0.6, person=obs(bearing=0.6), every_ticks=1)
+    assert sim.fsm.state == State.TURN_TO_SOUND
+    assert len(sim.rotates) == 1 and sim.rotates[0] == pytest.approx(0.6, abs=0.05)
+    assert all(w == 0.0 for _, _, w in sim.velocities)          # no yaw velocity command
+    sim.run(2.0, person=obs(bearing=0.6), every_ticks=1)        # still turning: no second turn
+    assert len(sim.rotates) == 1 and sim.motion_commands() == []
+    sim._record(sim.fsm.on_rotate_result(sim.rotates[0], 0.58, 'reached', sim.t))
+    sim.run(2.0, person=obs(bearing=0.02), every_ticks=1)
+    assert sim.fsm.state == State.WALK
+    assert_single_axis(sim)
+
+
+def test_align_by_rotate_gives_up_after_max_turns():
+    sim = Sim(align_by_rotate=True, max_align_turns=1)
+    sim.wake()
+    sim.run(0.6, person=obs(bearing=0.6), every_ticks=1)
+    sim._record(sim.fsm.on_rotate_result(sim.rotates[0], 0.0, 'timeout', sim.t))
+    sim.run(3.0, person=obs(bearing=0.6), every_ticks=1)
+    assert sim.fsm.state == State.IDLE
+    assert sim.summaries[-1]['stop_reason'] == 'align_failed'
+    assert sim.motion_commands() == []
+
+
+def test_turn_result_is_matched_to_the_commanded_angle_while_doa_keeps_streaming():
+    sim = turning_sim(target=0.99)
+    for az in (0.7, 1.2, 0.4):                       # built-in DOA updates mid-turn
+        sim.fsm.on_direction(az, 0.9, sim.t)
+        sim.run(0.2)
+    sim._record(sim.fsm.on_rotate_result(0.99, 0.95, 'reached', sim.t))
+    sim.run(1.0)
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    assert sim.rotates == [0.99]
+
+
+def test_search_turn_continues_toward_the_voice_side_when_nobody_is_seen():
+    sim = turning_sim(target=0.86, search_turn_rad=0.6, search_turn_after_s=2.0, max_search_turns=2)
+    sim._record(sim.fsm.on_rotate_result(0.86, 0.75, 'reached', sim.t))
+    sim.run(1.0)
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    sim.run(2.2, person=MISS, every_ticks=1)                   # caller still out of view
+    assert sim.fsm.state == State.TURN_TO_SOUND
+    assert sim.rotates == [0.86, 0.6]                           # same side, fixed step
+    sim._record(sim.fsm.on_rotate_result(0.6, 0.58, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(1.0, person=obs(bearing=0.05), every_ticks=1)
+    assert sim.fsm.state in (State.WALK, State.ALIGN)
+    assert sim.summaries == [] and len(sim.rotates) == 2
+
+
+def test_no_search_turn_when_the_caller_is_already_seen():
+    sim = turning_sim(target=-0.86, search_turn_rad=0.6)
+    sim._record(sim.fsm.on_rotate_result(-0.86, -0.8, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(3.0, person=obs(bearing=0.0), every_ticks=1)
+    assert sim.rotates == [-0.86]
+
+
+def test_search_turns_are_bounded_then_the_trial_ends_without_walking():
+    sim = turning_sim(target=-0.86, search_turn_rad=0.6, max_search_turns=1)
+    sim._record(sim.fsm.on_rotate_result(-0.86, -0.8, 'reached', sim.t))
+    sim.run(3.0, person=MISS, every_ticks=1)
+    assert sim.rotates == [-0.86, -0.6]
+    sim._record(sim.fsm.on_rotate_result(-0.6, -0.6, 'reached', sim.t))
+    sim.run(12.0, person=MISS, every_ticks=1)
+    assert sim.fsm.state == State.IDLE and sim.motion_commands() == []
+    assert len(sim.rotates) == 2

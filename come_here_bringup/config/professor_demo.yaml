@@ -17,8 +17,8 @@ audio_node:
     use_mock: false                  # launch argument use_mock overrides
     wake_detector: whisper
     enable_doa: false                # firmware DOAANGLE polling: register observed stuck
-    doa_source: software             # SRP-PHAT on raw capsules, per wake utterance
-    respeaker_frame_offset_deg: 0.0  # used only with doa_calibration_path:='' (launch doa_offset_deg)
+    doa_source: firmware             # lab 09-14 claps: built-in DOAANGLE correct front/left/right/back; SRP-PHAT read ~0 deg everywhere
+    respeaker_frame_offset_deg: -90.0   # lab 09-14 claps: robot deg = DOAANGLE - 90, positive = robot left (launch doa_offset_deg)
     doa_mirror: false                # launch argument doa_mirror; true if left/right swap
     doa_grid_deg: 2.0
     doa_peak_full_scale: 0.25        # SRP peak counted as full confidence; see probe
@@ -32,7 +32,7 @@ audio_node:
     whisper_compute_type: int8
     whisper_cpu_threads: 2           # uncapped CTranslate2 starved the camera on the Orin
     whisper_adapter_path: ""
-    whisper_confidence_threshold: 0.3   # ODIN lab: far-field phrase heard at 0.28-0.45; 0.4 missed Apr 21
+    whisper_confidence_threshold: 0.2   # lab 09-14 recordings: 48/57 of Yusuf's come here at 0.20, 0/14 false wakes
     whisper_no_speech_threshold: 0.75   # ODIN lab: no_speech_prob inflates with the robot powered
     whisper_vad_filter: true
     phrase_ratio_threshold: 0.80     # fuzzy "come here" match ("come hear" passes)
@@ -61,7 +61,7 @@ perception_node:
     model_path: /home/unitree/come-here/models/yolo11n.pt
     confidence: 0.45                 # YOLO person confidence floor
     yolo_imgsz: 320
-    max_frame_age_s: 0.5             # older camera frame -> not-detected; preflight needs >= 3 Hz
+    max_frame_age_s: 1.0             # lab 09-14: camera measured 1.7 Hz early in the session (7.5 Hz later)
     bearing_ema_alpha: 1.0           # raw bearing; the single EMA is in behavior_node
     use_lidar_distance: true
     lidar_cloud_topic: /utlidar/cloud_base
@@ -89,16 +89,16 @@ behavior_node:
     arrival_hold_s: 2.0
     # Speech: Aria clips in come_here_audio/scripts, one chosen at random per '|'.
     wake_speak_text: ""
-    direction_speak_text: "Got you. I'm on my way.|I hear you. Coming over.|Alright, I found your direction."
-    acquired_speak_text: "There you are.|I see you.|Found you. Coming closer."
-    speak_text: "Made it.|Here I am.|Found you."
-    direction_confidence_threshold: 0.5   # launch argument; set from calibrate_doa.py confidences
+    direction_speak_text: ""         # lab 09-14: the long ack queued the acquisition phrase past the walk
+    acquired_speak_text: "There you are.|I see you."
+    speak_text: "Made it.|Here I am."
+    direction_confidence_threshold: 0.4   # launch argument; built-in DOA tiers: 0.95 vad, 0.5-0.85 speech window, 0.45 nearby
     require_direction: true          # no confident DOA -> abort, never walk to a guessed person
     turn_result_timeout_s: 7.0       # bridge rotate_timeout_s 6.0 + 1
     turn_settle_s: 0.7               # frames from the end of the turn cannot select anyone
-    acquire_gate_half_rad: 0.44      # +/- 25 deg around where the voice is after the turn
-    track_gate_half_rad: 0.44        # +/- 25 deg around the tracked caller while moving
-    direction_max_age_s: 3.0         # a bearing older than this belongs to another utterance
+    acquire_gate_half_rad: 0.61      # 35 deg: lab 09-14 voice DOA under-reads (90 deg read +34..+49)
+    track_gate_half_rad: 0.61        # 35 deg
+    direction_max_age_s: 5.0         # lab 09-14: built-in DOA sample is ~2.5 s before the wake (Whisper latency)
     turn_min_rad: 0.2                # caller within 11 deg of ahead: skip the turn
     listening_timeout_s: 1.5
     # Acquisition
@@ -120,9 +120,15 @@ behavior_node:
     approach_ccw_yaw: 0.6
     approach_cw_yaw: 0.6
     # Stopping
-    bbox_stop_fraction: 0.75         # close-range stop; stopped ~0.8 m, hw 2026-04-24
+    bbox_stop_fraction: 0.82         # lab 09-14: 0.85 at measured 1.0 m standing; 0.72 fired too early from a close start
     approach_stop_distance_m: 0.8    # LiDAR/pinhole distance, read long while walking
-    max_walk_distance_m: 2.0         # launch argument; = caller start distance - 0.5 m
+    max_walk_distance_m: 1.5         # launch argument; lab 09-14 good stop from a ~2.5 m start
+    walk_budget_arrives: true        # budget reached with the caller tracked and centered = arrival, sit
+    align_by_rotate: true            # lab 09-14: visual yaw ALIGN overshot past the caller (camera lag)
+    max_align_turns: 2
+    search_turn_rad: 0.6             # lab 09-14: caller at 90 deg read +34..+49; the camera finishes the turn
+    search_turn_after_s: 2.0
+    max_search_turns: 2
     approach_timeout_s: 20.0
     # Arrival sequence (sit_and_identify)
     final_align_rad: 0.15            # arrive more than 9 deg off: yaw-only turn onto the caller first
@@ -130,7 +136,7 @@ behavior_node:
     pre_sit_settle_s: 1.0            # zero velocity, then 1 s standing still, then Sit
     sit_settle_s: 3.0
     face_timeout_s: 1.5
-    speak_hold_s: 5.0
+    speak_hold_s: 3.0
     stand_settle_s: 0.5
     sit_hold_until_reset: true       # stay seated; estop_console "reset" stands up
 
@@ -155,7 +161,7 @@ go2_bridge_node:
     rotate_closed_loop: true         # turn until /utlidar/robot_odom yaw moved by the target
     odom_topic: /utlidar/robot_odom
     odom_max_age_s: 0.5
-    rotate_deadband_rad: 0.12        # about 7 deg; the visual ALIGN finishes the job
+    rotate_deadband_rad: 0.06        # lab 09-14: 0.12 stopped ~6 deg short
     rotate_timeout_s: 6.0
     rotate_prefer_ccw_beyond_rad: 2.6   # beyond 150 deg turn left the long way
     sit_api_id: 1009

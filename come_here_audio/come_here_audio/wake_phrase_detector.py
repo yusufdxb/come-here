@@ -18,6 +18,7 @@ class PhraseDetection:
     transcript: str = ''
     ratio: float = 1.0                     # fuzzy-match similarity
     t_speech_end: Optional[float] = None   # monotonic time the speech ended
+    t_speech_start: Optional[float] = None  # monotonic time the speech started
     infer_ms: Optional[float] = None       # Whisper inference time
     doa: Optional[Any] = None              # srp_doa.DoaEstimate for this utterance
 

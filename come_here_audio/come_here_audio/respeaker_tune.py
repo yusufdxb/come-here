@@ -32,13 +32,14 @@ PARAMETERS = {
     'STATNOISEONOFF': (19, 8, int, 1, 'stationary noise suppression, 0 off 1 on'),
     'GAMMA_NS': (19, 9, float, 1.0, 'over-subtraction factor for stationary noise'),
     'MIN_NS': (19, 10, float, 0.15, 'gain floor for noise suppression'),
-    'GAMMAVAD_SR': (19, 39, float, 1.5, 'VAD threshold, raw value (1.5 is about 3.5 dB)'),
+    'GAMMAVAD_SR': (19, 39, float, 3.5, 'VAD threshold in dB (SDK tuning.py: default 3.5 dB); lower hears further'),
     'VOICEACTIVITY': (19, 32, int, 0, 'read-only: firmware VAD right now'),
+    'SPEECHDETECTED': (19, 22, int, 0, 'read-only: firmware speech detection status'),
     'HPFONOFF': (18, 27, int, 0, 'high-pass filter 0 off, 1 70Hz, 2 125Hz, 3 180Hz'),
     'DOAANGLE': (21, 0, int, 0, 'read-only: direction of arrival, degrees'),
 }
 
-READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'DOAANGLE')
+READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'SPEECHDETECTED', 'DOAANGLE')
 
 # For a caller a few metres in front of the robot:
 #   AGCONOFF 1         the DSP's own gain ride is the cheapest far-field win
@@ -49,9 +50,11 @@ READ_ONLY = ('AGCGAIN', 'VOICEACTIVITY', 'DOAANGLE')
 #   GAMMA_NS 1.0       but do not over-subtract, which eats quiet consonants
 #   MIN_NS 0.15        leave a gain floor so suppressed frames are not silence
 #   HPFONOFF 1         70 Hz, below voice and above most chassis rumble
-# GAMMAVAD_SR is left at its firmware default: its raw units are not dB, and
-# 2.0 raw would RAISE the VAD threshold from about 3.5 dB to about 6 dB.
+#   GAMMAVAD_SR 2.0    the SDK (usb_4_mic_array/tuning.py) documents this register
+#                      in dB, default 3.5 dB; 2.0 dB is ODIN's far-field value and
+#                      makes the firmware VAD that corroborates DOA hear further
 FAR_FIELD_PROFILE = {
+    'GAMMAVAD_SR': 2.0,
     'AGCONOFF': 1,
     'AGCMAXGAIN': 1000.0,
     'AGCDESIREDLEVEL': 0.03,

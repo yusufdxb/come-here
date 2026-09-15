@@ -67,7 +67,7 @@ def generate_launch_description():
             description='false restores the fixed 0.015 RMS wake gate',
         ),
         DeclareLaunchArgument(
-            'max_walk_distance_m', default_value='2.0',
+            'max_walk_distance_m', default_value='1.5',
             description='commanded walking budget; set to caller start distance minus 0.5 m',
         ),
         DeclareLaunchArgument(
@@ -87,7 +87,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('view_script', default_value=view_script),
         DeclareLaunchArgument(
-            'doa_offset_deg', default_value='0.0',
+            'doa_offset_deg', default_value='-90.0',
             description='software DOA mount offset, from scripts/doa_probe.py (caller ahead)',
         ),
         DeclareLaunchArgument(
@@ -95,7 +95,7 @@ def generate_launch_description():
             description='true if the probe reports left callers as right',
         ),
         DeclareLaunchArgument(
-            'direction_confidence_threshold', default_value='0.5',
+            'direction_confidence_threshold', default_value='0.4',
             description='DOA confidence needed to turn; below it the demo is camera only',
         ),
 

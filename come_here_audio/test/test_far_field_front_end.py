@@ -87,7 +87,7 @@ def test_quiet_far_field_speech_reaches_whisper_with_preroll():
     audio = np.concatenate([noise(1.5, room, rng), speech, noise(1.2, room, rng)])
     segments = feed(d, audio)
     assert len(segments) == 1
-    segment, _speech_end, _span = segments[0]
+    segment, _speech_end, _span = segments[0][:3]
     # Speech plus about 0.25 s of pre-roll plus the trailing silence that closed it.
     assert len(segment) >= int((0.6 + 0.2) * RATE)
     assert np.sqrt(np.mean(segment[:int(0.1 * RATE)] ** 2)) < 0.003  # starts before onset
@@ -192,7 +192,7 @@ def test_the_utterance_span_addresses_the_raw_capsules():
     audio6[:, 1] = np.arange(len(mono), dtype=np.float32)
     segments = _feed_multichannel(d, audio6)
     assert len(segments) == 1
-    segment, _t, span = segments[0]
+    segment, _t, span = segments[0][:3]
     est = d._estimate_doa(span)
     assert est is not None and d.last_doa is est
     clip = fake.clips[-1]

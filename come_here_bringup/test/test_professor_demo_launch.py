@@ -119,8 +119,8 @@ def test_turn_to_sound_uses_software_doa_and_closed_loop_turns(config, launch_de
     audio = _params(config, 'audio_node')
     behavior = _params(config, 'behavior_node')
     bridge = _params(config, 'go2_bridge_node')
-    assert audio['doa_source'] == 'software'
-    assert audio['enable_doa'] is False              # the stuck firmware register stays off
+    assert audio['doa_source'] == 'firmware'         # lab 09-14: built-in DOAANGLE, polled continuously
+    assert audio['enable_doa'] is False
     assert audio['mic_channels'] == 6                # raw capsules needed for DOA
     assert audio['mic_beam_channel'] == 0            # Whisper keeps the DSP beam
     assert behavior['skip_turn_to_sound'] is False
@@ -145,7 +145,7 @@ def test_hardware_tuned_motion_values_are_preserved(config):
     assert behavior['approach_align_threshold_rad'] == 0.15
     assert (behavior['approach_ccw_yaw'], behavior['approach_cw_yaw']) == (0.6, 0.6)
     assert (behavior['approach_min_align_s'], behavior['approach_min_walk_s']) == (0.4, 1.5)
-    assert behavior['bbox_stop_fraction'] == 0.75
+    assert behavior['bbox_stop_fraction'] == 0.82    # lab 09-14 (0.75 was the April camera framing)
     assert _params(config, 'go2_bridge_node')['republish_rate_hz'] == 20.0
 
 

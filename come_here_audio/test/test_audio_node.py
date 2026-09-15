@@ -110,3 +110,76 @@ def test_no_calibration_path_uses_parameters():
         assert node._load_doa_calibration('/x.json', True, 'software', True) == 'n/a'
     finally:
         node.destroy_node()
+
+
+def test_builtin_doa_publishes_the_utterance_bearing_before_the_wake():
+    from come_here_audio.doa_association import DoaSelection
+    node = AudioNode(parameter_overrides=[Parameter('use_mock', value=True)])
+    calls = {}
+
+    class FakeBuiltinDoa:
+        def teardown(self):
+            pass
+
+        def get_direction_near(self, **kw):
+            calls.update(kw)
+            return DoaSelection(azimuth_rad=1.2, confidence=0.7, source='gate_window',
+                                n_window=30, n_active=0, n_used=28, age_s=0.1, n_distinct=6)
+
+    order = []
+
+    class OrderedPub(FakePub):
+        def __init__(self, label):
+            super().__init__()
+            self.label = label
+
+        def publish(self, msg):
+            order.append(self.label)
+            super().publish(msg)
+
+    try:
+        node._direction_provider = FakeBuiltinDoa()
+        node._dir_pub = OrderedPub('direction')
+        node._detail_pub = OrderedPub('detail')
+        node._wake_pub = OrderedPub('wake')
+
+        class Detection:
+            phrase, confidence, transcript, ratio, infer_ms = 'come here', 0.9, 'come here', 1.0, 5.0
+            t_speech_end, t_speech_start, doa = 100.0, 98.8, None
+
+        node._wake_detector.check = lambda: Detection()
+        node._tick()
+        assert order == ['direction', 'detail', 'wake']
+        assert node._dir_pub.msgs[0].data.tolist() == [1.2, 0.7]
+        assert calls['speech_end_s'] == 100.0 and calls['speech_start_s'] == 98.8
+        detail = json.loads(node._detail_pub.msgs[0].data)
+        assert detail['doa_source'] == 'gate_window' and detail['doa_n_used'] == 28
+    finally:
+        node.destroy_node()
+
+
+def test_builtin_doa_without_samples_publishes_no_direction():
+    node = AudioNode(parameter_overrides=[Parameter('use_mock', value=True)])
+
+    class EmptyBuiltinDoa:
+        def teardown(self):
+            pass
+
+        def get_direction_near(self, **kw):
+            return None
+
+    try:
+        node._direction_provider = EmptyBuiltinDoa()
+        node._dir_pub, node._detail_pub, node._wake_pub = FakePub(), FakePub(), FakePub()
+
+        class Detection:
+            phrase, confidence, transcript, ratio, infer_ms = 'come here', 0.9, 'come here', 1.0, 5.0
+            t_speech_end, t_speech_start, doa = 100.0, 99.0, None
+
+        node._wake_detector.check = lambda: Detection()
+        node._tick()
+        assert node._dir_pub.msgs == []
+        assert len(node._wake_pub.msgs) == 1
+        assert json.loads(node._detail_pub.msgs[0].data)['doa_source'] == 'none'
+    finally:
+        node.destroy_node()
