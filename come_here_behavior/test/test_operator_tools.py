@@ -2,7 +2,7 @@
 
 import json
 
-from come_here_behavior.estop_console import ENGAGE, QUIT, RELEASE, STATUS, parse_command
+from come_here_behavior.estop_console import ENGAGE, QUIT, RELEASE, RESET, STATUS, parse_command
 from come_here_behavior.trial_report import build_rows, format_row, main, pass_streak
 
 
@@ -13,6 +13,7 @@ def test_estop_console_engages_on_enter_and_needs_a_word_to_release():
     assert parse_command('r') is None  # a single stray key never releases
     assert parse_command('s') == STATUS
     assert parse_command('q') == QUIT
+    assert parse_command('reset') == RESET
 
 
 def _trial(run_id, started, success=True, stop='arrived_bbox'):

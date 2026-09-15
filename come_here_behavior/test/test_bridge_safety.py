@@ -434,3 +434,28 @@ def test_rotate_without_odometry_falls_back_to_the_timed_turn():
         assert 6 <= len(_moves(n)) <= 12
     finally:
         n.destroy_node()
+
+
+class _Remote:
+    def __init__(self, lx=0.0, ly=0.0, rx=0.0, ry=0.0, keys=0):
+        self.lx, self.ly, self.rx, self.ry, self.keys = lx, ly, rx, ry, keys
+
+
+def test_remote_buttons_alone_do_not_trip_the_override(node):
+    node._remote_cb(_Remote(keys=0x0200))
+    node._remote_cb(_Remote(lx=0.1, ry=-0.15))
+    assert not node._gate.estopped
+
+
+def test_remote_stick_latches_the_estop_and_stops(node):
+    node._remote_cb(_Remote(ly=0.6))
+    assert node._gate.estopped
+    node._remote_cb(_Remote(lx=float('nan')))      # already latched: no error, still latched
+    assert node._gate.estopped
+
+
+def test_phrase_filenames_match_the_sound_files():
+    from come_here_behavior.go2_bridge_node import phrase_filename
+    assert phrase_filename('I am coming') == 'i_am_coming.wav'
+    assert phrase_filename("Got you. I'm on my way.") == 'got_you_i_m_on_my_way.wav'
+    assert phrase_filename(' Found you. ') == 'found_you.wav'

@@ -92,6 +92,19 @@ case "$mic" in
   *) fail "no ReSpeaker capture device: $mic" ;;
 esac
 
+echo "== DOA calibration and manual override"
+CAL="${HOME}/come_here_trials/doa_calibration.json"
+if [ -f "$CAL" ]; then
+  pass "DOA calibration $(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('offset %+.1f deg mirror %s, ahead std %s deg, measured %s' % (d['offset_deg'], d['mirror'], d.get('ahead_circ_std_deg'), d.get('measured_at')))" "$CAL" 2>&1)"
+else
+  fail "no DOA calibration at $CAL: run python3 scripts/calibrate_doa.py (the robot will not turn without it)"
+fi
+if python3 -c "from unitree_go.msg import WirelessController" 2>/dev/null; then
+  pass "unitree_go WirelessController importable (remote stick override)"
+else
+  warn "unitree_go not importable: remote stick override disabled (e-stop console still works)"
+fi
+
 echo "== processes"
 # Another stack on this Jetson holds the microphone (ALSA gives a capture
 # device to one process) and may command the robot; it must be down first.

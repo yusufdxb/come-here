@@ -495,6 +495,8 @@ def test_sit_and_identify_mode_runs_full_sequence():
     sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY)
     sim.run(0.3, person=obs(bbox=0.8))
     assert sim.fsm.state == State.SIT_AND_IDENTIFY
+    assert sim.sits == 0                # stop first, sit only after pre_sit_settle_s
+    sim.run(1.0)
     assert sim.sits == 1
     sim.run(12.0)
     assert (sim.face_requests, sim.stands) == (1, 1)
@@ -508,6 +510,9 @@ def test_turn_to_sound_path_rotates_then_acquires():
     sim.fsm.on_direction(0.8, 0.9, sim.t)
     sim.wake()
     sim.run(0.3)
+    assert sim.transitions == ['LISTENING', 'TURN_TO_SOUND']
+    sim._record(sim.fsm.on_rotate_result(0.8, 0.75, 'reached', sim.t))
+    sim.run(1.0)
     assert sim.transitions[:3] == ['LISTENING', 'TURN_TO_SOUND', 'ACQUIRE_PERSON']
     assert sim.rotates == [0.8]
 
@@ -518,7 +523,7 @@ def test_direction_published_just_after_the_wake_still_turns():
     sim.run(0.3)
     sim.fsm.on_direction(-1.2, 0.8, sim.t)
     sim.run(0.3)
-    assert sim.transitions[:3] == ['LISTENING', 'TURN_TO_SOUND', 'ACQUIRE_PERSON']
+    assert sim.transitions[:2] == ['LISTENING', 'TURN_TO_SOUND']
     assert sim.rotates == [-1.2]
     assert sim.fsm.status  # trial still open
 
@@ -579,3 +584,130 @@ def test_empty_speech_texts_disable_tts():
 def test_invalid_config_is_rejected(overrides):
     with pytest.raises(ValueError):
         ComeHereFsm(FsmConfig(**overrides))
+
+
+# -- DOA-gated acquisition, speech and the seated finish (class demo 2026-09-14) --
+
+def turning_sim(target=0.8, confidence=0.9, **overrides):
+    """Wake with a confident bearing; the rotate command has been sent."""
+    sim = Sim(skip_turn_to_sound=False, **overrides)
+    sim.fsm.on_direction(target, confidence, sim.t)
+    sim.wake()
+    sim.run(0.3)
+    return sim
+
+
+def test_no_person_is_acquired_while_the_robot_is_still_turning():
+    sim = turning_sim()
+    assert sim.fsm.state == State.TURN_TO_SOUND and sim.rotates == [0.8]
+    sim.run(3.0, person=obs(bearing=-0.5), every_ticks=1)   # a bystander swept past
+    assert sim.fsm.state == State.TURN_TO_SOUND
+    assert sim.motion_commands() == []
+    assert sim.rotates == [0.8]                             # exactly one turn
+    assert sim.fsm.tick(sim.t).gate == (0.0, 0.0)           # perception selects nobody
+
+
+def test_gate_is_centered_where_the_voice_is_after_the_turn():
+    sim = turning_sim(target=0.8)
+    sim._record(sim.fsm.on_rotate_result(0.8, 0.6, 'reached', sim.t))
+    sim.run(0.5)
+    assert sim.fsm.state == State.TURN_TO_SOUND             # turn_settle_s
+    sim.run(0.4)
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    center, half = sim.fsm.tick(sim.t).gate
+    assert center == pytest.approx(0.2) and half == pytest.approx(0.44)
+    assert any(line.startswith('DOA->turn: requested +46 deg, turned +34 deg')
+               for line in sim.fsm.tick(sim.t).log) is False  # logged once, at the transition
+
+
+def test_a_rotate_result_for_another_turn_is_ignored():
+    sim = turning_sim(target=0.8)
+    sim._record(sim.fsm.on_rotate_result(0.3, 0.3, 'reached', sim.t))
+    sim.run(1.0)
+    assert sim.fsm.state == State.TURN_TO_SOUND
+
+
+def test_missing_rotate_result_aborts_without_walking():
+    sim = turning_sim()
+    sim.run(8.0, person=obs(bearing=0.0))
+    assert sim.fsm.state == State.IDLE
+    assert sim.summaries[-1]['stop_reason'] == 'turn_no_result'
+    assert sim.motion_commands() == []
+
+
+def test_required_direction_missing_aborts_without_walking():
+    sim = Sim(skip_turn_to_sound=False, require_direction=True)
+    sim.fsm.on_direction(0.9, 0.2, sim.t)                   # heard, but not confident
+    sim.wake()
+    sim.run(3.0, person=obs(bearing=0.0))
+    assert sim.fsm.state == State.IDLE
+    assert sim.summaries[-1]['stop_reason'] == 'no_direction'
+    assert sim.motion_commands() == [] and sim.rotates == []
+
+
+def test_a_bearing_measured_well_before_the_wake_is_not_used():
+    sim = Sim(skip_turn_to_sound=False, direction_max_age_s=3.0)
+    sim.fsm.on_direction(1.0, 0.9, sim.t)
+    sim.run(2.0)                                            # younger than max age, older than slack
+    sim.wake()
+    sim.run(2.0)
+    assert sim.rotates == []
+
+
+def test_speech_after_direction_and_once_at_acquisition():
+    sim = turning_sim(target=0.8, wake_speak_text='', direction_speak_text='A|B',
+                      acquired_speak_text='C')
+    assert sim.says == ['A|B']
+    sim._record(sim.fsm.on_rotate_result(0.8, 0.8, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(2.0, person=obs(bearing=0.05), every_ticks=1)
+    assert sim.fsm.state == State.WALK
+    assert sim.says == ['A|B', 'C']
+    center, half = sim.fsm.tick(sim.t).gate                 # gate follows the tracked caller
+    assert center == pytest.approx(0.05) and half == pytest.approx(0.44)
+
+
+def test_seated_finish_holds_until_operator_reset():
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, sit_hold_until_reset=True,
+                      speak_text='Made it.|Here I am.')
+    t_arrive = sim.t
+    sim.run(0.3, person=obs(bbox=0.8))
+    assert sim.fsm.state == State.SIT_AND_IDENTIFY and sim.sits == 0
+    assert sim.cmd == (0.0, 0.0)
+    sim.run(1.0)
+    assert sim.sits == 1 and sim.fsm.display_state == 'SIT'
+    sim.run(3.0)
+    assert sim.face_requests == 1 and sim.fsm.display_state == 'LOOK_AT_FACE'
+    sim._record(sim.fsm.on_face_result(True, sim.t, 0.55))
+    sim.run(0.2)
+    assert sim.says[-1] == 'Made it.|Here I am.'
+    assert sim.fsm.display_state == 'DONE' and sim.stands == 0
+    assert sim.summaries[-1]['success'] is True and sim.summaries[-1]['face_center_x'] == 0.55
+    sim.run(30.0)
+    sim.wake()                                              # still seated: ignored
+    assert sim.fsm.state == State.SIT_AND_IDENTIFY and sim.stands == 0
+    assert sim.motion_commands(since=t_arrive + 0.3) == []
+    sim._record(sim.fsm.on_reset(sim.t))
+    assert sim.stands == 1
+    sim.run(1.0)
+    assert sim.fsm.state == State.IDLE
+
+
+def test_final_align_turns_onto_the_caller_before_sitting():
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, final_align_rad=0.1)
+    t0 = sim.t
+    sim.run(0.2, person=obs(bearing=0.6, bbox=0.8), every_ticks=1)
+    assert sim.fsm.display_state == 'ALIGN_TO_CALLER'
+    moves = sim.motion_commands(since=t0)
+    assert moves and all(vx == 0.0 and w > 0.0 for _, vx, w in moves)
+    assert sim.sits == 0
+    sim.run(3.0, person=obs(bearing=0.0, bbox=0.8), every_ticks=1)
+    assert sim.sits == 1
+    assert_single_axis(sim)
+
+
+def test_estop_during_the_seated_finish_ends_the_trial():
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, sit_hold_until_reset=True)
+    sim.run(0.3, person=obs(bbox=0.8))
+    sim.estop(True)
+    assert sim.fsm.state == State.IDLE and sim.cmd == (0.0, 0.0)

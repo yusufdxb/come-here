@@ -6,6 +6,7 @@ professor_demo.yaml must be a parameter its node actually declares.
 """
 
 import importlib.util
+import os
 import pathlib
 import re
 
@@ -21,6 +22,7 @@ CONFIG_FILE = REPO / 'come_here_bringup' / 'config' / 'professor_demo.yaml'
 NODE_SOURCES = {
     'audio_node': ['come_here_audio/come_here_audio/audio_node.py'],
     'perception_node': ['come_here_perception/come_here_perception/perception_node.py'],
+    'face_detector_node': ['come_here_perception/come_here_perception/face_detector_node.py'],
     'behavior_node': ['come_here_behavior/come_here_behavior/behavior_node.py'],
     'go2_bridge_node': ['come_here_behavior/come_here_behavior/go2_bridge_node.py'],
 }
@@ -64,10 +66,11 @@ def test_every_config_key_is_declared_by_its_node(config, node):
 def test_launch_starts_only_the_demo_nodes(launch_description):
     nodes = [e for e in launch_description.entities if isinstance(e, Node)]
     names = sorted(n.node_executable for n in nodes)
-    assert names == ['audio_node', 'behavior_node', 'go2_bridge_node', 'perception_node']
+    assert names == ['audio_node', 'behavior_node', 'face_detector_node', 'go2_bridge_node',
+                     'perception_node']
     processes = [e for e in launch_description.entities if isinstance(e, ExecuteProcess)
                  and not isinstance(e, Node)]
-    assert len(processes) == 1  # the camera publisher
+    assert len(processes) == 2  # the camera publisher and the subscribe-only operator view
 
 
 def test_dry_run_is_the_default(launch_description):
@@ -81,14 +84,35 @@ def test_launch_and_config_agree_on_walk_budget(launch_description, config):
     assert launch_default == _params(config, 'behavior_node')['max_walk_distance_m']
 
 
-def test_demo_scope_is_minimal(config):
+def test_class_demo_scope(config):
     behavior = _params(config, 'behavior_node')
     bridge = _params(config, 'go2_bridge_node')
-    assert behavior['arrival_mode'] == 'stop'
-    assert behavior['speak_text'] == ''
-    assert bridge['enable_posture_commands'] is False
+    audio = _params(config, 'audio_node')
+    assert behavior['arrival_mode'] == 'sit_and_identify'
+    assert behavior['sit_hold_until_reset'] is True
+    assert behavior['require_direction'] is True          # never guess a caller without DOA
+    assert audio['require_doa_calibration'] is True
+    assert 0.0 < behavior['acquire_gate_half_rad'] < 0.785
+    assert behavior['pre_sit_settle_s'] >= 0.5
+    assert bridge['enable_posture_commands'] is True
+    assert bridge['sit_api_id'] == 1009                   # hardware 2026-04-24: sits
+    assert bridge['manual_override_estop'] is True
     assert bridge['allow_combined_motion'] is False
     assert bridge['require_motion_mode'] == 'mcf'
+
+
+def test_every_phrase_has_a_sound_file(config):
+    if os.environ.get('GITHUB_ACTIONS'):
+        pytest.skip('voice clips are generated locally: scripts/make_voice_clips.sh')
+    sounds = REPO / 'come_here_audio' / 'scripts'
+    behavior = _params(config, 'behavior_node')
+    phrases = []
+    for key in ('wake_speak_text', 'direction_speak_text', 'acquired_speak_text', 'speak_text'):
+        phrases += [p.strip() for p in str(behavior.get(key, '')).split('|') if p.strip()]
+    assert phrases
+    name = lambda p: re.sub(r'[^a-z0-9]+', '_', p.lower()).strip('_') + '.wav'  # noqa: E731
+    missing = [p for p in phrases if not (sounds / name(p)).is_file()]
+    assert missing == []
 
 
 def test_turn_to_sound_uses_software_doa_and_closed_loop_turns(config, launch_description):

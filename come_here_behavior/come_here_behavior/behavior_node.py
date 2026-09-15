@@ -14,6 +14,8 @@ Subscribes:
   /come_here/audio_direction    (std_msgs/Float64MultiArray) [azimuth, confidence]
   /come_here/face_detection     (come_here_msgs/FaceDetection)
   /come_here/estop              (std_msgs/Bool)
+  /come_here/rotate_result      (std_msgs/String) JSON from go2_bridge_node when a turn ends
+  /come_here/reset              (std_msgs/Bool)   operator: stand up from DONE (estop_console)
 
 Publishes:
   /come_here/cmd_velocity        (std_msgs/Float64MultiArray) [vx, yaw_rate]
@@ -22,6 +24,8 @@ Publishes:
   /come_here/cmd_sit, cmd_stand  (std_msgs/Bool)
   /come_here/face_detect_request (std_msgs/Bool)
   /come_here/state               (std_msgs/String)
+  /come_here/status              (std_msgs/String) JSON for the operator view, every tick
+  /come_here/target_gate         (std_msgs/Float64MultiArray) [center_rad, half_width_rad]
   /come_here/trial_summary       (std_msgs/String) JSON, one message per finished trial
 
 Parameters: every ``FsmConfig`` field (documented in come_here_fsm.py and the
@@ -31,6 +35,8 @@ YAML configs), plus tick_rate_hz, trial_log_enabled, trial_log_dir, git_commit.
 import dataclasses
 import datetime
 import json
+import math
+import random
 import time
 
 from rclpy.node import Node
@@ -104,6 +110,8 @@ class BehaviorNode(Node):
         self._face_req_pub = self.create_publisher(Bool, '/come_here/face_detect_request', 10)
         self._state_pub = self.create_publisher(String, '/come_here/state', 10)
         self._trial_pub = self.create_publisher(String, '/come_here/trial_summary', 10)
+        self._status_pub = self.create_publisher(String, '/come_here/status', 10)
+        self._gate_pub = self.create_publisher(Float64MultiArray, '/come_here/target_gate', 10)
 
         # -- Subscribers --
         self.create_subscription(String, '/come_here/wake_phrase', self._wake_cb, 10)
@@ -116,6 +124,8 @@ class BehaviorNode(Node):
         )
         self.create_subscription(FaceDetection, '/come_here/face_detection', self._face_cb, 10)
         self.create_subscription(Bool, '/come_here/estop', self._estop_cb, 10)
+        self.create_subscription(String, '/come_here/rotate_result', self._rotate_result_cb, 10)
+        self.create_subscription(Bool, '/come_here/reset', self._reset_cb, 10)
 
         rate = float(self.get_parameter('tick_rate_hz').value)
         self._timer = self.create_timer(1.0 / rate, self._tick)
@@ -183,16 +193,39 @@ class BehaviorNode(Node):
         )
 
     def _face_cb(self, msg: FaceDetection) -> None:
-        self._apply(self._fsm.on_face_result(bool(msg.face_present), self._now()))
+        self._apply(self._fsm.on_face_result(
+            bool(msg.face_present), self._now(), float(msg.center_x_norm)))
+
+    def _rotate_result_cb(self, msg: String) -> None:
+        try:
+            result = json.loads(msg.data)
+            target = float(result['target_rad'])
+            turned = result.get('turned_rad')
+            turned = None if turned is None else float(turned)
+            reason = str(result.get('reason', '?'))
+        except (ValueError, TypeError, KeyError) as exc:
+            self.get_logger().warn(f'Ignoring malformed rotate_result: {exc}')
+            return
+        if not math.isfinite(target):
+            return
+        self._apply(self._fsm.on_rotate_result(target, turned, reason, self._now()))
+
+    def _reset_cb(self, msg: Bool) -> None:
+        if msg.data:
+            self._apply(self._fsm.on_reset(self._now()))
 
     def _estop_cb(self, msg: Bool) -> None:
         self._apply(self._fsm.on_estop(bool(msg.data), self._now()))
 
     def _tick(self) -> None:
-        self._apply(self._fsm.tick(self._now()))
+        now = self._now()
+        self._apply(self._fsm.tick(now))
         state = String()
         state.data = self._fsm.state.name
         self._state_pub.publish(state)
+        status = String()
+        status.data = json.dumps(self._fsm.viewer_status(now))
+        self._status_pub.publish(status)
         self._tick_count += 1
         if self._fsm.state in MOTION_STATES and self._tick_count % 10 == 0:
             status = self._fsm.status()
@@ -214,9 +247,15 @@ class BehaviorNode(Node):
             msg.data = float(cmds.rotate_rad)
             self._rotate_pub.publish(msg)
         if cmds.say:
-            msg = String()
-            msg.data = cmds.say
-            self._say_pub.publish(msg)
+            choices = [c.strip() for c in cmds.say.split('|') if c.strip()]
+            if choices:
+                msg = String()
+                msg.data = random.choice(choices)
+                self._say_pub.publish(msg)
+        if cmds.gate is not None:
+            msg = Float64MultiArray()
+            msg.data = [float(cmds.gate[0]), float(cmds.gate[1])]
+            self._gate_pub.publish(msg)
         for flag, pub in ((cmds.sit, self._sit_pub), (cmds.stand, self._stand_pub),
                           (cmds.face_request, self._face_req_pub)):
             if flag:

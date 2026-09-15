@@ -8,6 +8,7 @@ Start it in its own terminal before any live trial:
 
     Enter or e   ENGAGE the e-stop (latched in behavior_node and go2_bridge_node)
     release      release it; motion stays blocked until the next "come here"
+    reset        robot is sitting in DONE: stand it up and go back to IDLE
     s            show subscriber count and the latest bridge status
     q            quit (leaves the e-stop as it is)
 
@@ -22,6 +23,7 @@ ENGAGE = 'engage'
 RELEASE = 'release'
 STATUS = 'status'
 QUIT = 'quit'
+RESET = 'reset'
 
 
 def parse_command(line: str):
@@ -30,6 +32,8 @@ def parse_command(line: str):
         return ENGAGE
     if text == 'release':
         return RELEASE
+    if text in ('reset', 'stand'):
+        return RESET
     if text in ('s', 'status'):
         return STATUS
     if text in ('q', 'quit', 'exit'):
@@ -44,6 +48,7 @@ def main(argv=None) -> int:
     rclpy.init()
     node = rclpy.create_node('come_here_estop_console')
     publisher = node.create_publisher(Bool, '/come_here/estop', 10)
+    reset_publisher = node.create_publisher(Bool, '/come_here/reset', 10)
     latest = {}
 
     def on_status(msg):
@@ -82,12 +87,15 @@ def main(argv=None) -> int:
             elif command == RELEASE:
                 send(False)
                 print('e-stop released; motion needs a new "come here"')
+            elif command == RESET:
+                reset_publisher.publish(Bool(data=True))
+                print('reset sent: the robot stands up if it is sitting in DONE')
             elif command == STATUS:
                 print(f'subscribers: {subscribers()}  bridge: {latest or "no status yet"}')
             elif command == QUIT:
                 break
             else:
-                print('commands: Enter/e engage, release, s status, q quit')
+                print('commands: Enter/e engage, release, reset, s status, q quit')
     except KeyboardInterrupt:
         pass
     finally:

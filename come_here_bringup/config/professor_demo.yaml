@@ -1,13 +1,14 @@
-# Class demo configuration: "come here" -> find the caller -> ALIGN/WALK -> stop.
+# Class demo configuration: "come here" -> DOA -> turn -> DOA-gated caller -> approach -> sit.
 #
 #   ros2 launch come_here_bringup professor_demo.launch.py              # dry run, no motion
 #   ros2 launch come_here_bringup professor_demo.launch.py dry_run:=false
 #
-# Scenario: one caller 1.5 to 2.5 m from a standing GO2 (mcf mode), not
-# necessarily in the camera view: the robot hears "come here", turns toward
-# the voice (software DOA on the raw ReSpeaker capsules, closed-loop turn on
-# odometry yaw), finds the caller with YOLO, ALIGN/WALK, stops about 0.8 m
-# away. No sit, no face detection, no arrival speech.
+# Scenario: a caller several meters from a standing GO2 (mcf mode), other
+# people possibly in view: the robot hears "come here", measures the voice
+# direction (software DOA, calibrated by scripts/calibrate_doa.py), turns once
+# (closed loop on odometry yaw), selects only a person inside the DOA gate,
+# ALIGN/WALK, stops about 0.8 m away, StopMove, settles, sits, checks the face,
+# speaks, and stays seated until estop_console "reset". No L1 / deadman input.
 # Values marked "hw 2026-04-24" are the ones the last full hardware run used.
 # Launch arguments: skip_turn_to_sound:=true restores the camera-only demo.
 
@@ -69,6 +70,13 @@ perception_node:
     lidar_min_points: 4
     lidar_z_min: 0.1
     lidar_cone_half_rad: 0.30
+    gate_max_age_s: 0.5              # behavior_node republishes the target gate every tick
+
+face_detector_node:
+  ros__parameters:
+    use_mock: false
+    face_detector: mediapipe         # one inference, only after the robot sits
+    min_confidence: 0.5
 
 behavior_node:
   ros__parameters:
@@ -77,11 +85,19 @@ behavior_node:
     trial_log_dir: ~/come_here_trials   # launch argument trial_log_dir overrides
     # Demo scope
     skip_turn_to_sound: false        # launch argument; true = camera-only demo
-    arrival_mode: stop               # stop and stay stopped; no sit / face / stand
+    arrival_mode: sit_and_identify   # stop, settle, sit, face check, speak, stay seated
     arrival_hold_s: 2.0
-    wake_speak_text: "I am coming"   # audiohub playback, on its own thread
-    speak_text: ""                   # no arrival speech
-    direction_confidence_threshold: 0.5   # launch argument; below it: no turn, camera only
+    # Speech: Aria clips in come_here_audio/scripts, one chosen at random per '|'.
+    wake_speak_text: ""
+    direction_speak_text: "Got you. I'm on my way.|I hear you. Coming over.|Alright, I found your direction."
+    acquired_speak_text: "There you are.|I see you.|Found you. Coming closer."
+    speak_text: "Made it.|Here I am.|Found you."
+    direction_confidence_threshold: 0.5   # launch argument; set from calibrate_doa.py confidences
+    require_direction: true          # no confident DOA -> abort, never walk to a guessed person
+    turn_result_timeout_s: 7.0       # bridge rotate_timeout_s 6.0 + 1
+    turn_settle_s: 0.7               # frames from the end of the turn cannot select anyone
+    acquire_gate_half_rad: 0.44      # +/- 25 deg around where the voice is after the turn
+    track_gate_half_rad: 0.44        # +/- 25 deg around the tracked caller while moving
     direction_max_age_s: 3.0         # a bearing older than this belongs to another utterance
     turn_min_rad: 0.2                # caller within 11 deg of ahead: skip the turn
     listening_timeout_s: 1.5
@@ -108,11 +124,15 @@ behavior_node:
     approach_stop_distance_m: 0.8    # LiDAR/pinhole distance, read long while walking
     max_walk_distance_m: 2.0         # launch argument; = caller start distance - 0.5 m
     approach_timeout_s: 20.0
-    # Unused in arrival_mode stop
+    # Arrival sequence (sit_and_identify)
+    final_align_rad: 0.15            # arrive more than 9 deg off: yaw-only turn onto the caller first
+    final_align_timeout_s: 2.0
+    pre_sit_settle_s: 1.0            # zero velocity, then 1 s standing still, then Sit
     sit_settle_s: 3.0
     face_timeout_s: 1.5
     speak_hold_s: 5.0
     stand_settle_s: 0.5
+    sit_hold_until_reset: true       # stay seated; estop_console "reset" stands up
 
 go2_bridge_node:
   ros__parameters:
@@ -127,7 +147,9 @@ go2_bridge_node:
     cmd_velocity_timeout_s: 0.5      # watchdog
     republish_rate_hz: 20.0          # mcf gait latching, hw 2026-04-24
     enable_rotate_command: true      # TURN_TO_SOUND
-    enable_posture_commands: false   # no sit / stand
+    enable_posture_commands: true    # Sit 1009 after arrival, stand on operator reset
+    manual_override_estop: true      # a remote stick beyond the threshold latches the e-stop
+    manual_override_axis_threshold: 0.2
     cmd_z: 1.0                       # turn rate; mcf steps cleanly CCW at 1.0 (hw 2026-04-17)
     deg_per_sec: 57.0                # timed fallback only (1.0 rad/s nominal), unmeasured
     rotate_closed_loop: true         # turn until /utlidar/robot_odom yaw moved by the target

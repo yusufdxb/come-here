@@ -14,7 +14,9 @@ Subscribes:
   <odom_topic>                    (nav_msgs/Odometry) robot yaw for closed-loop turns
   /come_here/cmd_sit              (std_msgs/Bool)   True triggers Sit, optional
   /come_here/cmd_stand            (std_msgs/Bool)   True triggers BalanceStand, optional
-  /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub
+  /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub, queued
+  /wirelesscontroller             (unitree_go/WirelessController) manual override: any stick
+                                  beyond manual_override_axis_threshold latches the e-stop
   /api/motion_switcher/response   (unitree_api/msg/Response) CheckMode replies
 
 Publishes:
@@ -56,7 +58,9 @@ import datetime
 import json
 import math
 import os
+import queue
 import random
+import re
 import threading
 import time
 
@@ -81,6 +85,11 @@ from come_here_behavior.rotate_controller import RotateController
 
 SPORT_TOPIC = '/api/sport/request'
 DRY_RUN_SPORT_TOPIC = '/come_here/dry_run/sport_request'
+
+
+def phrase_filename(phrase: str) -> str:
+    """'Got you. I'm on my way.' -> 'got_you_i_m_on_my_way.wav' (matches the sounds dir)."""
+    return re.sub(r'[^a-z0-9]+', '_', phrase.strip().lower()).strip('_') + '.wav'
 
 
 def make_req(api_id, params=None):
@@ -143,6 +152,9 @@ class Go2BridgeNode(Node):
         self.declare_parameter('rotate_timeout_s', 6.0)
         self.declare_parameter('rotate_prefer_ccw_beyond_rad', 2.6)
         self.declare_parameter('enable_posture_commands', True)
+        # The operator touching a stick on the physical remote takes the robot back.
+        self.declare_parameter('manual_override_estop', True)
+        self.declare_parameter('manual_override_axis_threshold', 0.2)
 
         p = self.get_parameter
         self._dry_run = bool(p('dry_run').value)
@@ -225,8 +237,10 @@ class Go2BridgeNode(Node):
                 Odometry, str(p('odom_topic').value), self._odom_cb, qos_profile_sensor_data
             )
 
-        # Audio thread: drop new cmd_say if a previous playback is still streaming.
+        # Audio: one worker plays queued phrases in order, off the executor thread.
         self._audio_busy = threading.Event()
+        self._say_queue = queue.Queue(maxsize=3)
+        threading.Thread(target=self._say_worker, daemon=True).start()
 
         # Motion mode: refuse motion until CheckMode reports the required mode.
         self._motion_mode = None
@@ -252,6 +266,24 @@ class Go2BridgeNode(Node):
         self.create_subscription(Bool, '/come_here/cmd_sit', self._sit_cb, 10)
         self.create_subscription(Bool, '/come_here/cmd_stand', self._stand_cb, 10)
         self.create_subscription(String, '/come_here/cmd_say', self._say_cb, 10)
+
+        self._override_threshold = float(p('manual_override_axis_threshold').value)
+        self._estop_pub = None
+        if bool(p('manual_override_estop').value):
+            try:
+                from unitree_go.msg import WirelessController
+            except ImportError as exc:
+                self.get_logger().error(
+                    f'MANUAL STICK OVERRIDE UNAVAILABLE (unitree_go not importable: {exc}); '
+                    'use the e-stop console or the remote\'s own stop')
+            else:
+                self._estop_pub = self.create_publisher(Bool, '/come_here/estop', 10)
+                self.create_subscription(
+                    WirelessController, '/wirelesscontroller', self._remote_cb,
+                    qos_profile_sensor_data)
+                self.get_logger().info(
+                    f'manual override armed: remote stick > {self._override_threshold} '
+                    'latches the e-stop')
 
         self._velocity_timer = self.create_timer(
             1.0 / republish_rate_hz, self._velocity_tick
@@ -417,6 +449,25 @@ class Go2BridgeNode(Node):
             )
             self._publish_status()
 
+    # -- manual override from the physical remote --
+
+    def _remote_cb(self, msg) -> None:
+        axes = (msg.lx, msg.ly, msg.rx, msg.ry)
+        if all(math.isfinite(a) and abs(a) <= self._override_threshold for a in axes):
+            return
+        if self._gate.estopped:
+            return
+        self.get_logger().error(
+            'MANUAL OVERRIDE: remote stick moved (lx=%.2f ly=%.2f rx=%.2f ry=%.2f): '
+            'e-stop engaged, autonomy stopped; estop_console "release" to re-enable'
+            % axes)
+        engage = Bool()
+        engage.data = True
+        self._estop_cb(engage)
+        if self._estop_pub is not None:
+            for _ in range(3):
+                self._estop_pub.publish(engage)
+
     # -- cmd_rotate (experimental TURN_TO_SOUND path) --
 
     def _rotate_cb(self, msg: Float64) -> None:
@@ -558,7 +609,7 @@ class Go2BridgeNode(Node):
 
     def _deferred_sport_call(self, api_id: int, delay_s: float, label: str) -> None:
         time.sleep(delay_s)
-        if self._gate.estopped or self._gate.inhibited:
+        if self._gate.estopped or self._gate.inhibited or self._gate.active:
             self.get_logger().warn(f'cmd_{label} (deferred) dropped: motion blocked')
             return
         self.get_logger().info(f'cmd_{label} (deferred): api_id={api_id}')
@@ -571,7 +622,7 @@ class Go2BridgeNode(Node):
         phrase = msg.data or ''
         if not phrase:
             return
-        filename = phrase.strip().lower().replace(' ', '_') + '.wav'
+        filename = phrase_filename(phrase)
         wav_path = os.path.join(self._wav_dir, filename)
 
         if not os.path.isfile(wav_path):
@@ -580,17 +631,19 @@ class Go2BridgeNode(Node):
             )
             return
 
-        if self._audio_busy.is_set():
-            self.get_logger().warn(
-                f'cmd_say: previous playback still in flight, dropping "{phrase}"'
-            )
-            return
+        # Playback runs on the worker thread so it never delays motion commands.
+        try:
+            self._say_queue.put_nowait((wav_path, phrase))
+        except queue.Full:
+            self.get_logger().warn(f'cmd_say: speech queue full, dropping "{phrase}"')
 
-        # Playback runs on its own thread so it never delays motion commands.
-        self._audio_busy.set()
-        threading.Thread(
-            target=self._play_wav_worker, args=(wav_path, phrase), daemon=True
-        ).start()
+    def _say_worker(self) -> None:
+        while True:
+            item = self._say_queue.get()
+            if item is None:
+                return
+            self._audio_busy.set()
+            self._play_wav_worker(*item)
 
     def _play_wav_worker(self, wav_path: str, phrase: str) -> None:
         """Stream a WAV file to the GO2 speaker via audiohub (start/chunk/end)."""
@@ -606,6 +659,9 @@ class Go2BridgeNode(Node):
                 f'{len(chunks)} chunks)'
             )
 
+            # 16 kHz mono s16: seconds of audio, so the session is not ended mid-phrase.
+            audio_s = max(0.0, (len(wav_data) - 44) / 32000.0)
+            started = time.monotonic()
             self._audio_pub.publish(make_req(4001))
             time.sleep(0.1)
             for i, chunk in enumerate(chunks):
@@ -617,7 +673,7 @@ class Go2BridgeNode(Node):
                 self._audio_pub.publish(make_req(4003, payload))
                 time.sleep(self._wav_chunk_delay_s)
             # Let the last chunk play out, then end the session.
-            time.sleep(1.5)
+            time.sleep(max(1.5, audio_s - (time.monotonic() - started) + 0.5))
             self._audio_pub.publish(make_req(4002))
         except Exception as exc:
             self.get_logger().error(f'cmd_say: playback error for "{phrase}": {exc}')

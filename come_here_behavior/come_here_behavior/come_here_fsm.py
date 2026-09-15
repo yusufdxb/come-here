@@ -5,7 +5,17 @@ messages and a periodic tick, each with a monotonic timestamp in seconds, and
 publishes whatever ``Commands`` come back. Keeping the logic here makes every
 transition testable with fake time.
 
-Professor-demo path (``skip_turn_to_sound: true``, ``arrival_mode: stop``)::
+Class-demo path (``skip_turn_to_sound: false``, ``arrival_mode: sit_and_identify``)::
+
+    IDLE --wake--> LISTENING (LOCALIZE_SOUND) --confident DOA--> TURN_TO_SOUND
+    TURN_TO_SOUND: one rotate command, wait for the bridge's rotate_result
+    --> ACQUIRE_PERSON with a DOA gate: perception only reports a person whose
+        bearing is within acquire_gate_half_rad of where the voice now is
+    --> ALIGN <--> WALK (hysteresis, gate follows the tracked person)
+    --close enough--> SIT_AND_IDENTIFY: stop, settle, sit, face check, speak,
+        stay seated (DONE) until the operator reset
+
+Camera-only path (``skip_turn_to_sound: true``, ``arrival_mode: stop``)::
 
     IDLE --wake--> ACQUIRE_PERSON --N fresh detections--> ALIGN or WALK
     ALIGN <--> WALK (hysteresis) --close enough--> ARRIVED --hold--> IDLE
@@ -60,6 +70,25 @@ _TIME_EPS = 1e-6
 # Distance source codes in field 6 of /come_here/person_detection.
 DISTANCE_SOURCES = {0: 'none', 1: 'bbox_pinhole', 2: 'lidar'}
 
+# A bearing must be measured no earlier than this before the wake it belongs to
+# (audio_node publishes the direction a few ms before the wake phrase).
+WAKE_DIRECTION_SLACK_S = 1.0
+
+# Operator-facing names for the demo sequence (status topic and viewer only).
+DISPLAY_NAMES = {
+    'IDLE': 'IDLE', 'LISTENING': 'LOCALIZE_SOUND', 'TURN_TO_SOUND': 'ROTATE_TO_DOA',
+    'ACQUIRE_PERSON': 'ACQUIRE_PERSON', 'ALIGN': 'ALIGN', 'WALK': 'APPROACH',
+    'ARRIVED': 'ARRIVED',
+}
+SIT_PHASE_NAMES = {
+    'final_align': 'ALIGN_TO_CALLER', 'settle': 'ARRIVED', 'sit': 'SIT',
+    'look': 'LOOK_AT_FACE', 'speak_hold': 'DONE', 'done': 'DONE', 'stand': 'STAND',
+}
+
+
+def wrap_pi(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
 
 @dataclass(frozen=True)
 class FsmConfig:
@@ -71,6 +100,13 @@ class FsmConfig:
     listening_timeout_s: float = 1.5
     direction_max_age_s: float = 3.0    # a bearing older than this is another utterance
     turn_min_rad: float = 0.2           # caller already ahead: skip the turn
+    require_direction: bool = False     # true: no confident DOA -> abort, never guess a caller
+    direction_speak_text: str = ''      # said once the voice direction is known ('|' = choices)
+    turn_result_timeout_s: float = 7.0  # no rotate_result by then -> abort (fail closed)
+    turn_settle_s: float = 0.7          # gate stays closed this long after the turn ends
+    # DOA-gated person selection (applied by perception_node via /come_here/target_gate).
+    acquire_gate_half_rad: float = 0.44  # +/- 25 deg around the expected caller bearing
+    track_gate_half_rad: float = 0.44    # +/- 25 deg around the tracked bearing while moving
     # Person acquisition.
     person_confidence_threshold: float = 0.5
     search_min_consecutive_detections: int = 2
@@ -100,11 +136,16 @@ class FsmConfig:
     arrival_hold_s: float = 2.0
     wake_speak_text: str = 'I am coming'
     speak_text: str = 'I am here'
+    acquired_speak_text: str = ''       # said at the first visual acquisition ('|' = choices)
     # SIT_AND_IDENTIFY timing (arrival_mode: sit_and_identify).
     sit_settle_s: float = 3.0
     face_timeout_s: float = 1.5
     speak_hold_s: float = 5.0
     stand_settle_s: float = 0.5
+    final_align_rad: float = 0.0        # > 0: yaw-only turn onto the caller before sitting
+    final_align_timeout_s: float = 2.0
+    pre_sit_settle_s: float = 1.0       # StopMove, then this long before Sit
+    sit_hold_until_reset: bool = False  # true: stay seated after speaking until on_reset
 
     def validate(self) -> None:
         def positive(name):
@@ -118,13 +159,15 @@ class FsmConfig:
             'approach_align_threshold_rad', 'approach_realign_threshold_rad',
             'approach_speed', 'approach_ccw_yaw', 'approach_cw_yaw',
             'approach_stop_distance_m', 'bbox_stop_fraction',
-            'max_walk_distance_m', 'approach_timeout_s',
+            'max_walk_distance_m', 'approach_timeout_s', 'turn_result_timeout_s',
+            'acquire_gate_half_rad', 'track_gate_half_rad',
         ):
             positive(name)
         for name in (
             'turn_min_rad', 'lost_debounce_s', 'approach_min_align_s', 'approach_min_walk_s',
             'arrival_hold_s', 'sit_settle_s', 'face_timeout_s', 'speak_hold_s',
-            'stand_settle_s',
+            'stand_settle_s', 'turn_settle_s', 'final_align_rad', 'final_align_timeout_s',
+            'pre_sit_settle_s',
         ):
             value = getattr(self, name)
             if not (math.isfinite(value) and value >= 0.0):
@@ -184,6 +227,8 @@ class Commands:
     sit: bool = False
     stand: bool = False
     face_request: bool = False
+    # (center_rad, half_width_rad) for perception's person selection; (x, 0.0) = closed.
+    gate: Optional[Tuple[float, float]] = None
     trial_summary: Optional[dict] = None
     log: List[str] = field(default_factory=list)
 
@@ -220,6 +265,11 @@ class TrialStats:
     face_present: Optional[bool] = None
     turn_rad: Optional[float] = None       # TURN_TO_SOUND command, if any
     turn_confidence: Optional[float] = None
+    turn_turned_rad: Optional[float] = None  # odometry yaw change reported by the bridge
+    turn_result_reason: Optional[str] = None
+    gate_center_rad: Optional[float] = None  # expected caller bearing in the camera after the turn
+    acquire_bearing_rad: Optional[float] = None  # first visual bearing of the selected caller
+    face_center_x: Optional[float] = None
 
     def summary(self, end_s: float) -> dict:
         def rel(t):
@@ -264,7 +314,12 @@ class TrialStats:
             'final_person_confidence': rnd(self.final_person_confidence),
             'turn_rad': rnd(self.turn_rad),
             'turn_confidence': rnd(self.turn_confidence),
+            'turn_turned_rad': rnd(self.turn_turned_rad),
+            'turn_result_reason': self.turn_result_reason,
+            'gate_center_rad': rnd(self.gate_center_rad),
+            'acquire_bearing_rad': rnd(self.acquire_bearing_rad),
             'face_present': self.face_present,
+            'face_center_x': rnd(self.face_center_x),
             'success': self.stop_reason in ARRIVED_REASONS and not self.estop,
         }
 
@@ -292,9 +347,17 @@ class ComeHereFsm:
         self._vx_since: Optional[float] = None
         self._walk_distance_m = 0.0
 
-        self._sit_substep = 0
+        self._sit_phase = 'settle'
         self._sit_step_since = 0.0
+        self._sit_align_sign = 0.0
         self._face_received = False
+        self._last_face = None
+
+        self._wake_s: Optional[float] = None
+        self._gate_center = 0.0
+        self._turn_sent = False
+        self._turn_result: Optional[Tuple[float, Optional[float], str]] = None
+        self._turn_done_s: Optional[float] = None
 
     # -- read-only state --
 
@@ -309,6 +372,43 @@ class ComeHereFsm:
     @property
     def trial_active(self) -> bool:
         return self._trial is not None
+
+    @property
+    def display_state(self) -> str:
+        if self._state == State.SIT_AND_IDENTIFY:
+            return SIT_PHASE_NAMES.get(self._sit_phase, self._sit_phase.upper())
+        return DISPLAY_NAMES.get(self._state.name, self._state.name)
+
+    def viewer_status(self, now: float) -> dict:
+        """Everything the operator view draws; never used for decisions."""
+        obs = self._last_valid_obs
+        gate = self._current_gate()
+        dir_age = None if self._last_dir_s is None else round(now - self._last_dir_s, 2)
+        trial = self._trial
+        return {
+            'state': self._state.name,
+            'phase': self.display_state,
+            'estopped': self._estopped,
+            'doa_deg': round(math.degrees(self._last_azimuth), 1),
+            'doa_conf': round(self._last_dir_confidence, 2),
+            'doa_age_s': dir_age,
+            'turn_target_deg': None if trial is None or trial.turn_rad is None
+            else round(math.degrees(trial.turn_rad), 1),
+            'turn_turned_deg': None if trial is None or trial.turn_turned_rad is None
+            else round(math.degrees(trial.turn_turned_rad), 1),
+            'gate_center_deg': None if gate is None else round(math.degrees(gate[0]), 1),
+            'gate_half_deg': None if gate is None else round(math.degrees(gate[1]), 1),
+            'target_bearing_deg': None if self._ema_bearing is None
+            else round(math.degrees(self._ema_bearing), 1),
+            'target_conf': None if obs is None else round(obs.confidence, 2),
+            'target_distance_m': None if obs is None else round(obs.distance_m, 2),
+            'target_distance_source': None if obs is None
+            else DISTANCE_SOURCES.get(int(obs.distance_source), 'unknown'),
+            'target_bbox_h_frac': None if obs is None else round(obs.bbox_h_frac, 2),
+            'target_fresh': self._person_fresh(now),
+            'walked_m': round(self._walk_distance_m, 2),
+            'face': self._last_face,
+        }
 
     def status(self) -> dict:
         """Compact snapshot for operator logs; never used for decisions."""
@@ -336,6 +436,12 @@ class ComeHereFsm:
         self._reset_person_tracking()
         self._approach_start = None
         self._walk_distance_m = 0.0
+        self._wake_s = now
+        self._gate_center = 0.0
+        self._turn_sent = False
+        self._turn_result = None
+        self._turn_done_s = None
+        self._last_face = None
         # An explicit stop first: keeps the robot still and re-arms the bridge
         # after an e-stop release, so motion only ever resumes on a new trial.
         self._command(cmds, now, 0.0, 0.0)
@@ -405,12 +511,50 @@ class ComeHereFsm:
                 self._miss_since = now
         return cmds
 
-    def on_face_result(self, face_present: bool, now: float) -> Commands:
-        if self._state == State.SIT_AND_IDENTIFY and self._sit_substep == 1:
+    def on_face_result(self, face_present: bool, now: float,
+                       center_x: Optional[float] = None) -> Commands:
+        cmds = Commands()
+        if self._state == State.SIT_AND_IDENTIFY and self._sit_phase == 'look':
             self._face_received = True
+            cx = center_x if (center_x is not None and math.isfinite(center_x)) else None
+            self._last_face = {'present': bool(face_present),
+                               'center_x': None if cx is None else round(cx, 3)}
             if self._trial is not None:
                 self._trial.face_present = bool(face_present)
-        return Commands()
+                self._trial.face_center_x = cx if face_present else None
+            if face_present and cx is not None:
+                cmds.log.append(f'LOOK_AT_FACE: face at x={cx:.2f} of the image '
+                                f'({"centered" if abs(cx - 0.5) <= 0.2 else "off-center"})')
+            else:
+                cmds.log.append('LOOK_AT_FACE: no face found in the frame')
+        return cmds
+
+    def on_rotate_result(self, target_rad: float, turned_rad: Optional[float], reason: str,
+                         now: float) -> Commands:
+        """The bridge finished the turn this trial asked for."""
+        cmds = Commands()
+        if self._state != State.TURN_TO_SOUND or not self._turn_sent or self._turn_result:
+            return cmds
+        if not math.isfinite(target_rad) or abs(target_rad - self._last_azimuth) > 0.02:
+            cmds.log.append(f'Ignoring rotate_result for another turn (target {target_rad:+.2f})')
+            return cmds
+        if turned_rad is not None and not math.isfinite(turned_rad):
+            turned_rad = None
+        self._turn_result = (target_rad, turned_rad, str(reason))
+        self._turn_done_s = now
+        return cmds
+
+    def on_reset(self, now: float) -> Commands:
+        """Operator: stand up from DONE and go back to IDLE."""
+        cmds = Commands()
+        if self._state == State.SIT_AND_IDENTIFY and self._sit_phase == 'done':
+            cmds.stand = True
+            self._sit_phase = 'stand'
+            self._sit_step_since = now
+            cmds.log.append('Operator reset: standing up')
+        else:
+            cmds.log.append(f'Operator reset ignored in {self.display_state}')
+        return cmds
 
     def on_estop(self, engaged: bool, now: float) -> Commands:
         cmds = Commands()
@@ -455,13 +599,7 @@ class ComeHereFsm:
         if state == State.LISTENING:
             self._tick_listening(now, cmds)
         elif state == State.TURN_TO_SOUND:
-            cmds.rotate_rad = self._last_azimuth
-            if self._trial is not None:
-                self._trial.turn_rad = self._last_azimuth
-                self._trial.turn_confidence = self._last_dir_confidence
-            cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad '
-                            f'(confidence {self._last_dir_confidence:.2f})')
-            self._enter(State.ACQUIRE_PERSON, now, cmds, 'rotate sent')
+            self._tick_turn(now, cmds)
         elif state == State.ACQUIRE_PERSON:
             self._tick_acquire(now, cmds)
         elif state in MOTION_STATES:
@@ -471,6 +609,7 @@ class ComeHereFsm:
                 self._finish(now, cmds, 'arrival hold complete')
         elif state == State.SIT_AND_IDENTIFY:
             self._tick_sit(now, cmds)
+        cmds.gate = self._current_gate()
         return cmds
 
     # -- perception validity --
@@ -507,15 +646,69 @@ class ComeHereFsm:
     def _tick_listening(self, now: float, cmds: Commands) -> None:
         cfg = self.config
         fresh = (self._last_dir_s is not None
-                 and now - self._last_dir_s <= cfg.direction_max_age_s)
+                 and now - self._last_dir_s <= cfg.direction_max_age_s
+                 and (self._wake_s is None
+                      or self._last_dir_s >= self._wake_s - WAKE_DIRECTION_SLACK_S))
+        az_deg = math.degrees(self._last_azimuth)
         if fresh and self._last_dir_confidence >= cfg.direction_confidence_threshold:
+            if cfg.direction_speak_text:
+                cmds.say = cfg.direction_speak_text
+            cmds.log.append(f'DOA: voice at {az_deg:+.0f} deg '
+                            f'(confidence {self._last_dir_confidence:.2f})')
             if abs(self._last_azimuth) < cfg.turn_min_rad:
+                self._gate_center = self._last_azimuth
+                if self._trial is not None:
+                    self._trial.gate_center_rad = self._gate_center
                 self._enter(State.ACQUIRE_PERSON, now, cmds,
                             f'sound ahead ({self._last_azimuth:+.2f} rad), no turn')
             else:
+                self._turn_sent = False
+                self._turn_result = None
                 self._enter(State.TURN_TO_SOUND, now, cmds, 'direction confident')
         elif now - self._state_since > cfg.listening_timeout_s:
-            self._enter(State.ACQUIRE_PERSON, now, cmds, 'no confident direction')
+            why = ('no bearing for this utterance' if not fresh else
+                   f'bearing {az_deg:+.0f} deg confidence {self._last_dir_confidence:.2f} '
+                   f'< {cfg.direction_confidence_threshold}')
+            if cfg.require_direction:
+                cmds.log.append(f'NOT WALKING: no confident voice direction ({why})')
+                self._abort(now, cmds, 'no_direction')
+            else:
+                self._gate_center = 0.0
+                self._enter(State.ACQUIRE_PERSON, now, cmds, f'no confident direction ({why})')
+
+    def _tick_turn(self, now: float, cmds: Commands) -> None:
+        cfg = self.config
+        trial = self._trial
+        if not self._turn_sent:
+            self._turn_sent = True
+            cmds.rotate_rad = self._last_azimuth
+            if trial is not None:
+                trial.turn_rad = self._last_azimuth
+                trial.turn_confidence = self._last_dir_confidence
+            cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad '
+                            f'(confidence {self._last_dir_confidence:.2f}); waiting for the turn')
+            return
+        if self._turn_result is None:
+            if now - self._state_since > cfg.turn_result_timeout_s:
+                cmds.log.append('NOT WALKING: no rotate_result from the bridge')
+                self._abort(now, cmds, 'turn_no_result')
+            return
+        if now - self._turn_done_s + _TIME_EPS < cfg.turn_settle_s:
+            return
+        target, turned, reason = self._turn_result
+        # Timed (no odometry) turns report no angle: assume the commanded turn.
+        residual = 0.0 if turned is None else wrap_pi(target - turned)
+        self._gate_center = residual
+        if trial is not None:
+            trial.turn_turned_rad = turned
+            trial.turn_result_reason = reason
+            trial.gate_center_rad = residual
+        cmds.log.append(
+            f'DOA->turn: requested {math.degrees(target):+.0f} deg, turned '
+            f'{"n/a" if turned is None else f"{math.degrees(turned):+.0f}"} deg ({reason}); '
+            f'caller expected at {math.degrees(residual):+.0f} deg in the camera')
+        self._reset_person_tracking()
+        self._enter(State.ACQUIRE_PERSON, now, cmds, f'turn {reason}')
 
     def _tick_acquire(self, now: float, cmds: Commands) -> None:
         cfg = self.config
@@ -526,6 +719,13 @@ class ComeHereFsm:
                 if trial.acquired_s is None:
                     trial.acquired_s = now
                     trial.acquire_confidence = self._last_valid_obs.confidence
+                    trial.acquire_bearing_rad = self._ema_bearing
+                    if cfg.acquired_speak_text:
+                        cmds.say = cfg.acquired_speak_text
+                    cmds.log.append(
+                        f'Caller acquired at {math.degrees(self._ema_bearing):+.0f} deg '
+                        f'(gate center {math.degrees(self._gate_center):+.0f} deg, '
+                        f'confidence {self._last_valid_obs.confidence:.2f})')
                 else:
                     trial.reacquisitions += 1
             reason = self._close_enough_reason()
@@ -587,19 +787,53 @@ class ComeHereFsm:
                 self._command(cmds, now, cfg.approach_speed, 0.0)
 
     def _tick_sit(self, now: float, cmds: Commands) -> None:
+        """final_align? -> settle -> sit -> look -> (done | speak_hold) -> stand -> IDLE.
+
+        Sit is only ever sent after a zero velocity and pre_sit_settle_s of standing
+        still; the bridge adds its own StopMove and 0.5 s before the Sit request.
+        """
         cfg = self.config
+        phase = self._sit_phase
         elapsed = now - self._sit_step_since + _TIME_EPS
-        if self._sit_substep == 0 and elapsed >= cfg.sit_settle_s:
+        if phase == 'final_align':
+            bearing = self._ema_bearing
+            lost = (not self._person_fresh(now) or bearing is None
+                    or (self._miss_since is not None
+                        and now - self._miss_since + _TIME_EPS >= cfg.lost_debounce_s))
+            done = (not lost and (abs(bearing) <= cfg.final_align_rad
+                                  or bearing * self._sit_align_sign < 0.0))
+            if lost or done or elapsed >= cfg.final_align_timeout_s:
+                why = 'lost' if lost else ('aligned' if done else 'timeout')
+                self._command(cmds, now, 0.0, 0.0)
+                cmds.log.append(f'Final align {why}'
+                                + ('' if bearing is None else f' at {math.degrees(bearing):+.0f} deg'))
+                self._set_sit_phase('settle', now)
+            else:
+                self._command(cmds, now, 0.0, self._yaw_toward(bearing))
+        elif phase == 'settle' and elapsed >= cfg.pre_sit_settle_s:
+            cmds.sit = True
+            cmds.log.append('SIT: StopMove sent, settled; sitting')
+            self._set_sit_phase('sit', now)
+        elif phase == 'sit' and elapsed >= cfg.sit_settle_s:
             cmds.face_request = True
-            self._next_sit_substep(now)
-        elif self._sit_substep == 1 and (self._face_received or elapsed >= cfg.face_timeout_s):
+            self._set_sit_phase('look', now)
+        elif phase == 'look' and (self._face_received or elapsed >= cfg.face_timeout_s):
+            if not self._face_received:
+                cmds.log.append('LOOK_AT_FACE: no face result in time')
             if cfg.speak_text:
                 cmds.say = cfg.speak_text
-            self._next_sit_substep(now)
-        elif self._sit_substep == 2 and elapsed >= cfg.speak_hold_s:
+            if cfg.sit_hold_until_reset:
+                if self._trial is not None:
+                    cmds.trial_summary = self._trial.summary(now)
+                    self._trial = None
+                cmds.log.append('DONE: sitting; operator reset stands the robot up')
+                self._set_sit_phase('done', now)
+            else:
+                self._set_sit_phase('speak_hold', now)
+        elif phase == 'speak_hold' and elapsed >= cfg.speak_hold_s:
             cmds.stand = True
-            self._next_sit_substep(now)
-        elif self._sit_substep == 3 and elapsed >= cfg.stand_settle_s:
+            self._set_sit_phase('stand', now)
+        elif phase == 'stand' and elapsed >= cfg.stand_settle_s:
             self._finish(now, cmds, 'sit sequence complete')
 
     # -- transitions --
@@ -642,10 +876,16 @@ class ComeHereFsm:
         )
         if self.config.arrival_mode == ARRIVAL_SIT_AND_IDENTIFY:
             self._enter(State.SIT_AND_IDENTIFY, now, cmds, reason)
-            cmds.sit = True
-            self._sit_substep = 0
-            self._sit_step_since = now
             self._face_received = False
+            bearing = self._ema_bearing
+            if (self.config.final_align_rad > 0.0 and bearing is not None
+                    and abs(bearing) > self.config.final_align_rad):
+                self._sit_align_sign = 1.0 if bearing > 0.0 else -1.0
+                self._set_sit_phase('final_align', now)
+                self._command(cmds, now, 0.0, self._yaw_toward(bearing))
+                cmds.log.append(f'Final align onto the caller at {math.degrees(bearing):+.0f} deg')
+            else:
+                self._set_sit_phase('settle', now)
         else:
             self._enter(State.ARRIVED, now, cmds, reason)
             if self.config.speak_text:
@@ -666,9 +906,25 @@ class ComeHereFsm:
             self._trial = None
         self._enter(State.IDLE, now, cmds, reason)
 
-    def _next_sit_substep(self, now: float) -> None:
-        self._sit_substep += 1
+    def _set_sit_phase(self, phase: str, now: float) -> None:
+        self._sit_phase = phase
         self._sit_step_since = now
+
+    def _current_gate(self) -> Optional[Tuple[float, float]]:
+        """Where perception may select the caller; None = no constraint (idle)."""
+        cfg = self.config
+        state = self._state
+        if state in (State.LISTENING, State.TURN_TO_SOUND):
+            return (0.0, 0.0)
+        if state == State.ACQUIRE_PERSON:
+            if self._approach_start is None or self._ema_bearing is None:
+                return (self._gate_center, cfg.acquire_gate_half_rad)
+            return (self._ema_bearing, cfg.track_gate_half_rad)
+        if state in MOTION_STATES or (state == State.SIT_AND_IDENTIFY
+                                      and self._sit_phase == 'final_align'):
+            center = self._ema_bearing if self._ema_bearing is not None else self._gate_center
+            return (center, cfg.track_gate_half_rad)
+        return None
 
     # -- helpers --
 

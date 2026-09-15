@@ -5,11 +5,17 @@ Publishes:
       [bearing_rad, distance_m, confidence, detected, bbox_h_frac,
        distance_source, frame_age_s]
       distance_source: 0 none, 1 bbox pinhole, 2 LiDAR
+      The person is the one candidate_selector picks inside the behavior
+      node's gate; with no fresh gate, the tallest box (camera-only demo).
+  /come_here/person_boxes      (std_msgs/Float64MultiArray) for the operator view:
+      [img_w, img_h, n, selected_index (-1 none), gate_center_rad, gate_half_rad
+       (nan = no gate), then per box x1, y1, x2, y2, confidence, bearing_rad, in_gate]
 
 Subscribes:
   /camera/image_raw            (sensor_msgs/Image) - GO2 front camera publisher
   /utlidar/cloud_base          (sensor_msgs/PointCloud2) - base-frame LiDAR (GO2 L1)
   /come_here/mock_person       (std_msgs/Bool) - toggle mock person detection
+  /come_here/target_gate       (std_msgs/Float64MultiArray) [center_rad, half_width_rad]
 
 Freshness rules (fail closed):
   * YOLO runs once per NEW camera frame. Re-running it on the same frame would
@@ -32,8 +38,11 @@ from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Bool, Float64MultiArray
 
 from come_here_perception.bearing_smoother import BearingSmoother
+from come_here_perception.candidate_selector import largest, select
 from come_here_perception.lidar_distance_resolver import LidarDistanceResolver
-from come_here_perception.person_detector import MockPersonDetector, PersonDetector
+from come_here_perception.person_detector import (
+    MockPersonDetector, PersonDetector, PersonEstimate,
+)
 
 # YoloPersonDetector pulls in ultralytics (and OpenCV). It is imported lazily
 # inside the non-mock branch so mock-mode launches do not require those
@@ -65,6 +74,8 @@ class PerceptionNode(Node):
         # second EMA here (re-added by an April merge, never run on hardware)
         # doubles the lag the ALIGN deadband was tuned against.
         self.declare_parameter('bearing_ema_alpha', 1.0)
+        # A gate older than this is ignored (behavior_node republishes it every tick).
+        self.declare_parameter('gate_max_age_s', 0.5)
 
         use_mock = self.get_parameter('use_mock').value
         rate_hz = self.get_parameter('publish_rate_hz').value
@@ -162,6 +173,15 @@ class PerceptionNode(Node):
         self._pub = self.create_publisher(
             Float64MultiArray, '/come_here/person_detection', 10
         )
+        self._boxes_pub = self.create_publisher(
+            Float64MultiArray, '/come_here/person_boxes', 10
+        )
+        self._gate_max_age_s = float(self.get_parameter('gate_max_age_s').value)
+        self._gate = None
+        self._gate_rx_s = None
+        self.create_subscription(
+            Float64MultiArray, '/come_here/target_gate', self._on_gate, 10
+        )
 
         if use_mock and detector is None:
             self._mock_sub = self.create_subscription(
@@ -179,6 +199,12 @@ class PerceptionNode(Node):
         if now - self._last_warn_s.get(key, -math.inf) >= period_s:
             self._last_warn_s[key] = now
             self.get_logger().warn(text)
+
+    def _info_throttled(self, key: str, text: str, period_s: float = 1.0) -> None:
+        now = self._now()
+        if now - self._last_warn_s.get(key, -math.inf) >= period_s:
+            self._last_warn_s[key] = now
+            self.get_logger().info(text)
 
     def _on_image(self, msg: Image):
         """Convert ROS Image to numpy and feed to detector."""
@@ -216,6 +242,32 @@ class PerceptionNode(Node):
         self._latest_cloud_stamp_s = self._now()
         self._cloud_cb_count += 1
 
+    def _on_gate(self, msg: Float64MultiArray):
+        data = list(msg.data)
+        if len(data) != 2 or not all(math.isfinite(v) for v in data) or data[1] < 0.0:
+            self._warn_throttled('bad_gate', f'Ignoring malformed target_gate {data}')
+            return
+        self._gate = (float(data[0]), float(data[1]))
+        self._gate_rx_s = self._now()
+
+    def _fresh_gate(self):
+        if self._gate_rx_s is None or self._now() - self._gate_rx_s > self._gate_max_age_s:
+            return None
+        return self._gate
+
+    def _publish_boxes(self, candidates, selected, in_gate, gate):
+        size = self._detector.frame_size() or (0, 0)
+        nan = float('nan')
+        data = [float(size[0]), float(size[1]), float(len(candidates)),
+                float(-1 if selected is None else selected),
+                nan if gate is None else gate[0], nan if gate is None else gate[1]]
+        for c, ok in zip(candidates, in_gate):
+            data.extend([*(float(v) for v in c.box_px), float(c.confidence),
+                         float(c.bearing_rad), float(ok)])
+        msg = Float64MultiArray()
+        msg.data = data
+        self._boxes_pub.publish(msg)
+
     def _mock_person_cb(self, msg: Bool):
         if isinstance(self._detector, MockPersonDetector):
             self._detector.set_detected(msg.data)
@@ -242,13 +294,35 @@ class PerceptionNode(Node):
                 )
                 self._bearing_smoother.reset()
                 self._publish(0.0, 0.0, 0.0, False, 0.0, DISTANCE_SOURCE_NONE, age)
+                self._publish_boxes([], None, [], self._fresh_gate())
                 return
             if self._frame_seq == self._last_processed_seq:
                 return  # nothing new to look at
             self._last_processed_seq = self._frame_seq
             frame_age_s = now - self._frame_rx_s
 
-        result = self._detector.detect()
+        candidates = self._detector.detect_all()
+        gate = self._fresh_gate()
+        if gate is None:
+            selected = largest(candidates)
+            in_gate = [True] * len(candidates)
+        else:
+            selected, in_gate = select(candidates, gate[0], gate[1])
+        if selected is None:
+            result = PersonEstimate(0.0, 0.0, 0.0, False)
+        else:
+            c = candidates[selected]
+            result = PersonEstimate(c.bearing_rad, c.distance_m, c.confidence, True, c.bbox_h_frac)
+        self._publish_boxes(candidates, selected, in_gate, gate)
+        if gate is not None and candidates:
+            rejected = [f'{math.degrees(c.bearing_rad):+.0f}deg/{c.confidence:.2f}'
+                        for c, ok in zip(candidates, in_gate) if not ok]
+            chosen = ('none' if selected is None else
+                      f'{math.degrees(result.bearing_rad):+.0f}deg/{result.confidence:.2f}')
+            self._info_throttled(
+                'gate',
+                f'gate {math.degrees(gate[0]):+.0f}+/-{math.degrees(gate[1]):.0f}deg: '
+                f'{len(candidates)} people, selected {chosen}, outside gate {rejected}')
         distance_m = result.distance_m
         distance_source = (
             DISTANCE_SOURCE_BBOX if result.detected and distance_m > 0.0

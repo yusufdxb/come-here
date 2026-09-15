@@ -34,6 +34,21 @@ class PersonDetector(ABC):
     def teardown(self) -> None:
         ...
 
+    def detect_all(self) -> list:
+        """Every person in the latest frame as candidate_selector.Candidate.
+
+        Default: the single detect() result. Real detectors return all boxes.
+        """
+        from come_here_perception.candidate_selector import Candidate
+        est = self.detect()
+        if not est.detected:
+            return []
+        return [Candidate(est.bearing_rad, est.distance_m, est.confidence, est.bbox_h_frac)]
+
+    def frame_size(self):
+        """(width, height) of the frame the last detection used, or None."""
+        return None
+
 
 class MockPersonDetector(PersonDetector):
     """Stub detector that returns a fixed person location.

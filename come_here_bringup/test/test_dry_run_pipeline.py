@@ -128,7 +128,11 @@ def stack(tmp_path, monkeypatch):
     env = dict(os.environ, PYTHONUNBUFFERED='1')
     params = ['--ros-args', '--params-file', str(CONFIG)]
     procs = [
-        subprocess.Popen([behavior] + params + ['-p', f'trial_log_dir:={tmp_path}'],
+        # Camera-only walk path of the demo config: no audio process here, so no
+        # bearing, and arrival_mode stop keeps the IDLE-after-arrival contract.
+        subprocess.Popen([behavior] + params + ['-p', f'trial_log_dir:={tmp_path}',
+                                                '-p', 'skip_turn_to_sound:=true',
+                                                '-p', 'arrival_mode:=stop'],
                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True),
         subprocess.Popen([bridge] + params + ['-p', 'dry_run:=true',
                                               '-p', "require_motion_mode:=''",

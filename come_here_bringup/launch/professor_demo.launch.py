@@ -1,11 +1,13 @@
-"""Class demo launch: "come here" -> find the caller -> ALIGN/WALK -> stop.
+"""Class demo launch: "come here" -> DOA turn -> DOA-gated caller -> approach -> sit.
 
     ros2 launch come_here_bringup professor_demo.launch.py                 # dry run
     ros2 launch come_here_bringup professor_demo.launch.py dry_run:=false  # live
 
-Starts the camera publisher, audio_node (Whisper wake phrase), perception_node
-(YOLO), behavior_node (state machine + trial log) and go2_bridge_node. No
-face detector, no TURN_TO_SOUND, no sit.
+Starts the camera publisher, audio_node (Whisper wake phrase + software DOA),
+perception_node (YOLO, DOA-gated selection), face_detector_node (one MediaPipe
+check after sitting), behavior_node (state machine + trial log),
+go2_bridge_node, and the operator view (scripts/demo_view.py, subscribe-only,
+MJPEG on port 8088; on the laptop run scripts/demo_view.sh).
 
 dry_run defaults to true: the bridge sends Sport API requests to
 /come_here/dry_run/sport_request, which the robot ignores. Motion needs the
@@ -33,6 +35,11 @@ def generate_launch_description():
     use_mock = LaunchConfiguration('use_mock')
     camera = LaunchConfiguration('camera')
     mock = {'use_mock': ParameterValue(use_mock, value_type=bool)}
+    # Symlink install: the launch file resolves to the repo, next to scripts/.
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    view_script = os.path.join(repo, 'scripts', 'demo_view.py')
+    if not os.path.isfile(view_script):
+        view_script = os.path.expanduser('~/come-here-demo/scripts/demo_view.py')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -71,6 +78,15 @@ def generate_launch_description():
             description='true: no turn toward the voice, the caller must start in camera view',
         ),
         DeclareLaunchArgument(
+            'doa_calibration_path', default_value='~/come_here_trials/doa_calibration.json',
+            description='scripts/calibrate_doa.py output; required: no file = no turn',
+        ),
+        DeclareLaunchArgument(
+            'view', default_value='true',
+            description='serve the operator view (subscribe-only) on port 8088',
+        ),
+        DeclareLaunchArgument('view_script', default_value=view_script),
+        DeclareLaunchArgument(
             'doa_offset_deg', default_value='0.0',
             description='software DOA mount offset, from scripts/doa_probe.py (caller ahead)',
         ),
@@ -105,6 +121,7 @@ def generate_launch_description():
                     LaunchConfiguration('doa_offset_deg'), value_type=float),
                 'doa_mirror': ParameterValue(
                     LaunchConfiguration('doa_mirror'), value_type=bool),
+                'doa_calibration_path': LaunchConfiguration('doa_calibration_path'),
             }],
             output='screen',
             respawn=True,
@@ -118,6 +135,24 @@ def generate_launch_description():
             output='screen',
             respawn=True,
             respawn_delay=2.0,
+        ),
+        Node(
+            package='come_here_perception',
+            executable='face_detector_node',
+            name='face_detector_node',
+            parameters=[config, mock],
+            output='screen',
+            respawn=True,
+            respawn_delay=2.0,
+        ),
+        ExecuteProcess(
+            cmd=['nice', '-n', '19', 'python3', '-u', LaunchConfiguration('view_script'),
+                 '--port', '8088'],
+            name='demo_view',
+            output='screen',
+            respawn=True,
+            respawn_delay=3.0,
+            condition=IfCondition(LaunchConfiguration('view')),
         ),
         # behavior_node and go2_bridge_node are never respawned: a restart
         # would forget a latched e-stop.

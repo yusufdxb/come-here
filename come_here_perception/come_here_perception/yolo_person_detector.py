@@ -121,6 +121,34 @@ class YoloPersonDetector(PersonDetector):
             bbox_h_frac=float(bbox_h / h) if h > 0 else 0.0,
         )
 
+    def detect_all(self) -> list:
+        """Every person box in the last frame, with the same bearing/distance model."""
+        from come_here_perception.candidate_selector import Candidate
+        self._last_size = None
+        if self._model is None or self._last_frame is None:
+            return []
+        frame = self._last_frame
+        h, w = frame.shape[:2]
+        self._last_size = (w, h)
+        results = self._model(
+            frame, conf=self._confidence, verbose=False, classes=[0], imgsz=self._imgsz,
+        )[0]
+        focal_length_px = (w / 2.0) / math.tan(self._hfov_rad / 2.0)
+        out = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].cpu().numpy())
+            bbox_h = y2 - y1
+            bearing = math.atan2((w / 2.0) - (x1 + x2) / 2.0, focal_length_px)
+            distance = (PERSON_HEIGHT_M * focal_length_px) / bbox_h if bbox_h > 10 else 0.0
+            out.append(Candidate(
+                bearing_rad=bearing, distance_m=distance, confidence=float(box.conf[0]),
+                bbox_h_frac=float(bbox_h / h) if h > 0 else 0.0, box_px=(x1, y1, x2, y2),
+            ))
+        return out
+
+    def frame_size(self):
+        return getattr(self, '_last_size', None)
+
     def teardown(self) -> None:
         self._model = None
         self._last_frame = None
