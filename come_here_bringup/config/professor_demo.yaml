@@ -126,9 +126,15 @@ behavior_node:
     walk_budget_arrives: true        # budget reached with the caller tracked and centered = arrival, sit
     align_by_rotate: true            # lab 09-14: visual yaw ALIGN overshot past the caller (camera lag)
     max_align_turns: 2
-    search_turn_rad: 0.6             # lab 09-14: caller at 90 deg read +34..+49; the camera finishes the turn
+    # Full-circle camera scan after the voice turn. Lab 09-15: voice from the
+    # robot's right read +141/+144 deg (claps read -117), the robot turned the
+    # wrong way and 2 x 34 deg search turns ended 66 deg short of the caller.
+    # 45 deg steps with the +/-35 deg acquire gate leave no blind gap, and
+    # 7 turns + the voice-turn view cover 360 deg. Worst case ~20 s of turning
+    # in place; nothing walks before a person is acquired.
+    search_turn_rad: 0.785
     search_turn_after_s: 2.0
-    max_search_turns: 2
+    max_search_turns: 7
     approach_timeout_s: 20.0
     # Arrival sequence (sit_and_identify)
     final_align_rad: 0.15            # arrive more than 9 deg off: yaw-only turn onto the caller first

@@ -809,3 +809,23 @@ def test_search_turns_are_bounded_then_the_trial_ends_without_walking():
     sim.run(12.0, person=MISS, every_ticks=1)
     assert sim.fsm.state == State.IDLE and sim.motion_commands() == []
     assert len(sim.rotates) == 2
+
+
+def test_camera_scan_finds_the_caller_after_a_wrong_voice_bearing():
+    """Lab 09-15: voice from the right read +141 deg; the robot turned left and
+    2 x 34 deg search turns stopped 66 deg short. 45 deg steps keep scanning the
+    same way until the camera sees the caller, and nothing walks before that."""
+    sim = turning_sim(target=2.46, search_turn_rad=0.785, search_turn_after_s=2.0,
+                      max_search_turns=7)
+    sim._record(sim.fsm.on_rotate_result(2.46, 2.446, 'reached', sim.t))
+    sim.run(1.0)
+    for _ in range(3):                                           # caller still out of view
+        sim.run(2.2, person=MISS, every_ticks=1)
+        assert sim.fsm.state == State.TURN_TO_SOUND
+        assert sim.motion_commands() == []
+        sim._record(sim.fsm.on_rotate_result(0.785, 0.76, 'reached', sim.t))
+        sim.run(1.0)
+    assert sim.rotates == [2.46, 0.785, 0.785, 0.785]            # one direction, fixed step
+    sim.run(1.0, person=obs(bearing=0.05), every_ticks=1)
+    assert sim.fsm.state in (State.WALK, State.ALIGN)
+    assert sim.summaries == []

@@ -6,6 +6,7 @@ professor_demo.yaml must be a parameter its node actually declares.
 """
 
 import importlib.util
+import math
 import os
 import pathlib
 import re
@@ -99,6 +100,16 @@ def test_class_demo_scope(config):
     assert bridge['manual_override_estop'] is True
     assert bridge['allow_combined_motion'] is False
     assert bridge['require_motion_mode'] == 'mcf'
+
+
+def test_camera_scan_covers_the_full_circle_without_blind_gaps(config):
+    # Lab 09-15: a wrong voice bearing must still end with the caller in view.
+    behavior = _params(config, 'behavior_node')
+    step = behavior['search_turn_rad']
+    gate = behavior['acquire_gate_half_rad']
+    turns = behavior['max_search_turns']
+    assert 0.0 < step < 2.0 * gate                                 # consecutive views overlap
+    assert step * turns + 2.0 * gate >= 2.0 * math.pi              # voice-turn view + scan = 360 deg
 
 
 def test_every_phrase_has_a_sound_file(config):
