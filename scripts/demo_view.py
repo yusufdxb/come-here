@@ -18,6 +18,7 @@ and a header with STATE, DOA, turn, target, distance and frame rates.
 import argparse
 import json
 import math
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -242,9 +243,26 @@ def main():
     ap.add_argument('--quality', type=int, default=60)
     ap.add_argument('--fps', type=float, default=8.0)
     args = ap.parse_args()
-    rclpy.init()
+    # rclpy's own handlers would stop only the spin thread and leave the HTTP
+    # loop (and the process) running; Ctrl+C and SIGTERM end both here.
+    from rclpy.executors import ExternalShutdownException
+    from rclpy.signals import SignalHandlerOptions
+
+    def _interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     view = DemoView(args.width, args.quality, args.fps)
-    threading.Thread(target=rclpy.spin, args=(view,), daemon=True).start()
+
+    def _spin():
+        try:
+            rclpy.spin(view)
+        except (ExternalShutdownException, rclpy.executors.ShutdownException):
+            pass
+
+    spinner = threading.Thread(target=_spin, daemon=True)
+    spinner.start()
     server = ThreadingHTTPServer(('0.0.0.0', args.port), make_handler(view))
     server.daemon_threads = True
     print(f'demo view on http://0.0.0.0:{args.port}/camera.mjpg', flush=True)
@@ -253,9 +271,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        server.shutdown()
+        server.server_close()
+        rclpy.try_shutdown()          # wakes the spin thread
+        spinner.join(timeout=3.0)     # let it leave the executor before teardown
         view.destroy_node()
-        rclpy.try_shutdown()
     return 0
 
 
