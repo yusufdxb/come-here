@@ -45,6 +45,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
+from come_here_audio.come_here_matcher import match_come_here
 from come_here_audio.phrase_matcher import match_trigger
 from come_here_audio.ring_buffer import LatestOnlyQueue, MultiRingBuffer, RingBuffer
 from come_here_audio.wake_phrase_detector import PhraseDetection, WakePhraseDetector
@@ -619,6 +620,18 @@ class WhisperPhraseDetector(WakePhraseDetector):
 
     # --- Transcription ---
 
+    def _match(self, text: str):
+        """Trigger match for one transcript.
+
+        {"come here"} uses the bounded whole-token matcher (come_here_matcher:
+        no substring hits such as "welcome here everyone"); any other trigger
+        set keeps the generic substring + difflib matcher.
+        """
+        if set(self.TRIGGER_PHRASES) == {'come here'}:
+            return match_come_here(text)
+        return match_trigger(text, self.TRIGGER_PHRASES,
+                             ratio_threshold=self._phrase_ratio_threshold)
+
     def _transcribe_ct2(self, audio_np: np.ndarray) -> PhraseDetection | None:
         """Transcribe using faster-whisper (CTranslate2)."""
         segments, info = self._ct2_model.transcribe(
@@ -646,11 +659,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
                       f"conf={confidence:.2f} logprob={avg_logprob:.2f}")
                 continue
 
-            match = match_trigger(
-                text,
-                self.TRIGGER_PHRASES,
-                ratio_threshold=self._phrase_ratio_threshold,
-            )
+            match = self._match(text)
             if match is not None:
                 if match.ratio < 1.0:
                     print(f"[WHISPER] fuzzy match: heard '{match.heard}' "
@@ -688,11 +697,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
 
         confidence = 0.85
 
-        match = match_trigger(
-            text,
-            self.TRIGGER_PHRASES,
-            ratio_threshold=self._phrase_ratio_threshold,
-        )
+        match = self._match(text)
         if match is not None:
             if match.ratio < 1.0:
                 print(f"[WHISPER] fuzzy match (HF): heard '{match.heard}' "
