@@ -136,6 +136,9 @@ behavior_node:
     search_turn_rad: 0.785
     search_turn_after_s: 2.0
     max_search_turns: 7
+    relisten_speak_text: "I can't see you. Can you call me again?"   # never contains the wake phrase
+    max_relistens: 1                 # one retry per trial, then IDLE
+    relisten_timeout_s: 8.0          # wait for the next come here after the prompt
     approach_timeout_s: 20.0
     # Arrival sequence (sit_and_identify)
     final_align_rad: 0.15            # arrive more than 9 deg off: yaw-only turn onto the caller first

@@ -139,6 +139,12 @@ class FsmConfig:
     search_turn_rad: float = 0.0
     search_turn_after_s: float = 2.0
     max_search_turns: int = 2
+    # Nobody seen after the voice turn and search turns: say this, go back to
+    # LISTENING and turn toward the next wake's bearing ('' disables, '|' = choices).
+    # Must not contain the wake phrase, or the robot can wake itself.
+    relisten_speak_text: str = ''
+    max_relistens: int = 1              # per trial
+    relisten_timeout_s: float = 8.0     # no new confident bearing by then -> give up
     approach_timeout_s: float = 30.0
     # Arrival.
     arrival_mode: str = ARRIVAL_STOP
@@ -172,7 +178,7 @@ class FsmConfig:
             'approach_speed', 'approach_ccw_yaw', 'approach_cw_yaw',
             'approach_stop_distance_m', 'bbox_stop_fraction',
             'max_walk_distance_m', 'approach_timeout_s', 'turn_result_timeout_s',
-            'acquire_gate_half_rad', 'track_gate_half_rad',
+            'acquire_gate_half_rad', 'track_gate_half_rad', 'relisten_timeout_s',
         ):
             positive(name)
         for name in (
@@ -193,6 +199,8 @@ class FsmConfig:
             raise ValueError('search_turn_rad must be in [0, pi] and max_search_turns >= 0')
         if self.max_align_turns < 0:
             raise ValueError('max_align_turns must be >= 0')
+        if self.max_relistens < 0:
+            raise ValueError('max_relistens must be >= 0')
         if self.search_min_consecutive_detections < 1:
             raise ValueError('search_min_consecutive_detections must be >= 1')
         if self.approach_align_threshold_rad >= self.approach_realign_threshold_rad:
@@ -287,6 +295,7 @@ class TrialStats:
     gate_center_rad: Optional[float] = None  # expected caller bearing in the camera after the turn
     acquire_bearing_rad: Optional[float] = None  # first visual bearing of the selected caller
     face_center_x: Optional[float] = None
+    relistens: int = 0
 
     def summary(self, end_s: float) -> dict:
         def rel(t):
@@ -337,6 +346,7 @@ class TrialStats:
             'acquire_bearing_rad': rnd(self.acquire_bearing_rad),
             'face_present': self.face_present,
             'face_center_x': rnd(self.face_center_x),
+            'relistens': self.relistens,
             'success': self.stop_reason in ARRIVED_REASONS and not self.estop,
         }
 
@@ -382,6 +392,8 @@ class ComeHereFsm:
         self._align_turns = 0
         self._search_sign = 0.0
         self._search_turns = 0
+        self._relistens = 0
+        self._relisten_s: Optional[float] = None
 
     # -- read-only state --
 
@@ -472,6 +484,8 @@ class ComeHereFsm:
         self._search_turns = 0
         self._search_sign = 0.0
         self._search_turns = 0
+        self._relistens = 0
+        self._relisten_s = None
         # An explicit stop first: keeps the robot still and re-arms the bridge
         # after an e-stop release, so motion only ever resumes on a new trial.
         self._command(cmds, now, 0.0, 0.0)
@@ -682,7 +696,9 @@ class ComeHereFsm:
                  and now - self._last_dir_s <= cfg.direction_max_age_s
                  and (self._wake_s is None
                       or self._last_dir_s >= self._wake_s - max(
-                          WAKE_DIRECTION_SLACK_S, cfg.direction_max_age_s)))
+                          WAKE_DIRECTION_SLACK_S, cfg.direction_max_age_s))
+                 # Re-listening: only a bearing from an utterance after the prompt.
+                 and (self._relisten_s is None or self._last_dir_s > self._relisten_s))
         az_deg = math.degrees(self._last_azimuth)
         if fresh and self._last_dir_confidence >= cfg.direction_confidence_threshold:
             if cfg.direction_speak_text:
@@ -701,7 +717,8 @@ class ComeHereFsm:
                 self._turn_purpose = 'doa'
                 self._search_sign = 1.0 if self._last_azimuth > 0.0 else -1.0
                 self._enter(State.TURN_TO_SOUND, now, cmds, 'direction confident')
-        elif now - self._state_since > cfg.listening_timeout_s:
+        elif now - self._state_since > (cfg.listening_timeout_s if self._relisten_s is None
+                                        else cfg.relisten_timeout_s):
             why = ('no bearing for this utterance' if not fresh else
                    f'bearing {az_deg:+.0f} deg confidence {self._last_dir_confidence:.2f} '
                    f'< {cfg.direction_confidence_threshold}')
@@ -797,6 +814,11 @@ class ComeHereFsm:
                         f'{cfg.max_search_turns} toward the voice side')
             return
         if now - self._acquire_since > cfg.search_timeout_s:
+            if (cfg.relisten_speak_text and not cfg.skip_turn_to_sound
+                    and self._approach_start is None
+                    and self._relistens < cfg.max_relistens):
+                self._relisten(now, cmds)
+                return
             reason = 'acquire_timeout' if self._approach_start is None else 'reacquire_timeout'
             self._abort(now, cmds, reason)
 
@@ -986,6 +1008,21 @@ class ComeHereFsm:
         self._turn_result = None
         self._enter(State.TURN_TO_SOUND, now, cmds,
                     f'{why}: align turn {self._align_turns} of {self.config.max_align_turns}')
+
+    def _relisten(self, now: float, cmds: Commands) -> None:
+        """Caller never seen: ask them to call again and localize the new utterance."""
+        self._relistens += 1
+        if self._trial is not None:
+            self._trial.relistens = self._relistens
+        self._command(cmds, now, 0.0, 0.0)
+        cmds.say = self.config.relisten_speak_text
+        self._relisten_s = now
+        self._reset_person_tracking()
+        self._search_sign = 0.0
+        self._search_turns = 0
+        self._enter(State.LISTENING, now, cmds,
+                    f'nobody seen: asking the caller to speak again '
+                    f'({self._relistens} of {self.config.max_relistens})')
 
     def _set_sit_phase(self, phase: str, now: float) -> None:
         self._sit_phase = phase

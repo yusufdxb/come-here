@@ -811,6 +811,61 @@ def test_search_turns_are_bounded_then_the_trial_ends_without_walking():
     assert len(sim.rotates) == 2
 
 
+def relisten_sim(**overrides):
+    """DOA turn done, then nobody in view until the acquire timeout."""
+    cfg = dict(target=0.86, relisten_speak_text="I can't see you. Call me again?",
+               search_timeout_s=3.0, require_direction=True)
+    cfg.update(overrides)
+    sim = turning_sim(**cfg)
+    sim._record(sim.fsm.on_rotate_result(cfg['target'], 0.84, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(3.2, person=MISS, every_ticks=1)
+    return sim
+
+
+def test_nobody_seen_after_the_turn_asks_the_caller_to_speak_again():
+    sim = relisten_sim()
+    assert sim.fsm.state == State.LISTENING
+    assert sim.says[-1] == "I can't see you. Call me again?"
+    assert sim.cmd == (0.0, 0.0) and sim.summaries == []
+    sim.run(1.0)                                     # the old bearing does not count
+    assert sim.fsm.state == State.LISTENING and sim.rotates == [0.86]
+    sim.fsm.on_direction(-0.7, 0.9, sim.t)           # caller says come here again
+    sim.run(0.2)
+    assert sim.fsm.state == State.TURN_TO_SOUND and sim.rotates == [0.86, -0.7]
+    sim._record(sim.fsm.on_rotate_result(-0.7, -0.68, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(0.5, person=obs(bearing=0.02), every_ticks=1)
+    assert sim.fsm.state == State.WALK
+    assert_single_axis(sim)
+
+
+def test_relisten_without_a_new_bearing_gives_up_without_walking():
+    sim = relisten_sim(relisten_timeout_s=4.0)
+    sim.run(4.2)
+    assert sim.fsm.state == State.IDLE and sim.motion_commands() == []
+    assert sim.summaries[-1]['stop_reason'] == 'no_direction'
+    assert sim.summaries[-1]['relistens'] == 1
+
+
+def test_relisten_is_bounded_per_trial():
+    sim = relisten_sim(max_relistens=1)
+    sim.fsm.on_direction(0.5, 0.9, sim.t)
+    sim.run(0.2)
+    sim._record(sim.fsm.on_rotate_result(0.5, 0.5, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(3.2, person=MISS, every_ticks=1)         # still nobody: no second prompt
+    assert sim.fsm.state == State.IDLE
+    assert sim.summaries[-1]['stop_reason'] == 'acquire_timeout'
+    assert len([x for x in sim.says if 'again' in x]) == 1
+
+
+def test_no_relisten_unless_configured():
+    sim = relisten_sim(relisten_speak_text='')
+    assert sim.fsm.state == State.IDLE
+    assert sim.summaries[-1]['stop_reason'] == 'acquire_timeout'
+
+
 def test_camera_scan_finds_the_caller_after_a_wrong_voice_bearing():
     """Lab 09-15: voice from the right read +141 deg; the robot turned left and
     2 x 34 deg search turns stopped 66 deg short. 45 deg steps keep scanning the
