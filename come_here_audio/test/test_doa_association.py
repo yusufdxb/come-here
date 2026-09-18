@@ -248,7 +248,7 @@ def test_control_transfer_timeout_is_milliseconds_not_microseconds():
 
     scripts/calibrate_respeaker_doa.py passes 100 and works.
     """
-    from odin_come_here.engine.audio import respeaker_doa_provider as rdp
+    from come_here_audio import respeaker_doa_provider as rdp
     assert rdp._CTRL_TIMEOUT <= 1000, (
         f'_CTRL_TIMEOUT is {rdp._CTRL_TIMEOUT} ms; anything above a second '
         f'stalls the direction thread instead of failing fast'
