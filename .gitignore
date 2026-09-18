@@ -23,3 +23,9 @@ TODO_*.md
 LATENCY_*.md
 *_PROMPT.md
 *_PROMPT.txt
+
+# Model weights that tools download into the working directory
+*.pt
+
+# Boot service live flag (per robot, never committed)
+.come_here_live

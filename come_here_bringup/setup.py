@@ -9,8 +9,9 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/come_here.launch.py']),
-        ('share/' + package_name + '/config', ['config/come_here_params.yaml']),
+        ('share/' + package_name + '/launch',
+         ['launch/come_here.launch.py', 'launch/professor_demo.launch.py']),
+        ('share/' + package_name + '/config', ['config/professor_demo.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

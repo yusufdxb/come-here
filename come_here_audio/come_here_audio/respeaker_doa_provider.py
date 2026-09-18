@@ -21,6 +21,7 @@ import usb.core
 import usb.util
 
 from come_here_audio.audio_direction_provider import AudioDirectionProvider, DirectionEstimate
+from come_here_audio.doa_association import mark_held_register, select_direction
 
 # ReSpeaker Mic Array v2.0 USB IDs
 _VENDOR_ID = 0x2886
@@ -29,8 +30,11 @@ _PRODUCT_ID = 0x0018
 # XMOS register addresses (from tuning.py PARAMETERS table)
 _REG_DOAANGLE = (21, 0)       # (id=21, offset=0), int, 0-359 degrees
 _REG_VOICEACTIVITY = (19, 32)  # (id=19, offset=32), int, 0 or 1
+_REG_SPEECHDETECTED = (19, 22)  # (id=19, offset=22), int, 0 or 1 (SDK tuning.py)
 
-_CTRL_TIMEOUT = 100000  # microseconds
+# pyusb timeouts are MILLISECONDS. 100000 was 100 s: one stuck control transfer
+# froze the audio node's executor. ODIN uses 100 ms.
+_CTRL_TIMEOUT = 100
 
 # AGC register addresses (from tuning.py PARAMETERS table)
 _REG_AGCONOFF = (19, 0)       # AGC enable: 0=off, 1=on
@@ -138,7 +142,13 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
         """Background thread: poll DOA + VAD at the configured rate."""
         while self._polling and self._dev is not None:
             try:
+                # Either firmware detector counts as corroboration. Lab
+                # 2026-09-14: VOICEACTIVITY stayed 0 for 172 of 172 samples of
+                # normal speech at 2 m while DOAANGLE tracked the talker, so
+                # the angle is sampled whether or not a detector fires.
                 vad = _read_register(self._dev, *_REG_VOICEACTIVITY, is_int=True)
+                if not vad:
+                    vad = _read_register(self._dev, *_REG_SPEECHDETECTED, is_int=True)
                 raw_deg = _read_register(self._dev, *_REG_DOAANGLE, is_int=True)
 
                 aligned_deg = (raw_deg + self._frame_offset_deg) % 360
@@ -235,6 +245,29 @@ class ReSpeakerDOAProvider(AudioDirectionProvider):
         print(f"[DOA] fallback: {math.degrees(az):+.0f}° "
               f"(only {n_active} VAD samples, using latest, conf={confidence:.2f})")
         return DirectionEstimate(azimuth_rad=az, confidence=confidence)
+
+    def get_direction_near(self, *, speech_end_s, speech_start_s=None, pre_s=1.0, post_s=0.3,
+                           min_active_samples=3, stale_fallback_s=0.0, reject_held=False):
+        """The bearing of the utterance that ended at speech_end_s (ODIN doa_association).
+
+        Samples come from the continuous poll, so a firmware VAD that never
+        latches does not lose the direction. Returns a DoaSelection or None;
+        None is no direction, never 0.0 rad. The selection carries the
+        held-register flag (mark_held_register); reject_held caps its confidence.
+        """
+        samples = tuple(self._samples)
+        selection = select_direction(
+            samples,
+            speech_end_s=speech_end_s,
+            speech_start_s=speech_start_s,
+            pre_s=pre_s,
+            post_s=post_s,
+            min_active_samples=min_active_samples,
+            stale_fallback_s=stale_fallback_s,
+        )
+        return mark_held_register(
+            selection, samples, speech_end_s=speech_end_s, speech_start_s=speech_start_s,
+            pre_s=pre_s, post_s=post_s, reject_held=reject_held)
 
     def teardown(self) -> None:
         self._polling = False

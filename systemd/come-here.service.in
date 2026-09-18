@@ -1,0 +1,35 @@
+# come-here boot service template. scripts/install_come_here_service.sh fills in
+# @USER@, @HOME@ and @ROOT@ and writes /etc/systemd/system/come-here.service.
+#
+# Dry run unless @ROOT@/.come_here_live exists: enabling the service cannot by
+# itself make the robot walk.
+[Unit]
+Description=come-here: GO2 voice summon (wake phrase, turn, approach, sit)
+Documentation=file://@ROOT@/docs/professor_demo.md
+# The robot's DDS traffic needs the network interface up; sound.target brings
+# up ALSA so the ReSpeaker is enumerated before the capture device is opened.
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+Environment=HOME=@HOME@
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=@ROOT@
+ExecStart=@ROOT@/scripts/come_here_boot.sh
+# SIGINT is the shutdown path that reaches DDS and sends StopMove (C3). SIGTERM
+# would kill the launch before the robot is told to stop.
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=20
+# The wrapper exits non-zero while the robot is off or the mic is missing, so
+# a boot before the robot is powered retries instead of giving up.
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:@HOME@/come_here_trials/boot_service.log
+StandardError=append:@HOME@/come_here_trials/boot_service.log
+
+[Install]
+WantedBy=multi-user.target

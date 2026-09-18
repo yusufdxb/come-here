@@ -1,3 +1,4 @@
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'come_here_audio'
@@ -11,6 +12,9 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/config', ['config/audio_params.yaml']),
         ('share/' + package_name + '/launch', ['launch/audio.launch.py']),
+        # Speech played through the GO2 audiohub; the bridge looks up <phrase>.wav.
+        ('share/' + package_name + '/sounds',
+         sorted(glob('scripts/*.wav'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

@@ -1,20 +1,38 @@
 behavior_node:
   ros__parameters:
+    # Full experimental stack (TURN_TO_SOUND + SIT_AND_IDENTIFY) launched by
+    # come_here.launch.py. The supported professor demo uses
+    # come_here_bringup/config/professor_demo.yaml instead.
     tick_rate_hz: 10.0
+    trial_log_enabled: true
+    trial_log_dir: ~/come_here_trials
     direction_confidence_threshold: 0.5
     # 2026-04-30: DOA confirmed publishing on hardware (az ~0.6 rad, conf 0.9)
     # so TURN_TO_SOUND is back in the loop. If DOA regresses, set true again.
     skip_turn_to_sound: false
     # Max time LISTENING will wait for a high-confidence DOA reading before
-    # falling back to SEARCH_FOR_PERSON without rotation.
+    # falling back to ACQUIRE_PERSON without rotation.
     listening_timeout_s: 1.5
-    # Consecutive person-detection frames required before SEARCH commits to
-    # APPROACH. YOLO at 1-2 Hz on CPU produces occasional false positives
-    # mid-rotation; requiring 2 frames filters those without much delay.
+    # Consecutive fresh person-detection frames required before ACQUIRE_PERSON
+    # commits to motion. YOLO at 1-2 Hz on CPU produces occasional false
+    # positives mid-rotation; requiring 2 frames filters those.
     search_min_consecutive_detections: 2
     person_confidence_threshold: 0.5
     approach_stop_distance_m: 0.8
     search_timeout_s: 10.0
+    # Lost person: stop after this long without a valid detection frame
+    # (0.3 s = the 3-tick debounce tuned on hardware 2026-04-24) ...
+    lost_debounce_s: 0.3
+    # ... or when no valid detection has arrived at all for this long.
+    person_stale_timeout_s: 1.5
+    # Close-range stop: bbox height >= 75% of frame (hardware 2026-04-24,
+    # stopped ~0.8 m from the operator; LiDAR read ~1 m long while walking).
+    bbox_stop_fraction: 0.75
+    # Backstops that stop the robot even if every perception stop fails.
+    max_walk_distance_m: 4.0
+    approach_timeout_s: 30.0
+    arrival_mode: sit_and_identify
+    wake_speak_text: "I am coming"
     # mcf gait requires vx >= 0.5 m/s and a stable setpoint held for ~1 s+
     # to engage a clean trot. 0.5 is on the engagement floor; observed
     # intermittent shake-in-place when the gait failed to latch. 0.6 gives
@@ -30,10 +48,13 @@ behavior_node:
     approach_cw_yaw: 0.6
     approach_min_align_s: 0.4
     approach_min_walk_s: 1.5
+    # WALK re-aligns only once |bearing| exceeds this (previously the implicit
+    # 2 x align threshold); the gap between the thresholds is the hysteresis.
+    approach_realign_threshold_rad: 0.30
     # EMA alpha on YOLO bbox-center bearing (blocker #2). 0.3 damps the
     # observed ±0.6 rad frame-to-frame jitter without over-lagging real turns.
+    # This is the only bearing smoothing layer; perception publishes raw bearing.
     bearing_ema_alpha: 0.3
-    lost_timeout_s: 3.0
     # SIT_AND_IDENTIFY sequence timing
     # Time from cmd_sit publish until the physical sit is visibly settled.
     # go2_bridge inserts a 0.5 s StopMove pre-delay before issuing Sit api_id,
@@ -47,17 +68,24 @@ behavior_node:
 
 go2_bridge_node:
   ros__parameters:
+    dry_run: false
     cmd_z: 2.0
     deg_per_sec: 90.0
     sit_api_id: 1009   # Sit (haunches up, head up), not 1005 StandDown (belly flat)
     stand_api_id: 1002
     move_api_id: 1008
     stop_move_api_id: 1003
-    move_control_rate_hz: 10.0
     wav_dir: /home/unitree/come-here/come_here_audio/scripts
     wav_chunk_size_bytes: 16384
     wav_chunk_delay_s: 0.15
-    # Safety clamps (skeptic-review C4): set above all calibrated setpoints
-    # so they only catch corrupt/runaway values, never normal operation.
+    # Motion gate (skeptic-review C4 + watchdog). Clamp limits sit above all
+    # calibrated setpoints; larger values are rejected as corrupt.
     max_vx: 1.0
     max_yaw_rate: 2.5
+    reject_vx_above: 2.0
+    reject_yaw_rate_above: 4.0
+    allow_combined_motion: false
+    cmd_velocity_timeout_s: 0.5
+    republish_rate_hz: 20.0
+    enable_rotate_command: true     # TURN_TO_SOUND uses cmd_rotate
+    enable_posture_commands: true   # SIT_AND_IDENTIFY uses cmd_sit / cmd_stand
