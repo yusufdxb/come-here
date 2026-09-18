@@ -234,6 +234,12 @@ All of these are overridable at launch time via `--ros-args --params-file`.
 
 ---
 
+## Live hardware result
+
+On 2026-09-15, two live end-to-end trials on the physical GO2 completed the full sequence (wake phrase → caller direction → turn → visual person acquisition → approach → stop → sit), running onboard the Jetson Orin NX. One was a blind trial, where the caller's position was not disclosed in advance; in it, the robot reached `DONE: sitting` about 12.8 s after wake-phrase detection (behavior-node log, `IDLE -> LISTENING` to `DONE: sitting`). Other attempts in the same session did not complete, including an attempt that timed out after an incorrect direction estimate.
+
+These two runs show that the complete behavior executes on hardware. They are not a robustness or performance study, and 12.8 s describes one trial, not typical timing. The trials used the [`demo-doa`](https://github.com/yusufdxb/come-here/tree/demo-doa) development line, not the `main` implementation described above. The robot checkout was recorded as `047825b` with uncommitted changes, so the exact executed source state is not fully reconstructable from Git history. Trial IDs: `20260915T225451-001` (caller at the robot's right), `20260915T230644-001` (blind trial).
+
 ## Status
 
 | Subsystem | Hardware-validated |
@@ -243,9 +249,11 @@ All of these are overridable at launch time via `--ros-args --params-file`.
 | GO2 Sport API rotation (`cmd_z=2.0` ≈ 90°/s) | Yes |
 | GO2 audiohub voice playback ("I am coming") | Yes |
 | End-to-end hear→rotate | Yes |
-| YOLO11n person detection via `/camera/image_raw` | Pending (implemented, bench script ready) |
-| MediaPipe face detection on GO2 frames | Pending (implemented, bench script ready) |
-| Approach controller + SIT_AND_IDENTIFY sequence | Pending (unit-tested; `go2_bridge_node` in-repo, hardware-side execution not yet validated end-to-end) |
+| YOLO11n person detection via `/camera/image_raw` | Demonstrated in the 2026-09-15 live trials (`demo-doa` development line); not re-validated on `main` |
+| MediaPipe face detection on GO2 frames | Pending: no face was detected in either 2026-09-15 live trial |
+| Approach + stop | Demonstrated in the 2026-09-15 live trials (`demo-doa` development line); the `main` controller above is unit-tested only |
+| Terminal sit | Demonstrated in the 2026-09-15 live trials (`demo-doa` development line) |
+| Identity confirmation (the "identify" half of SIT_AND_IDENTIFY) | Not demonstrated |
 
 ---
 
