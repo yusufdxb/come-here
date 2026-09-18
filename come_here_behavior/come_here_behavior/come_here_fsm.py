@@ -139,10 +139,12 @@ class FsmConfig:
     search_turn_rad: float = 0.0
     search_turn_after_s: float = 2.0
     max_search_turns: int = 2
-    # Nobody seen after the voice turn and search turns: say this, go back to
-    # LISTENING and turn toward the next wake's bearing ('' disables, '|' = choices).
-    # Must not contain the wake phrase, or the robot can wake itself.
+    # Nobody seen relisten_after_s after the voice turn: say this, go back to
+    # LISTENING and turn toward the next wake's bearing, before any search turn
+    # ('' disables, '|' = choices). Must not contain the wake phrase, or the
+    # robot can wake itself. Once used up, the search turns run as before.
     relisten_speak_text: str = ''
+    relisten_after_s: float = 2.0
     max_relistens: int = 1              # per trial
     relisten_timeout_s: float = 8.0     # no new confident bearing by then -> give up
     approach_timeout_s: float = 30.0
@@ -185,7 +187,7 @@ class FsmConfig:
             'turn_min_rad', 'lost_debounce_s', 'approach_min_align_s', 'approach_min_walk_s',
             'arrival_hold_s', 'sit_settle_s', 'face_timeout_s', 'speak_hold_s',
             'stand_settle_s', 'turn_settle_s', 'final_align_rad', 'final_align_timeout_s',
-            'pre_sit_settle_s', 'wake_speak_hold_s',
+            'pre_sit_settle_s', 'wake_speak_hold_s', 'relisten_after_s',
         ):
             value = getattr(self, name)
             if not (math.isfinite(value) and value >= 0.0):
@@ -798,6 +800,14 @@ class ComeHereFsm:
                 self._enter(State.ALIGN, now, cmds, 'person acquired, misaligned')
                 self._command(cmds, now, 0.0, self._yaw_toward(self._ema_bearing))
             return
+        can_relisten = (cfg.relisten_speak_text and not cfg.skip_turn_to_sound
+                        and self._approach_start is None
+                        and self._relistens < cfg.max_relistens)
+        nobody_seen = self._last_valid_s is None or self._last_valid_s < self._acquire_since
+        if (can_relisten and nobody_seen
+                and now - self._acquire_since + _TIME_EPS >= cfg.relisten_after_s):
+            self._relisten(now, cmds)
+            return
         if (cfg.search_turn_rad > 0.0 and self._approach_start is None
                 and self._search_sign != 0.0
                 and self._search_turns < cfg.max_search_turns
@@ -814,9 +824,7 @@ class ComeHereFsm:
                         f'{cfg.max_search_turns} toward the voice side')
             return
         if now - self._acquire_since > cfg.search_timeout_s:
-            if (cfg.relisten_speak_text and not cfg.skip_turn_to_sound
-                    and self._approach_start is None
-                    and self._relistens < cfg.max_relistens):
+            if can_relisten:                         # someone flickered in view, never acquired
                 self._relisten(now, cmds)
                 return
             reason = 'acquire_timeout' if self._approach_start is None else 'reacquire_timeout'

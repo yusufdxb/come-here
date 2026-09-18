@@ -860,6 +860,26 @@ def test_relisten_is_bounded_per_trial():
     assert len([x for x in sim.says if 'again' in x]) == 1
 
 
+def test_relisten_comes_before_the_search_turns_which_still_follow():
+    sim = turning_sim(target=0.86, relisten_speak_text='Call me again?', relisten_after_s=2.0,
+                      search_turn_rad=0.785, search_turn_after_s=2.0, max_search_turns=7,
+                      require_direction=True)
+    sim._record(sim.fsm.on_rotate_result(0.86, 0.84, 'reached', sim.t))
+    sim.run(1.0)                                     # turn_settle_s
+    sim.run(2.2, person=MISS, every_ticks=1)
+    assert sim.fsm.state == State.LISTENING and sim.rotates == [0.86]   # no search turn first
+    assert sim.says[-1] == 'Call me again?'
+    sim.fsm.on_direction(-0.7, 0.9, sim.t)
+    sim.run(0.2)
+    assert sim.rotates == [0.86, -0.7]
+    sim._record(sim.fsm.on_rotate_result(-0.7, -0.7, 'reached', sim.t))
+    sim.run(1.0)
+    sim.run(2.2, person=MISS, every_ticks=1)         # still nobody: sweep on the new side
+    assert sim.fsm.state == State.TURN_TO_SOUND
+    assert sim.rotates == [0.86, -0.7, -0.785]
+    assert len([x for x in sim.says if x == 'Call me again?']) == 1
+
+
 def test_no_relisten_unless_configured():
     sim = relisten_sim(relisten_speak_text='')
     assert sim.fsm.state == State.IDLE
