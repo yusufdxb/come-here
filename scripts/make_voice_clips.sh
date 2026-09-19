@@ -11,7 +11,8 @@ python3 - "$ROOT/come_here_bringup/config/professor_demo.yaml" <<'PY' > "$TMP/ph
 import sys, yaml
 b = yaml.safe_load(open(sys.argv[1]))['behavior_node']['ros__parameters']
 seen = set()
-for key in ('wake_speak_text', 'direction_speak_text', 'acquired_speak_text', 'speak_text'):
+for key in ('wake_speak_text', 'direction_speak_text', 'acquired_speak_text', 'speak_text',
+            'relisten_speak_text'):
     for p in str(b.get(key) or '').split('|'):
         p = p.strip()
         if p and p not in seen:

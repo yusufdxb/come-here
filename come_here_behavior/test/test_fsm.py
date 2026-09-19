@@ -880,6 +880,44 @@ def test_relisten_comes_before_the_search_turns_which_still_follow():
     assert len([x for x in sim.says if x == 'Call me again?']) == 1
 
 
+def empty_frame_sim(**overrides):
+    cfg = dict(target=0.86, relisten_speak_text='Where are you?', relisten_after_s=2.0,
+               relisten_empty_frames=4, require_direction=True)
+    cfg.update(overrides)
+    sim = turning_sim(**cfg)
+    sim._record(sim.fsm.on_rotate_result(0.86, 0.84, 'reached', sim.t))
+    sim.run(0.8)                                     # past turn_settle_s
+    return sim
+
+
+def test_fast_camera_prompts_after_the_empty_frames_not_the_time_bound():
+    sim = empty_frame_sim()
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    t0 = sim.t
+    sim.run(1.5, person=MISS, every_ticks=1)         # 10 Hz frames
+    assert sim.fsm.state == State.LISTENING and sim.says[-1] == 'Where are you?'
+    assert sim.transitions[-1] == 'LISTENING'
+    assert sim.velocities[-1][0] - t0 <= 0.5         # 4 frames at 10 Hz, not 2 s
+
+
+def test_stale_camera_frames_do_not_count_as_nobody():
+    sim = empty_frame_sim()
+    stale = obs(bearing=0.0, distance=0.0, conf=0.0, detected=False, bbox=0.0, source=0.0,
+                age=999.0)
+    sim.run(1.5, person=stale, every_ticks=1)
+    assert sim.fsm.state == State.ACQUIRE_PERSON     # still waiting for the time bound
+    sim.run(0.7, person=stale, every_ticks=1)
+    assert sim.fsm.state == State.LISTENING          # relisten_after_s reached
+
+
+def test_a_person_in_view_blocks_the_early_prompt():
+    sim = empty_frame_sim()
+    sim.run(0.1, person=obs(bearing=0.9), every_ticks=1)   # one hit, never acquired
+    sim.run(1.0, person=MISS, every_ticks=1)
+    assert sim.fsm.state == State.ACQUIRE_PERSON and not any(
+        s == 'Where are you?' for s in sim.says)
+
+
 def test_no_relisten_unless_configured():
     sim = relisten_sim(relisten_speak_text='')
     assert sim.fsm.state == State.IDLE

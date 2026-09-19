@@ -144,7 +144,11 @@ class FsmConfig:
     # ('' disables, '|' = choices). Must not contain the wake phrase, or the
     # robot can wake itself. Once used up, the search turns run as before.
     relisten_speak_text: str = ''
-    relisten_after_s: float = 2.0
+    relisten_after_s: float = 2.0       # upper bound, also covers a dead camera
+    # Ask sooner: this many consecutive fresh camera frames with nobody in them
+    # (0 = time only). Fast camera -> fast prompt; slow camera -> relisten_after_s.
+    relisten_empty_frames: int = 0
+    relisten_frame_max_age_s: float = 1.0   # older frames are a stale camera, not "nobody"
     max_relistens: int = 1              # per trial
     relisten_timeout_s: float = 8.0     # no new confident bearing by then -> give up
     approach_timeout_s: float = 30.0
@@ -181,6 +185,7 @@ class FsmConfig:
             'approach_stop_distance_m', 'bbox_stop_fraction',
             'max_walk_distance_m', 'approach_timeout_s', 'turn_result_timeout_s',
             'acquire_gate_half_rad', 'track_gate_half_rad', 'relisten_timeout_s',
+            'relisten_frame_max_age_s',
         ):
             positive(name)
         for name in (
@@ -201,8 +206,8 @@ class FsmConfig:
             raise ValueError('search_turn_rad must be in [0, pi] and max_search_turns >= 0')
         if self.max_align_turns < 0:
             raise ValueError('max_align_turns must be >= 0')
-        if self.max_relistens < 0:
-            raise ValueError('max_relistens must be >= 0')
+        if self.max_relistens < 0 or self.relisten_empty_frames < 0:
+            raise ValueError('max_relistens and relisten_empty_frames must be >= 0')
         if self.search_min_consecutive_detections < 1:
             raise ValueError('search_min_consecutive_detections must be >= 1')
         if self.approach_align_threshold_rad >= self.approach_realign_threshold_rad:
@@ -396,6 +401,7 @@ class ComeHereFsm:
         self._search_turns = 0
         self._relistens = 0
         self._relisten_s: Optional[float] = None
+        self._empty_frames = 0
 
     # -- read-only state --
 
@@ -523,6 +529,12 @@ class ComeHereFsm:
         self._last_person_msg_s = now
 
         kind = self.classify(obs)
+        if self._state == State.ACQUIRE_PERSON:
+            if kind == 'positive':
+                self._empty_frames = 0
+            elif (kind == 'negative'
+                  and obs.frame_age_s <= self.config.relisten_frame_max_age_s):
+                self._empty_frames += 1
         if kind == 'positive':
             self._consec_hits += 1
             self._last_valid_s = now
@@ -804,8 +816,11 @@ class ComeHereFsm:
                         and self._approach_start is None
                         and self._relistens < cfg.max_relistens)
         nobody_seen = self._last_valid_s is None or self._last_valid_s < self._acquire_since
+        empty_enough = (cfg.relisten_empty_frames > 0
+                        and self._empty_frames >= cfg.relisten_empty_frames)
         if (can_relisten and nobody_seen
-                and now - self._acquire_since + _TIME_EPS >= cfg.relisten_after_s):
+                and (empty_enough
+                     or now - self._acquire_since + _TIME_EPS >= cfg.relisten_after_s)):
             self._relisten(now, cmds)
             return
         if (cfg.search_turn_rad > 0.0 and self._approach_start is None
@@ -942,6 +957,7 @@ class ComeHereFsm:
         if new_state == State.ACQUIRE_PERSON:
             self._acquire_since = now
             self._consec_hits = 0
+            self._empty_frames = 0
         elif new_state in MOTION_STATES:
             self._phase_since = now
             if self._approach_start is None:
