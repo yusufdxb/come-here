@@ -60,6 +60,10 @@ WAKE_DETAIL_WINDOW_S = 2.0
 
 
 class BehaviorNode(Node):
+    # Subclasses (Come Here ANY) swap the state machine; the legacy demo uses these.
+    CONFIG_CLASS = FsmConfig
+    FSM_CLASS = ComeHereFsm
+
     def __init__(self, **kwargs):
         super().__init__('behavior_node', **kwargs)
 
@@ -67,14 +71,15 @@ class BehaviorNode(Node):
         self.declare_parameter('trial_log_enabled', True)
         self.declare_parameter('trial_log_dir', '~/come_here_trials')
         self.declare_parameter('git_commit', '')
-        for f in dataclasses.fields(FsmConfig):
+        for f in dataclasses.fields(self.CONFIG_CLASS):
             self.declare_parameter(f.name, f.default)
 
-        config = FsmConfig(**{
-            f.name: self.get_parameter(f.name).value for f in dataclasses.fields(FsmConfig)
+        config = self.CONFIG_CLASS(**{
+            f.name: self.get_parameter(f.name).value
+            for f in dataclasses.fields(self.CONFIG_CLASS)
         })
         # Raises ValueError on an inconsistent config: the node refuses to start.
-        self._fsm = ComeHereFsm(config)
+        self._fsm = self.FSM_CLASS(config)
         self._config_snapshot = dataclasses.asdict(config)
         # Monotonic: FSM timeouts must not jump when the Jetson clock is set by hand.
         self._now = time.monotonic
@@ -240,7 +245,8 @@ class BehaviorNode(Node):
             self.get_logger().info(line)
         if cmds.velocity is not None:
             msg = Float64MultiArray()
-            msg.data = [float(cmds.velocity[0]), float(cmds.velocity[1])]
+            # Legacy: [vx, yaw_rate]. Come Here ANY: [vx, vy, yaw_rate].
+            msg.data = [float(v) for v in cmds.velocity]
             self._velocity_pub.publish(msg)
         if cmds.rotate_rad is not None:
             msg = Float64()

@@ -24,6 +24,9 @@ setup(
             'check_motion_mode = come_here_behavior.motion_mode:main',
             'estop_console = come_here_behavior.estop_console:main',
             'trial_report = come_here_behavior.trial_report:main',
+            # Come Here ANY (experimental, native obstacle avoidance; never the default)
+            'come_here_any_behavior_node = come_here_behavior.come_here_any_behavior_node:main',
+            'native_avoid_bridge_node = come_here_behavior.native_avoid_bridge_node:main',
         ],
     },
 )
