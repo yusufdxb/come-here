@@ -88,7 +88,11 @@ class Driver:
             self.cmd = cmds.velocity
         if cmds.rotate_rad is not None:
             self.pending_rotate = (cmds.rotate_rad, self.t + 1.0)
-        self.trace.append({'t': self.t, 'in': name, 'out': _ser(dataclasses.asdict(cmds))})
+        out = dataclasses.asdict(cmds)
+        # Added after the baseline for the (disabled) skill interface: must stay empty
+        # on every baseline frame, and is not part of the baseline record.
+        assert out.pop('skill_results', []) == [], 'skill result on the baseline path'
+        self.trace.append({'t': self.t, 'in': name, 'out': _ser(out)})
         if cmds.face_request and self.face:
             self.rec('face', self.fsm.on_face_result(True, self.t, 0.5))
 

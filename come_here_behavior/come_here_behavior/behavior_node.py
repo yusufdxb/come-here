@@ -16,6 +16,7 @@ Subscribes:
   /come_here/estop              (std_msgs/Bool)
   /come_here/rotate_result      (std_msgs/String) JSON from go2_bridge_node when a turn ends
   /come_here/reset              (std_msgs/Bool)   operator: stand up from DONE (estop_console)
+  /come_here/skill_request      (std_msgs/String) JSON; only when enable_skill_api is true
 
 Publishes:
   /come_here/cmd_velocity        (std_msgs/Float64MultiArray) [vx, yaw_rate]
@@ -27,9 +28,12 @@ Publishes:
   /come_here/status              (std_msgs/String) JSON for the operator view, every tick
   /come_here/target_gate         (std_msgs/Float64MultiArray) [center_rad, half_width_rad]
   /come_here/trial_summary       (std_msgs/String) JSON, one message per finished trial
+  /come_here/skill_result        (std_msgs/String) JSON, transient_local; only when
+                                 enable_skill_api is true
 
 Parameters: every ``FsmConfig`` field (documented in come_here_fsm.py and the
-YAML configs), plus tick_rate_hz, trial_log_enabled, trial_log_dir, git_commit.
+YAML configs), plus tick_rate_hz, trial_log_enabled, trial_log_dir, git_commit, and
+enable_skill_api (default false: no skill topics exist and behavior is the baseline).
 """
 
 import dataclasses
@@ -40,6 +44,7 @@ import random
 import time
 
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 
 from come_here_behavior.come_here_fsm import (
@@ -67,6 +72,8 @@ class BehaviorNode(Node):
         self.declare_parameter('trial_log_enabled', True)
         self.declare_parameter('trial_log_dir', '~/come_here_trials')
         self.declare_parameter('git_commit', '')
+        # Not an FsmConfig field, so the config snapshot in every trial record is unchanged.
+        self.declare_parameter('enable_skill_api', False)
         for f in dataclasses.fields(FsmConfig):
             self.declare_parameter(f.name, f.default)
 
@@ -112,6 +119,13 @@ class BehaviorNode(Node):
         self._trial_pub = self.create_publisher(String, '/come_here/trial_summary', 10)
         self._status_pub = self.create_publisher(String, '/come_here/status', 10)
         self._gate_pub = self.create_publisher(Float64MultiArray, '/come_here/target_gate', 10)
+        self._skill_api = bool(self.get_parameter('enable_skill_api').value)
+        self._skill_pub = None
+        if self._skill_api:
+            self._skill_pub = self.create_publisher(
+                String, '/come_here/skill_result',
+                QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                           durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # -- Subscribers --
         self.create_subscription(String, '/come_here/wake_phrase', self._wake_cb, 10)
@@ -126,6 +140,9 @@ class BehaviorNode(Node):
         self.create_subscription(Bool, '/come_here/estop', self._estop_cb, 10)
         self.create_subscription(String, '/come_here/rotate_result', self._rotate_result_cb, 10)
         self.create_subscription(Bool, '/come_here/reset', self._reset_cb, 10)
+        if self._skill_api:
+            self.create_subscription(
+                String, '/come_here/skill_request', self._skill_request_cb, 10)
 
         rate = float(self.get_parameter('tick_rate_hz').value)
         self._timer = self.create_timer(1.0 / rate, self._tick)
@@ -139,6 +156,7 @@ class BehaviorNode(Node):
             f'max_walk={config.max_walk_distance_m} m '
             f'git={self._git["commit"][:10]} '
             f'trial_log={self._log_writer.path if self._log_writer else "off"}'
+            + (' skill_api=ON' if self._skill_api else '')
         )
 
     # -- inputs --
@@ -159,6 +177,25 @@ class BehaviorNode(Node):
                 'started_at': datetime.datetime.now().isoformat(timespec='seconds'),
                 'start_s': now,
                 'wake': wake,
+            }
+        self._apply(cmds)
+
+    def _skill_request_cb(self, msg: String) -> None:
+        now = self._now()
+        try:
+            req = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            req = None                         # the FSM rejects it as malformed
+        started = not self._fsm.trial_active
+        cmds = self._fsm.on_skill_request(req, now)
+        if started and self._fsm.trial_active:
+            self._trial_index += 1
+            self._pending_detail = None
+            self._trial_meta = {
+                'run_id': f'{self._session_id}-{self._trial_index:03d}',
+                'started_at': datetime.datetime.now().isoformat(timespec='seconds'),
+                'start_s': now,
+                'wake': {'source': 'skill_api'},
             }
         self._apply(cmds)
 
@@ -262,8 +299,17 @@ class BehaviorNode(Node):
                 msg = Bool()
                 msg.data = True
                 pub.publish(msg)
+        run_id = (self._trial_meta or {}).get('run_id')
         if cmds.trial_summary is not None:
             self._record_trial(cmds.trial_summary)
+        for result in cmds.skill_results:
+            if self._skill_pub is None:
+                break
+            msg = String()
+            msg.data = json.dumps(dict(result, run_id=None if result['status'] == 'rejected'
+                                       else run_id), sort_keys=True)
+            self._skill_pub.publish(msg)
+            self.get_logger().info(f'SKILL RESULT {msg.data}')
 
     def _record_trial(self, summary: dict) -> None:
         meta = self._trial_meta or {}

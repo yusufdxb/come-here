@@ -63,6 +63,18 @@ ARRIVAL_SIT_AND_IDENTIFY = 'sit_and_identify'
 
 ARRIVED_REASONS = ('arrived_bbox', 'arrived_distance', 'arrived_walk_budget')
 
+# Stepwise skill interface (behavior_node parameter enable_skill_api; off by default).
+SKILL_API_VERSION = 1
+SKILL_TURN = 'turn_to_voice'
+SKILL_APPROACH = 'approach_person'
+SKILL_CANCEL = 'cancel'
+SKILL_TURN_OK = ('turn_not_needed', 'reached', 'overshoot', 'timed')
+# Sit sequence phases where a cancel cannot stop anything: the robot is sitting or
+# changing posture, and the operator reset owns the stand-up.
+SKILL_POSTURE_PHASES = ('sit', 'look', 'speak_hold', 'done', 'stand')
+MAX_GOAL_ID_LEN = 64
+GOAL_ID_MEMORY = 1024
+
 # Tolerance for duration comparisons, so a 0.3 s debounce on a 10 Hz tick is
 # exactly three ticks despite float rounding.
 _TIME_EPS = 1e-6
@@ -262,6 +274,8 @@ class Commands:
     # (center_rad, half_width_rad) for perception's person selection; (x, 0.0) = closed.
     gate: Optional[Tuple[float, float]] = None
     trial_summary: Optional[dict] = None
+    # Skill interface results, one per request (always empty on the baseline path).
+    skill_results: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
 
 
@@ -303,6 +317,8 @@ class TrialStats:
     acquire_bearing_rad: Optional[float] = None  # first visual bearing of the selected caller
     face_center_x: Optional[float] = None
     relistens: int = 0
+    goal_id: Optional[str] = None           # skill interface only
+    skill: Optional[str] = None
 
     def summary(self, end_s: float) -> dict:
         def rel(t):
@@ -316,7 +332,7 @@ class TrialStats:
             end = self.approach_end_s if self.approach_end_s is not None else end_s
             approach_duration = round(end - self.approach_start_s, 3)
         abort_stop = self.stop_reason not in ARRIVED_REASONS + (None,)
-        return {
+        out = {
             'wake_phrase': self.wake_phrase,
             'first_detection_latency_s': rel(self.first_detection_s),
             'acquire_latency_s': rel(self.acquired_s),
@@ -356,6 +372,10 @@ class TrialStats:
             'relistens': self.relistens,
             'success': self.stop_reason in ARRIVED_REASONS and not self.estop,
         }
+        if self.goal_id is not None:          # baseline trials keep the exact key set
+            out['goal_id'] = self.goal_id
+            out['skill'] = self.skill
+        return out
 
 
 class ComeHereFsm:
@@ -403,6 +423,13 @@ class ComeHereFsm:
         self._relisten_s: Optional[float] = None
         self._empty_frames = 0
 
+        # Skill interface state; None / False on every baseline path.
+        self._skill: Optional[str] = None
+        self._goal_id: Optional[str] = None
+        self._skill_arrival: Optional[str] = None
+        self._turn_gate_valid = False
+        self._seen_goal_ids: List[str] = []
+
     # -- read-only state --
 
     @property
@@ -429,7 +456,7 @@ class ComeHereFsm:
         gate = self._current_gate()
         dir_age = None if self._last_dir_s is None else round(now - self._last_dir_s, 2)
         trial = self._trial
-        return {
+        status = {
             'state': self._state.name,
             'phase': self.display_state,
             'estopped': self._estopped,
@@ -453,6 +480,10 @@ class ComeHereFsm:
             'walked_m': round(self._walk_distance_m, 2),
             'face': self._last_face,
         }
+        if self._skill is not None:
+            status['goal_id'] = self._goal_id
+            status['skill'] = self._skill
+        return status
 
     def status(self) -> dict:
         """Compact snapshot for operator logs; never used for decisions."""
@@ -614,11 +645,162 @@ class ComeHereFsm:
             cmds.log.append(f'Operator reset ignored in {self.display_state}')
         return cmds
 
+    # -- stepwise skill interface --
+
+    @property
+    def active_goal_id(self) -> Optional[str]:
+        return self._goal_id if self._skill is not None else None
+
+    def on_skill_request(self, req, now: float) -> Commands:
+        """One request from the skill interface (already JSON-decoded).
+
+        Every request gets exactly one result. A rejection never touches motion: it
+        returns Commands with no velocity, rotation, sit or stand. Accepted requests
+        run the existing trial code and end through the existing stop paths.
+        """
+        cmds = Commands()
+        goal_id = req.get('goal_id') if isinstance(req, dict) else None
+        skill = req.get('skill') if isinstance(req, dict) else None
+        if not isinstance(goal_id, str):
+            goal_id = None
+        if (not isinstance(req, dict) or req.get('v') != SKILL_API_VERSION
+                or goal_id is None or not 1 <= len(goal_id) <= MAX_GOAL_ID_LEN
+                or not goal_id.isprintable()
+                or not isinstance(req.get('args', {}), dict)):
+            return self._skill_reject(cmds, goal_id, skill, 'malformed')
+        if skill not in (SKILL_TURN, SKILL_APPROACH, SKILL_CANCEL):
+            return self._skill_reject(cmds, goal_id, skill, 'unknown_skill')
+        args = req.get('args', {})
+        if goal_id in self._seen_goal_ids:
+            return self._skill_reject(cmds, goal_id, skill, 'duplicate_goal_id')
+        self._remember_goal_id(goal_id)
+
+        if skill == SKILL_CANCEL:
+            target = args.get('goal_id')
+            if set(args) != {'goal_id'} or not isinstance(target, str):
+                return self._skill_reject(cmds, goal_id, skill, 'bad_args')
+            if self._skill is None or target != self._goal_id:
+                return self._skill_reject(cmds, goal_id, skill, 'not_active')
+            if (self._state == State.SIT_AND_IDENTIFY
+                    and self._sit_phase in SKILL_POSTURE_PHASES):
+                return self._skill_reject(cmds, goal_id, skill, 'posture_phase')
+            cmds.log.append(f'Skill {self._skill} [{target}] cancelled by [{goal_id}]')
+            self._abort(now, cmds, 'cancelled')
+            cmds.skill_results[-1]['data']['cancel_goal_id'] = goal_id
+            cmds.skill_results.append({'v': SKILL_API_VERSION, 'goal_id': goal_id,
+                                       'skill': SKILL_CANCEL, 'status': 'succeeded',
+                                       'reason': 'cancelled', 'data': {'goal_id': target}})
+            return cmds
+
+        if skill == SKILL_TURN and args:
+            return self._skill_reject(cmds, goal_id, skill, 'bad_args')
+        if skill == SKILL_APPROACH and (
+                set(args) != {'arrival'}
+                or args['arrival'] not in (ARRIVAL_STOP, ARRIVAL_SIT_AND_IDENTIFY)):
+            return self._skill_reject(cmds, goal_id, skill, 'bad_args')
+        if self._estopped:
+            return self._skill_reject(cmds, goal_id, skill, 'estopped')
+        if self._state != State.IDLE or self._trial is not None:
+            return self._skill_reject(cmds, goal_id, skill, 'not_idle')
+        self._start_skill_trial(skill, goal_id, args.get('arrival'), now, cmds)
+        return cmds
+
+    def _skill_reject(self, cmds: Commands, goal_id, skill, reason: str) -> Commands:
+        cmds.skill_results.append({'v': SKILL_API_VERSION, 'goal_id': goal_id,
+                                   'skill': skill if isinstance(skill, str) else None,
+                                   'status': 'rejected', 'reason': reason, 'data': {}})
+        cmds.log.append(f'Skill request [{goal_id}] {skill} rejected: {reason}')
+        return cmds
+
+    def _remember_goal_id(self, goal_id: str) -> None:
+        self._seen_goal_ids.append(goal_id)
+        if len(self._seen_goal_ids) > GOAL_ID_MEMORY:
+            del self._seen_goal_ids[0]
+
+    def _start_skill_trial(self, skill: str, goal_id: str, arrival: Optional[str],
+                           now: float, cmds: Commands) -> None:
+        # Same reset as on_wake (kept as a copy so the baseline entry is untouched).
+        self._trial = TrialStats(wake_time_s=now, wake_phrase=f'skill:{skill}',
+                                 goal_id=goal_id, skill=skill)
+        self._reset_person_tracking()
+        self._approach_start = None
+        self._walk_distance_m = 0.0
+        self._wake_s = None                   # no wake phrase is spoken, no hold
+        self._turn_sent = False
+        self._turn_result = None
+        self._turn_done_s = None
+        self._last_face = None
+        self._turn_purpose = 'doa'
+        self._align_turns = 0
+        self._search_sign = 0.0               # no search turns inside a skill
+        self._search_turns = 0
+        self._relistens = 0
+        self._relisten_s = None
+        self._skill = skill
+        self._goal_id = goal_id
+        self._skill_arrival = arrival
+        # An explicit stop first, as on a wake: re-arms the bridge after an e-stop release.
+        self._command(cmds, now, 0.0, 0.0)
+        cmds.log.append(f'Skill request [{goal_id}] {skill} accepted'
+                        + ('' if arrival is None else f' (arrival {arrival})'))
+        if skill == SKILL_TURN:
+            self._gate_center = 0.0
+            self._turn_gate_valid = False
+            self._enter(State.LISTENING, now, cmds, f'skill {skill}')
+        else:
+            # The residual of an immediately preceding turn skill says where the caller
+            # should be in the camera; anything else starts centered.
+            self._gate_center = (self._gate_center if self._turn_gate_valid else 0.0)
+            self._turn_gate_valid = False
+            if self._trial is not None:
+                self._trial.gate_center_rad = self._gate_center
+            self._enter(State.ACQUIRE_PERSON, now, cmds, f'skill {skill}')
+
+    def _skill_finish_result(self, summary: dict, reason: str) -> dict:
+        """Result for the active skill from its trial summary; clears the skill."""
+        skill, goal_id = self._skill, self._goal_id
+        stop = summary.get('stop_reason') or reason
+        if summary.get('estop') or reason in ('estop', 'cancelled') or stop in (
+                'estop', 'cancelled'):
+            # Cancelled even after an arrival: the requested arrival did not complete.
+            status = 'cancelled'
+            stop = 'estop' if (summary.get('estop') or 'estop' in (reason, stop)) \
+                else 'cancelled'
+        elif skill == SKILL_TURN:
+            ok = stop == 'turn_not_needed' or (
+                stop == 'turn_complete'
+                and summary.get('turn_result_reason') in SKILL_TURN_OK)
+            status = 'succeeded' if ok else 'failed'
+        else:
+            status = 'succeeded' if summary.get('success') else 'failed'
+        if skill == SKILL_TURN:
+            data = {k: summary.get(k) for k in (
+                'turn_rad', 'turn_turned_rad', 'turn_result_reason', 'gate_center_rad',
+                'turn_confidence')}
+            data['turn_result_reason'] = (
+                'turn_not_needed' if stop == 'turn_not_needed'
+                else data['turn_result_reason'])
+        else:
+            data = {k: summary.get(k) for k in (
+                'final_distance_m', 'final_bearing_rad', 'final_bbox_h_frac',
+                'commanded_walk_distance_m', 'align_phases', 'walk_phases', 'lost_events',
+                'reacquisitions', 'face_present')}
+            data['arrival'] = self._skill_arrival
+            data['stop_reason'] = summary.get('stop_reason')
+            if self._skill_arrival == ARRIVAL_SIT_AND_IDENTIFY and status == 'succeeded':
+                data['posture'] = 'unverified'
+        self._skill = None
+        self._goal_id = None
+        self._skill_arrival = None
+        return {'v': SKILL_API_VERSION, 'goal_id': goal_id, 'skill': skill,
+                'status': status, 'reason': stop, 'data': data}
+
     def on_estop(self, engaged: bool, now: float) -> Commands:
         cmds = Commands()
         if engaged:
             newly_engaged = not self._estopped
             self._estopped = True
+            self._turn_gate_valid = False     # the robot may be moved by hand
             self._command(cmds, now, 0.0, 0.0)
             if self._trial is not None:
                 if self._trial.stop_reason is None:
@@ -645,6 +827,10 @@ class ComeHereFsm:
                 self._record_final()
             cmds.trial_summary = self._trial.summary(now)
             self._trial = None
+            if self._skill is not None:
+                result = self._skill_finish_result(cmds.trial_summary, 'shutdown')
+                result.update(status='failed', reason='shutdown')
+                cmds.skill_results.append(result)
         self._state = State.IDLE
         return cmds
 
@@ -723,6 +909,9 @@ class ComeHereFsm:
                 self._gate_center = self._last_azimuth
                 if self._trial is not None:
                     self._trial.gate_center_rad = self._gate_center
+                if self._skill == SKILL_TURN:
+                    self._skill_turn_done(now, cmds, 'turn_not_needed')
+                    return
                 self._enter(State.ACQUIRE_PERSON, now, cmds,
                             f'sound ahead ({self._last_azimuth:+.2f} rad), no turn')
             else:
@@ -736,7 +925,7 @@ class ComeHereFsm:
             why = ('no bearing for this utterance' if not fresh else
                    f'bearing {az_deg:+.0f} deg confidence {self._last_dir_confidence:.2f} '
                    f'< {cfg.direction_confidence_threshold}')
-            if cfg.require_direction:
+            if cfg.require_direction or self._skill is not None:
                 cmds.log.append(f'NOT WALKING: no confident voice direction ({why})')
                 self._abort(now, cmds, 'no_direction')
             else:
@@ -777,6 +966,9 @@ class ComeHereFsm:
             f'{self._turn_purpose.upper()}->turn: requested {math.degrees(target):+.0f} deg, turned '
             f'{"n/a" if turned is None else f"{math.degrees(turned):+.0f}"} deg ({reason}); '
             f'caller expected at {math.degrees(residual):+.0f} deg in the camera')
+        if self._skill == SKILL_TURN and self._turn_purpose == 'doa':
+            self._skill_turn_done(now, cmds, 'turn_complete')
+            return
         self._reset_person_tracking()
         self._enter(State.ACQUIRE_PERSON, now, cmds, f'turn {reason}')
 
@@ -814,7 +1006,8 @@ class ComeHereFsm:
             return
         can_relisten = (cfg.relisten_speak_text and not cfg.skip_turn_to_sound
                         and self._approach_start is None
-                        and self._relistens < cfg.max_relistens)
+                        and self._relistens < cfg.max_relistens
+                        and self._skill is None)
         nobody_seen = self._last_valid_s is None or self._last_valid_s < self._acquire_since
         empty_enough = (cfg.relisten_empty_frames > 0
                         and self._empty_frames >= cfg.relisten_empty_frames)
@@ -936,6 +1129,9 @@ class ComeHereFsm:
                 if self._trial is not None:
                     cmds.trial_summary = self._trial.summary(now)
                     self._trial = None
+                    if self._skill is not None:
+                        cmds.skill_results.append(self._skill_finish_result(
+                            cmds.trial_summary, 'seated'))
                 cmds.log.append('DONE: sitting; operator reset stands the robot up')
                 self._set_sit_phase('done', now)
             else:
@@ -985,7 +1181,8 @@ class ComeHereFsm:
             f'Close enough ({reason}): bbox_h_frac={obs.bbox_h_frac:.2f} '
             f'distance={obs.distance_m:.2f} m'
         )
-        if self.config.arrival_mode == ARRIVAL_SIT_AND_IDENTIFY:
+        mode = self._skill_arrival if self._skill is not None else self.config.arrival_mode
+        if mode == ARRIVAL_SIT_AND_IDENTIFY:
             self._enter(State.SIT_AND_IDENTIFY, now, cmds, reason)
             self._face_received = False
             bearing = self._ema_bearing
@@ -1012,10 +1209,26 @@ class ComeHereFsm:
         self._finish(now, cmds, reason)
 
     def _finish(self, now: float, cmds: Commands, reason: str) -> None:
+        keep_gate = (self._skill == SKILL_TURN
+                     and reason in ('turn_complete', 'turn_not_needed'))
         if self._trial is not None:
             cmds.trial_summary = self._trial.summary(now)
             self._trial = None
+            if self._skill is not None:
+                result = self._skill_finish_result(cmds.trial_summary, reason)
+                cmds.skill_results.append(result)
+                keep_gate = keep_gate and result['status'] == 'succeeded'
+        self._skill = None
+        self._turn_gate_valid = keep_gate
         self._enter(State.IDLE, now, cmds, reason)
+
+    def _skill_turn_done(self, now: float, cmds: Commands, reason: str) -> None:
+        """A turn_to_voice request ends here: stopped (the bridge forces StopMove after
+        every rotation), trial closed, result emitted."""
+        self._command(cmds, now, 0.0, 0.0)
+        if self._trial is not None:
+            self._trial.stop_reason = reason
+        self._finish(now, cmds, reason)
 
     def _align_turn(self, now: float, cmds: Commands, why: str) -> None:
         """Stop, then one closed-loop odometry turn by the caller's camera bearing."""
