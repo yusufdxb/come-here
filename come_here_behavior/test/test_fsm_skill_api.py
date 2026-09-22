@@ -487,8 +487,14 @@ def test_estop_after_sit_blocks_motion_until_operator_reset():
     d.run_until(loc)
     rid = d.request('orient_to_caller', localization=loc)
     assert d.result(rid)['reason'] == 'seated'
+    d.rec('estop', d.fsm.on_estop(True, d.t))
     d.rec('reset', d.fsm.on_reset(d.t))
-    assert not any(c.stand for _, n, c in d.frames[-1:])  # no command: hand stand-up
+    assert not d.frames[-1][2].stand, 'reset while e-stopped does nothing'
+    d.rec('estop', d.fsm.on_estop(False, d.t))
+    d.rec('reset', d.fsm.on_reset(d.t))
+    assert d.frames[-1][2].stand, 'released: the reset stands the robot up'
+    d.run(2)
+    assert d.fsm.state == State.IDLE
     _voice(d)
     loc = d.request('localize_caller')
     d.run_until(loc)
@@ -733,3 +739,42 @@ def test_request_id_memory_is_bounded():
         d.request('ask_caller_again', rid=f'q{i}')
     assert len(d.fsm._seen_request_ids) == GOAL_ID_MEMORY
     assert math.isfinite(d.t)
+
+
+def test_a_bearing_heard_during_a_cancelled_turn_never_localizes():
+    d = SkillDriver(gb.World(1.2, 2.6), rotate_result=False)
+    _voice(d)
+    loc = d.request('localize_caller')
+    d.run_until(loc)
+    ori = d.request('orient_to_caller', localization=loc)
+    d.run(0.5)
+    d.direction(0.8, 0.9)                     # heard mid-turn
+    d.run(0.2)
+    d.request('cancel', request_id=ori)
+    r = d.run_until(d.request('localize_caller'))
+    assert r['reason'] == 'no_direction', r
+
+
+def test_lost_track_bearing_is_not_reused_after_a_failed_turn():
+    d = SkillDriver(gb.World(0.05, 3.5), rotate_result=False)
+    acq = d.request('acquire_caller')
+    d.run_until(acq)
+    app = d.request('approach_caller', acquisition=acq)
+    d.run(2.0)
+    d.world.visible = False
+    assert d.run_until(app)['reason'] == 'track_lost'
+    t_loss = d.fsm._lost_bearing[1]
+    d.fsm._lost_bearing = (0.4, t_loss)          # a distinctive pre-turn bearing
+    # Without a turn in between, the reacquisition gates at the lost bearing ...
+    probe = d.request('acquire_caller')
+    assert d.fsm._gate_center == pytest.approx(0.4)
+    d.request('cancel', request_id=probe)
+    # ... but after a commanded (here failed) turn it must not.
+    d.fsm._lost_bearing = (0.4, t_loss)
+    d.direction(1.0, 0.9)
+    loc = d.request('localize_caller')
+    d.run_until(loc)
+    ori = d.request('orient_to_caller', localization=loc)
+    assert d.run_until(ori)['reason'] == 'turn_no_result'
+    d.request('acquire_caller')
+    assert d.fsm._gate_center == 0.0

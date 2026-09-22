@@ -189,7 +189,7 @@ class BehaviorNode(Node):
         now = self._now()
         try:
             req = json.loads(msg.data)
-        except (json.JSONDecodeError, TypeError):
+        except Exception:  # noqa: BLE001 - any undecodable request is malformed, never fatal
             req = None                         # the FSM rejects it as malformed
         started = not self._fsm.trial_active
         cmds = self._fsm.on_skill_request(req, now)

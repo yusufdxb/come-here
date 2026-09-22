@@ -698,10 +698,16 @@ class ComeHereFsm:
             self._sit_phase = 'stand'
             self._sit_step_since = now
             cmds.log.append('Operator reset: standing up')
+        elif self._skill_seated and self._state == State.IDLE and self._estopped:
+            cmds.log.append('Operator reset ignored while e-stopped (robot may be seated)')
         elif self._skill_seated and self._state == State.IDLE:
-            # E-stopped while seated: the operator stood the robot up by hand.
+            # E-stopped while seated, now released: stand up through the normal stand
+            # phase, so every later motion request starts from a standing robot.
+            cmds.stand = True
             self._skill_seated = False
-            cmds.log.append('Operator reset: skill sit cleared (robot stood up by the operator)')
+            self._state = State.SIT_AND_IDENTIFY
+            self._set_sit_phase('stand', now)
+            cmds.log.append('Operator reset: standing up after a skill sit')
         else:
             cmds.log.append(f'Operator reset ignored in {self.display_state}')
         return cmds
@@ -896,7 +902,9 @@ class ComeHereFsm:
             lost = self._lost_bearing
             if keep_turn_gate:
                 center = self._gate_center
-            elif lost is not None and now - lost[1] <= self.config.search_timeout_s:
+            elif (lost is not None and now - lost[1] <= self.config.search_timeout_s
+                  and not (self._last_motion_s is not None
+                           and self._last_motion_s > lost[1])):
                 center = lost[0]
             else:
                 center = 0.0
@@ -1410,6 +1418,10 @@ class ComeHereFsm:
 
     def _enter(self, new_state: State, now: float, cmds: Commands, reason: str) -> None:
         old = self._state
+        if old in (State.TURN_TO_SOUND, State.SIT_AND_IDENTIFY) or old in MOTION_STATES:
+            # Leaving a turn, walk or posture change (done, cancelled or e-stopped): what
+            # was sensed before now belongs to another heading or place.
+            self._last_motion_s = now
         self._state = new_state
         self._state_since = now
         cmds.log.append(f'State: {old.name} -> {new_state.name} ({reason})')
