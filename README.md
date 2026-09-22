@@ -109,6 +109,10 @@ These two runs show that the complete behavior executes on hardware. They are no
 | Boot service | Reboot-tested in dry run on 2026-09-15; live boot path not yet exercised |
 | Face detection after sitting | Not working: no face detected from the seated camera view |
 
+### Experimental: Come Here ANY
+
+A separate, opt-in entry point (`come_here_any.launch.py`) reuses this caller pipeline and hands locomotion to the GO2's onboard obstacle avoidance. It is not the supported demo and has **not moved the robot yet**: only its no-motion API checks and software tests exist. Design, evidence and the hardware ladder: [docs/come_here_any.md](docs/come_here_any.md).
+
 ## Known limits
 
 - One caller. Nobody closer to the robot than the caller.
