@@ -1,0 +1,219 @@
+# COME HERE ANY (experimental): the class-demo caller pipeline with the GO2's native
+# obstacle avoidance as the motion backend. NEVER the default; the legacy demo is
+# professor_demo.launch.py + professor_demo.yaml and is unaffected by this file.
+#
+#   ros2 launch come_here_bringup come_here_any.launch.py                  # dry run, no motion
+#   ros2 launch come_here_bringup come_here_any.launch.py dry_run:=false   # live: still NO motion
+#       unless native_live_motion_cleared:=true (only after the Stage A-D ladder,
+#       docs/come_here_any.md). Stop: estop_console, the remote stick, or Ctrl+C.
+#
+# audio_node, perception_node and face_detector_node are the legacy values
+# (kept identical; test_come_here_any_launch.py checks it). behavior_node and
+# go2_bridge_node run the ANY executables: come_here_any_behavior_node and
+# native_avoid_bridge_node.
+
+audio_node:
+  ros__parameters:
+    use_mock: false                  # launch argument use_mock overrides
+    wake_detector: whisper
+    enable_doa: false                # firmware DOAANGLE polling: register observed stuck
+    doa_source: firmware             # lab 09-14 claps: built-in DOAANGLE correct front/left/right/back; SRP-PHAT read ~0 deg everywhere
+    respeaker_frame_offset_deg: -90.0   # lab 09-14 claps: robot deg = DOAANGLE - 90, positive = robot left (launch doa_offset_deg)
+    doa_mirror: false                # launch argument doa_mirror; true if left/right swap
+    doa_grid_deg: 2.0
+    doa_peak_full_scale: 0.25        # SRP peak counted as full confidence; see probe
+    doa_firmware_advisory: false     # the register read blocks the executor (100 s USB timeout)
+    doa_calibration_path: ~/come_here_trials/doa_calibration.json   # scripts/calibrate_doa.py
+    require_doa_calibration: true    # no file -> no bearing published, loud ERROR, no turn
+    publish_rate_hz: 10.0
+    health_period_s: 5.0             # /come_here/audio_health and a log line
+    whisper_model_size: base.en
+    whisper_device: cpu
+    whisper_compute_type: int8
+    whisper_cpu_threads: 2           # uncapped CTranslate2 starved the camera on the Orin
+    whisper_adapter_path: ""
+    whisper_confidence_threshold: 0.2   # lab 09-14 recordings: 48/57 of Yusuf's come here at 0.20, 0/14 false wakes
+    whisper_no_speech_threshold: 0.75   # ODIN lab: no_speech_prob inflates with the robot powered
+    whisper_vad_filter: true
+    phrase_ratio_threshold: 0.80     # fuzzy "come here" match ("come hear" passes)
+    wake_cooldown_s: 3.0             # one utterance cannot fire twice
+    mic_device: ReSpeaker            # resolved by name; the 6-channel array is preferred
+    mic_prefer_far_field: true
+    mic_channels: 6                  # ch0 DSP beam for Whisper, ch1-4 raw capsules for DOA
+    mic_beam_channel: 0              # DSP beamformed output
+    mic_gain: 1.0
+    respeaker_profile: far_field     # launch argument respeaker_profile overrides
+    adaptive_gate: true              # launch argument adaptive_gate overrides
+    gate_snr_margin: 2.0             # gate = max(gate_floor_rms, noise_floor * margin)
+    gate_floor_rms: 0.003
+    calibration_s: 1.0               # room measured before listening; keep quiet at startup
+    preroll_sec: 0.25
+    utterance_rms_threshold: 0.015   # fixed gate, used only with adaptive_gate:=false
+    segment_peak_threshold: 0.02
+    silence_to_end_sec: 0.55         # lab 09-14 replay: 0.55 keeps 49/57 wakes and 0 false (0.45 drops to 46/57)
+    min_utterance_sec: 0.20
+    max_utterance_sec: 4.50
+
+perception_node:
+  ros__parameters:
+    use_mock: false                  # launch argument use_mock overrides
+    publish_rate_hz: 10.0            # upper bound; YOLO runs once per new camera frame
+    model_path: /home/unitree/come-here/models/yolo11n.pt
+    confidence: 0.45                 # YOLO person confidence floor
+    yolo_imgsz: 320
+    max_frame_age_s: 1.0             # lab 09-14: camera measured 1.7 Hz early in the session (7.5 Hz later)
+    bearing_ema_alpha: 1.0           # raw bearing; the single EMA is in behavior_node
+    use_lidar_distance: true
+    lidar_cloud_topic: /utlidar/cloud_base
+    lidar_max_age_s: 2.0
+    lidar_min_vertical_extent_m: 0.15
+    lidar_min_points: 4
+    lidar_z_min: 0.1
+    lidar_cone_half_rad: 0.30
+    gate_max_age_s: 0.5              # behavior_node republishes the target gate every tick
+
+face_detector_node:
+  ros__parameters:
+    use_mock: false
+    face_detector: mediapipe         # one inference, only after the robot sits
+    min_confidence: 0.5
+
+behavior_node:
+  ros__parameters:
+    tick_rate_hz: 10.0
+    trial_log_enabled: true
+    trial_log_dir: ~/come_here_trials   # launch argument trial_log_dir overrides
+    odom_topic: /utlidar/robot_odom
+    # Caller pipeline: the legacy class-demo values
+    skip_turn_to_sound: false
+    arrival_mode: sit_and_identify   # required by ANY (verified final facing, then sit)
+    arrival_hold_s: 2.0
+    wake_speak_text: "I am coming."
+    wake_speak_hold_s: 1.0
+    direction_speak_text: ""
+    acquired_speak_text: "I see you."
+    speak_text: "Made it.|Here I am."
+    direction_confidence_threshold: 0.4
+    require_direction: true
+    turn_result_timeout_s: 7.0
+    turn_settle_s: 0.7
+    acquire_gate_half_rad: 0.61
+    track_gate_half_rad: 0.61
+    direction_max_age_s: 5.0
+    turn_min_rad: 0.2
+    listening_timeout_s: 1.5
+    person_confidence_threshold: 0.5
+    search_min_consecutive_detections: 2
+    search_timeout_s: 10.0           # also the reacquire limit; then stop_reason caller_lost
+    max_person_bearing_rad: 1.0
+    max_person_distance_m: 10.0
+    lost_debounce_s: 0.3
+    person_stale_timeout_s: 1.5
+    bearing_ema_alpha: 0.3
+    approach_align_threshold_rad: 0.15
+    approach_realign_threshold_rad: 0.30
+    approach_min_align_s: 0.4
+    approach_min_walk_s: 1.5
+    approach_speed: 0.6
+    approach_ccw_yaw: 0.6
+    approach_cw_yaw: 0.6
+    bbox_stop_fraction: 0.82         # arrival: fresh camera only
+    approach_stop_distance_m: 0.8
+    # Commanded-walk budget: an ABORT backstop in ANY, never an arrival (detours are longer).
+    max_walk_distance_m: 6.0
+    walk_budget_arrives: false       # required false in ANY
+    align_by_rotate: true
+    max_align_turns: 3
+    search_turn_rad: 0.785
+    search_turn_after_s: 2.0
+    max_search_turns: 7
+    relisten_speak_text: "Where are you?"
+    relisten_after_s: 2.0
+    relisten_empty_frames: 4
+    relisten_frame_max_age_s: 1.0
+    max_relistens: 1
+    relisten_timeout_s: 8.0
+    approach_timeout_s: 30.0
+    # Verified final facing (ANY): align onto the box-center bearing, verify on new frames
+    final_align_rad: 0.15            # 9 deg
+    final_align_timeout_s: 4.0       # not verified by then: stop, NO sit, final_align_failed
+    pre_sit_settle_s: 1.0
+    sit_settle_s: 3.0
+    face_timeout_s: 1.5
+    speak_hold_s: 3.0
+    stand_settle_s: 0.5
+    sit_hold_until_reset: true
+    # ANY pursuit. split = legacy single-axis law through the native backend (safe
+    # default); combined / vector need Stage D evidence AND the matching bridge flags.
+    any_control_law: split
+    any_allow_combined: false
+    any_allow_lateral: false
+    any_max_vy: 0.3
+    any_yaw_gain: 1.2
+    any_min_speed: 0.5               # mcf clean trot floor (hw 2026-04-17); lower = hold, not creep
+    any_fov_stop_rad: 0.6            # caller 34 deg off-center: stop translating, turn to keep them
+    # Brief occlusion: odometry-frame caller estimate, never an arrival
+    any_prediction_ttl_s: 1.5
+    any_prediction_base_sigma_m: 0.25
+    any_prediction_sigma_growth_mps: 0.8
+    any_prediction_max_sigma_m: 1.2
+    any_camera_max_frame_age_s: 1.0
+    any_identity_max_jump_m: 1.2     # reacquired person must be near the tracked caller
+    any_identity_memory_s: 5.0
+    # Bounds
+    any_odom_max_age_s: 0.5
+    any_odom_max_step_m: 0.3
+    any_max_travel_m: 5.0            # odometric path length per trial
+    any_max_displacement_m: 4.0      # straight-line distance from where the trial started
+    any_no_progress_s: 8.0
+    any_min_progress_m: 0.3
+    any_min_progress_bbox: 0.05
+    any_trial_timeout_s: 60.0
+    any_final_align_yaw: 0.6
+    any_align_verify_s: 0.5
+    any_align_verify_obs: 2
+    any_final_align_attempts: 3
+
+go2_bridge_node:
+  ros__parameters:
+    dry_run: true                    # launch argument dry_run overrides
+    require_motion_mode: mcf
+    motion_mode_timeout_s: 5.0
+    max_vx: 0.7
+    max_yaw_rate: 1.0
+    reject_vx_above: 1.5
+    reject_yaw_rate_above: 3.0
+    allow_combined_motion: false     # legacy flag, unused by the native gate
+    cmd_velocity_timeout_s: 0.5
+    republish_rate_hz: 20.0
+    enable_rotate_command: true
+    enable_posture_commands: true
+    manual_override_estop: true
+    manual_override_axis_threshold: 0.2
+    cmd_z: 1.0
+    deg_per_sec: 57.0
+    rotate_closed_loop: true
+    odom_topic: /utlidar/robot_odom
+    odom_max_age_s: 0.5
+    rotate_deadband_rad: 0.06
+    rotate_timeout_s: 6.0
+    rotate_prefer_ccw_beyond_rad: 2.6
+    sit_api_id: 1009
+    stand_api_id: 1002
+    move_api_id: 1008
+    stop_move_api_id: 1003
+    wav_chunk_size_bytes: 16384
+    wav_chunk_delay_s: 0.15
+    # Native avoidance backend (the ONLY motion owner in this launch)
+    native_avoid_backend: sport_freeavoid   # launch argument; or obstacles_avoid (Stage C decides)
+    native_live_motion_cleared: false       # launch argument; true only after Stages A-D pass
+    native_allow_lateral: false             # Stage D
+    native_allow_combined: false            # Stage D
+    native_max_vy: 0.3
+    native_reject_vy_above: 1.0
+    native_response_timeout_s: 1.5
+    native_use_remote_command_from_api: true   # obstacles_avoid only; Stage B checks remote e-stop
+    native_restore_switch_on_release: true
+    native_disable_freeavoid_on_release: true
+    native_stop_with_sport_stopmove: true
+    native_odom_max_age_s: 0.5
