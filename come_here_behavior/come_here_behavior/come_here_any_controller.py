@@ -85,7 +85,7 @@ class AnyFsmConfig(FsmConfig):
     any_prediction_max_sigma_m: float = 1.2
     any_camera_max_frame_age_s: float = 1.0
     any_identity_max_jump_m: float = 1.2
-    any_identity_memory_s: float = 5.0
+    any_identity_memory_s: float = 15.0  # must outlast the reacquire window
     # Odometry and travel bounds.
     any_odom_max_age_s: float = 0.5
     any_odom_max_step_m: float = 0.3
@@ -131,6 +131,9 @@ class AnyFsmConfig(FsmConfig):
             raise ValueError('ANY needs arrival_mode sit_and_identify (verified final facing)')
         if self.any_align_verify_obs < 1 or self.any_final_align_attempts < 1:
             raise ValueError('any_align_verify_obs and any_final_align_attempts must be >= 1')
+        if self.any_identity_memory_s < self.search_timeout_s:
+            raise ValueError('any_identity_memory_s must be >= search_timeout_s: otherwise a '
+                             'long reacquisition accepts anyone as the caller')
         if self.any_min_speed > self.approach_speed:
             raise ValueError('any_min_speed must be <= approach_speed')
 
@@ -262,16 +265,20 @@ class ComeHereAnyFsm(ComeHereFsm):
             self._last_frame_age = obs.frame_age_s
         else:
             self._last_frame_age = math.inf
-        if (self.classify(obs) == 'positive' and self._approach_start is not None
-                and self._odom_fresh(now)
-                and not self._caller.consistent(self._pose, obs.bearing_rad, obs.distance_m,
-                                                now, cfg.any_identity_max_jump_m,
-                                                cfg.any_identity_memory_s)):
-            if isinstance(trial, AnyTrialStats):
-                trial.identity_rejections += 1
-            identity_log = (f'Rejected a person at {math.degrees(obs.bearing_rad):+.0f} deg '
-                            f'{obs.distance_m:.2f} m: not where the tracked caller can be')
-            obs = dataclasses.replace(obs, detected=0.0, confidence=0.0)
+        if self.classify(obs) == 'positive' and self._approach_start is not None:
+            reject = None
+            if not self._odom_fresh(now) and self._caller.has_fix:
+                reject = 'odometry stale, cannot check it is the same caller'
+            elif not self._caller.consistent(self._pose, obs.bearing_rad, obs.distance_m,
+                                             now, cfg.any_identity_max_jump_m,
+                                             cfg.any_identity_memory_s):
+                reject = 'not where the tracked caller can be'
+            if reject is not None:
+                if isinstance(trial, AnyTrialStats):
+                    trial.identity_rejections += 1
+                identity_log = (f'Rejected a person at {math.degrees(obs.bearing_rad):+.0f} deg '
+                                f'{obs.distance_m:.2f} m: {reject}')
+                obs = dataclasses.replace(obs, detected=0.0, confidence=0.0)
         cmds = super().on_person(obs, now)
         if identity_log:
             cmds.log.append(identity_log)
@@ -397,8 +404,13 @@ class ComeHereAnyFsm(ComeHereFsm):
     def _drive(self, now: float, cmds: Commands, bearing: float, scale: float) -> None:
         cfg = self.config
         law = cfg.any_control_law
-        speed = cfg.approach_speed * scale
-        if speed < cfg.any_min_speed:
+        if scale >= 1.0:
+            speed = cfg.approach_speed
+        elif scale > 0.0:
+            # Predicting: slow down toward the gait floor (mcf trots cleanly only at
+            # >= any_min_speed), then stop when the estimate expires or grows uncertain.
+            speed = max(cfg.any_min_speed, cfg.approach_speed * scale)
+        else:
             speed = 0.0
         if law == 'split':
             elapsed = now - self._phase_since

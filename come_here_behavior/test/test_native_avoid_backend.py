@@ -319,3 +319,55 @@ def test_legacy_defaults_still_forbid_combined_motion():
     """Regression: nothing in ANY changed the legacy gate or FSM defaults."""
     assert GateLimits(0.7, 1.0, 1.5, 3.0, 0.5).allow_combined is False
     assert FsmConfig().walk_budget_arrives is False
+
+
+# -- review 2026-09-21: a lost or late reply must still be released / restored --
+
+def _publish_steps(b, upto_label, now=0.0):
+    """Answer every step before ``upto_label`` with OA_OK/FA_OK; publish that one unanswered."""
+    replies = OA_OK if b.backend == BACKEND_OBSTACLES_AVOID else FA_OK
+    calls = b.begin_enable(now)
+    while calls:
+        call = calls[0]
+        rid = b.new_request_id()
+        b.on_published(rid, now)
+        if call.label == upto_label:
+            return call, rid
+        code, data = replies[call.label]
+        calls = b.on_response(call.service, rid, call.api_id, code, data, now)
+    raise AssertionError(f'{upto_label} never sent')
+
+
+def test_unanswered_take_api_control_is_released_after_timeout():
+    b = NativeAvoidBackend(BACKEND_OBSTACLES_AVOID, response_timeout_s=1.0)
+    _publish_steps(b, 'take_api_control')
+    b.tick(2.0)
+    assert b.state == FAILED
+    labels = [c.label for c in b.release_calls()]
+    assert 'release_api_control' in labels and 'switch_restore' in labels
+
+
+def test_estop_during_take_api_control_releases_and_late_reply_changes_nothing():
+    b = NativeAvoidBackend(BACKEND_OBSTACLES_AVOID)
+    call, rid = _publish_steps(b, 'take_api_control')
+    assert 'release_api_control' in [c.label for c in b.suspend()]
+    assert b.on_response(call.service, rid, call.api_id, 0, '{}', 0.1) == []
+    assert not b.enabled
+
+
+def test_interrupted_switch_set_restores_to_the_state_before_we_touched_it():
+    b = NativeAvoidBackend(BACKEND_OBSTACLES_AVOID)
+    _publish_steps(b, 'switch_set_on')          # initial read: enable false
+    b.suspend()
+    # Re-enable: the robot now reads enable:true (our unanswered SwitchSet applied)
+    enable_live(b, dict(OA_OK, switch_get_initial=(0, '{"enable":true}')))
+    restore = [c for c in b.release_calls() if c.label == 'switch_restore']
+    assert restore and restore[0].params == {'enable': False}
+
+
+def test_unanswered_freeavoid_is_turned_off_at_shutdown():
+    b = NativeAvoidBackend(BACKEND_FREEAVOID, response_timeout_s=1.0)
+    _publish_steps(b, 'free_avoid_on')
+    b.tick(2.0)
+    assert b.state == FAILED
+    assert 'free_avoid_off' in [c.label for c in b.release_calls()]

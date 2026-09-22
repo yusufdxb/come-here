@@ -180,6 +180,11 @@ class NativeAvoidBackend:
         self._api_control_released = False
         self._freeavoid_set = False
         self._switch_set = False
+        # Set when the request is PUBLISHED: a lost or late reply may still have
+        # applied it, so release / restore must undo anything attempted.
+        self._freeavoid_attempted = False
+        self._switch_attempted = False
+        self._api_control_attempted = False
         self._log: List[str] = []
 
     # -- read-only --
@@ -260,6 +265,14 @@ class NativeAvoidBackend:
         if self._pending is None or self._pending_id is not None:
             return
         self._pending_id = request_id
+        call = self._pending.call
+        if call.service == SPORT and call.api_id == SPORT_API_FREEAVOID:
+            self._freeavoid_attempted = True
+        elif call.service == OBSTACLES_AVOID and call.api_id == OA_API_SWITCH_SET:
+            self._switch_attempted = True
+        elif (call.service == OBSTACLES_AVOID
+              and call.api_id == OA_API_USE_REMOTE_COMMAND_FROM_API):
+            self._api_control_attempted = True
 
     def on_response(self, service: str, request_id: int, api_id: int, code: int,
                     data: str, now: float) -> List[ApiCall]:
@@ -320,7 +333,9 @@ class NativeAvoidBackend:
             if not isinstance(enable, bool):
                 self._fail(f'{label}: unreadable reply {data!r}')
                 return []
-            self._initial_switch = enable
+            if self._initial_switch is None and not self._switch_attempted:
+                # Only the state before WE ever touched it is the one to restore.
+                self._initial_switch = enable
         if step.expect:
             for key, value in step.expect.items():
                 if payload is None or payload.get(key) != value:
@@ -384,7 +399,7 @@ class NativeAvoidBackend:
         before motion; obstacles_avoid API control is released immediately.
         """
         calls = self.stop_calls()
-        if self._api_control_taken:
+        if self._api_control_taken or self._api_control_attempted:
             calls.append(self._release_api_control())
         if self._state in (ENABLING, ENABLED):
             self._state = DISABLED
@@ -397,12 +412,14 @@ class NativeAvoidBackend:
         """Shutdown: stop, give API control back, restore / disable avoidance."""
         calls = self.stop_calls()
         if self.backend == BACKEND_OBSTACLES_AVOID:
-            if self._api_control_taken:
+            if self._api_control_taken or self._api_control_attempted:
                 calls.append(self._release_api_control())
-            if self._switch_set and self._restore_switch and self._initial_switch is not None:
+            if (self._switch_set or self._switch_attempted) and self._restore_switch:
+                # Unknown prior state (never read) restores to off, the safe default.
+                initial = False if self._initial_switch is None else self._initial_switch
                 calls.append(ApiCall(OBSTACLES_AVOID, OA_API_SWITCH_SET,
-                                     {'enable': self._initial_switch}, False, 'switch_restore'))
-        elif self._freeavoid_set and self._disable_freeavoid:
+                                     {'enable': initial}, False, 'switch_restore'))
+        elif (self._freeavoid_set or self._freeavoid_attempted) and self._disable_freeavoid:
             calls.append(ApiCall(SPORT, SPORT_API_FREEAVOID, {'data': False}, False,
                                  'free_avoid_off'))
         if self._state != FAILED:
@@ -414,6 +431,7 @@ class NativeAvoidBackend:
 
     def _release_api_control(self) -> ApiCall:
         self._api_control_taken = False
+        self._api_control_attempted = False
         self._api_control_released = True
         return ApiCall(OBSTACLES_AVOID, OA_API_USE_REMOTE_COMMAND_FROM_API,
                        {'is_remote_commands_from_api': False}, False, 'release_api_control')

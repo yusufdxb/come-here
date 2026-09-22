@@ -62,3 +62,11 @@ def test_record_is_appended(probe, tmp_path):
     path = probe.append_record({'command': 'status'}, directory=str(tmp_path))
     probe.append_record({'command': 'stop'}, directory=str(tmp_path))
     assert len(pathlib.Path(path).read_text().splitlines()) == 2
+
+
+def test_obstacles_avoid_run_refused_unless_switch_on_and_control_granted(probe):
+    assert probe.oa_not_ready((0, '{"enable":true}'), (0, '{}')) is None
+    assert 'switch' in probe.oa_not_ready((0, '{"enable":false}'), (0, '{}'))
+    assert 'switch' in probe.oa_not_ready((None, None), (0, '{}'))
+    assert 'switch' in probe.oa_not_ready((0, 'garbage'), (0, '{}'))
+    assert 'API control' in probe.oa_not_ready((0, '{"enable":true}'), (3104, None))

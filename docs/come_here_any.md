@@ -101,11 +101,18 @@ Stage D shows the native controller handles them.
 | Event | sport_freeavoid | obstacles_avoid |
 |---|---|---|
 | any stop (watchdog, zero, lost caller, odometry stale) | StopMove | Move(0,0,0), StopMove |
-| e-stop, remote stick override, Sit | StopMove | Move(0,0,0), StopMove, **UseRemoteCommandFromApi(false)** |
+| e-stop, remote stick override, Sit, motion mode lost | StopMove | Move(0,0,0), StopMove, **UseRemoteCommandFromApi(false)** |
 | shutdown (SIGINT/SIGTERM/SIGHUP, exception) | StopMove, FreeAvoid(false), StopMove | Move(0,0,0), StopMove, release API control, SwitchSet(initial), StopMove |
 
-Stops never wait for replies. The ordering is a design choice; Stage B verifies
-it on the robot.
+Stops never wait for replies. Any enable request that was published counts as
+possibly applied: a lost or late reply still gets its release (API control) or
+restore (switch, FreeAvoid) at e-stop and shutdown. The ordering is a design
+choice; Stage B verifies it on the robot.
+
+Known limit: after an e-stop release or a Stand, the bridge re-enables
+avoidance on its own and (obstacles_avoid) takes API control again while idle.
+Stage B `remote-check` must show the stick override still arrives before that
+backend is used.
 
 ### Caller tracking (reused)
 
@@ -129,16 +136,22 @@ exist but refuse to load without their flags.
 On each fresh visual fix with a real range, the caller's position is stored in
 the odometry frame (`caller_estimate.py`, explicit math, no TF). While the
 camera is fresh but the caller is hidden, the robot keeps steering on the
-predicted bearing at reduced speed. With the defaults the prediction lasts at
-most about 1.2 s (uncertainty grows 0.8 m/s from 0.25 m, refused past 1.2 m,
+predicted bearing, slowing from 0.6 toward the 0.5 m/s gait floor (the mcf
+trot is only clean at 0.5 or more, so there is no creeping). With the defaults
+the prediction lasts at most about 1.2 s (uncertainty grows 0.8 m/s from 0.25 m, refused past 1.2 m,
 TTL 1.5 s). Then it stops and reacquires, with the perception gate centered
 on the predicted bearing. Rules:
 
 * the camera is authoritative; a stale camera stops at once (no prediction);
 * a prediction never arrives: arrival needs a fresh frame;
-* a person who would put the caller more than 1.2 m from the last fix (no
-  growth with time) is rejected as someone else, so the robot stops and
-  reports `caller_lost` instead of adopting a new target.
+* after the approach starts, a person who would put the caller more than
+  1.2 m from the last fix (no growth with time) is rejected as someone else,
+  so the robot stops and reports `caller_lost` instead of adopting a new
+  target. The fix is remembered for `any_identity_memory_s` (15 s), which must
+  outlast the 10 s reacquire window (validated at startup). With stale
+  odometry nobody can be checked, so detections are rejected. A detection
+  with no range at all cannot be placed and is not rejected (the perception
+  node normally supplies a LiDAR or pinhole range).
 
 ### Arrival and final facing
 

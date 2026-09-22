@@ -371,7 +371,8 @@ def test_odometry_jump_stops():
 
 
 def test_trial_timeout():
-    sim = Sim(World(0.0, 3.0), any_trial_timeout_s=5.0, search_timeout_s=30.0)
+    sim = Sim(World(0.0, 3.0), any_trial_timeout_s=5.0, search_timeout_s=30.0,
+              any_identity_memory_s=30.0)
     sim.wake()
     sim.run(6.0, person=lambda s: empty())
     assert sim.last_summary()['stop_reason'] == 'trial_timeout'
@@ -505,3 +506,66 @@ def test_legacy_fsm_still_sits_after_its_final_align_timeout():
             fsm.on_person(obs(bearing=0.4, distance=0.7, bbox=0.8), t)
         sits += int(fsm.tick(t).sit)
     assert sits == 1
+
+
+# -- review 2026-09-21 --
+
+def test_identity_memory_must_outlast_the_reacquire_window():
+    with pytest.raises(ValueError):
+        AnyFsmConfig(any_identity_memory_s=5.0, search_timeout_s=10.0).validate()
+
+
+def test_a_stranger_after_a_long_occlusion_is_still_rejected():
+    sim = Sim(World(0.0, 3.5), search_timeout_s=10.0)
+    sim.wake()
+    sim.run(2.5)
+    sim.run(6.0, person=lambda s: empty())                   # hidden 6 s (> the old 5 s memory)
+    impostor = lambda s: obs(bearing=0.0, distance=s.world.distance() + 2.5, bbox=0.46)
+    sim.run(2.0, person=impostor)
+    assert sim.fsm.state == State.ACQUIRE_PERSON and sim.cmd == (0.0, 0.0, 0.0)
+    assert sim.fsm._trial.identity_rejections > 0
+    sim.run(4.0, person=impostor)
+    assert sim.last_summary()['stop_reason'] == 'caller_lost' and sim.sits == 0
+
+
+def test_detections_are_rejected_when_odometry_cannot_check_identity():
+    sim = Sim(World(0.0, 3.5))
+    sim.wake()
+    sim.run(2.5)
+    sim.run(2.5, person=lambda s: empty())              # lost: stopped in ACQUIRE_PERSON
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    sim.odom_ok = False
+    sim.run(1.0, person=lambda s: empty())              # odometry now stale
+    mark = len(sim.velocities)
+    sim.run(2.0)                                        # the caller is visible again
+    assert sim.fsm._trial.identity_rejections > 0
+    assert sim.fsm.state == State.ACQUIRE_PERSON
+    assert all(v[1:] == (0.0, 0.0, 0.0) for v in sim.velocities[mark:])
+
+
+def _shipped_config(**overrides):
+    import pathlib
+    import yaml
+    cfg = yaml.safe_load((pathlib.Path(__file__).resolve().parents[2] / 'come_here_bringup'
+                          / 'config' / 'come_here_any.yaml').read_text())
+    params = cfg['behavior_node']['ros__parameters']
+    fields = {f for f in AnyFsmConfig.__dataclass_fields__}
+    values = {k: v for k, v in params.items() if k in fields}
+    values.update(skip_turn_to_sound=True, wake_speak_text='', speak_text='',
+                  acquired_speak_text='', relisten_speak_text='')
+    values.update(overrides)
+    return values
+
+
+def test_occlusion_keeps_walking_forward_with_the_shipped_config():
+    world = World(0.0, 3.5)
+    sim = Sim(world)
+    sim.fsm = ComeHereAnyFsm(AnyFsmConfig(**_shipped_config(align_by_rotate=False)))
+    sim.wake()
+    sim.run(3.0)
+    assert sim.fsm.state == State.WALK
+    t0 = sim.t
+    sim.run(1.0, person=_occluded_between(t0, t0 + 0.8))
+    during = [v for v in sim.velocities if t0 + 0.35 <= v[0] <= t0 + 0.8]
+    assert any(v[1] >= 0.5 for v in during), f'no forward motion while predicting: {during}'
+    assert sim.fsm._trial.caller_prediction_used_s > 0.0

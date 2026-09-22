@@ -159,7 +159,7 @@ behavior_node:
     any_prediction_max_sigma_m: 1.2
     any_camera_max_frame_age_s: 1.0
     any_identity_max_jump_m: 1.2     # reacquired person must be near the tracked caller
-    any_identity_memory_s: 5.0
+    any_identity_memory_s: 15.0      # >= search_timeout_s (validated): a long reacquire never adopts a stranger
     # Bounds
     any_odom_max_age_s: 0.5
     any_odom_max_step_m: 0.3

@@ -172,23 +172,25 @@ class NativeAvoidBridgeNode(Go2BridgeNode):
         self._log_backend()
 
     def _publish_move(self, vx: float, yaw_rate: float, vy: float = 0.0) -> None:
-        calls = self._backend.move(vx, vy, yaw_rate)
-        if not calls:
-            self._publish_stop()
-            return
-        self._send(calls)
+        # Decide, publish and update the zero flag atomically (as the legacy bridge
+        # does under its one lock): a stop racing the rotate worker must see this Move.
         with self._flag_lock:
-            self._last_was_zero = False
+            calls = self._backend.move(vx, vy, yaw_rate)
+            if calls:
+                self._send(calls)
+                self._last_was_zero = False
+                return
+        self._publish_stop()
 
     def _publish_stop(self, force: bool = False) -> None:
         with self._flag_lock:
             if not (force or not self._last_was_zero):
                 return
+            # After the shutdown release only the known-good Sport StopMove is sent.
+            calls = self._backend.stop_calls() if not self._released else [
+                c for c in self._backend.stop_calls() if c.service == SPORT]
+            self._send(calls)
             self._last_was_zero = True
-        # After the shutdown release only the known-good Sport StopMove is sent.
-        calls = self._backend.stop_calls() if not self._released else [
-            c for c in self._backend.stop_calls() if c.service == SPORT]
-        self._send(calls)
 
     def _apply(self, decision, source: str) -> None:
         if decision.action == MOVE:
@@ -269,6 +271,10 @@ class NativeAvoidBridgeNode(Go2BridgeNode):
                 f'NATIVE AVOID FAILED ({self._backend.status().failure}): motion blocked until '
                 'the node restarts; Come Here ANY does not fall back to legacy walking')
             return
+        if (self._required_mode and not self._mode_verified
+                and self._backend.state in ('enabling', 'enabled')):
+            self._suspend('motion mode no longer verified')
+            return
         if self._backend.state == 'disabled' and self._enable_allowed():
             self._pump(self._backend.begin_enable(now), now)
 
@@ -305,7 +311,9 @@ class NativeAvoidBridgeNode(Go2BridgeNode):
         super()._sit_cb(msg)
 
     def _enable_on_sit_allowed(self) -> bool:
-        return self._enable_posture and not self._gate.estopped
+        # Mirror the legacy _posture_allowed: a Sit that will be dropped must not
+        # leave the posture hold set.
+        return self._enable_posture and not self._gate.estopped and not self._gate.inhibited
 
     def _stand_cb(self, msg) -> None:
         super()._stand_cb(msg)

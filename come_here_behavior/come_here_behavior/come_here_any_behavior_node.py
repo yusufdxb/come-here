@@ -21,7 +21,7 @@ import math
 
 from nav_msgs.msg import Odometry
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 
 from come_here_behavior.behavior_node import BehaviorNode
 from come_here_behavior.come_here_any_controller import AnyFsmConfig, ComeHereAnyFsm
@@ -74,6 +74,12 @@ class ComeHereAnyBehaviorNode(BehaviorNode):
         super()._wake_cb(msg)
         if started and self._fsm.trial_active:
             self._bridge_status_at_start = dict(self._bridge_status)
+
+    def _stop_motion(self) -> None:
+        """Fallback zero in the ANY format (a 2-element zero is malformed for the ANY gate)."""
+        msg = Float64MultiArray()
+        msg.data = [0.0, 0.0, 0.0]
+        self._velocity_pub.publish(msg)
 
     def _apply(self, cmds) -> None:
         if cmds.trial_summary is not None:

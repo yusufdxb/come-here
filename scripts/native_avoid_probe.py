@@ -95,6 +95,22 @@ def speed_stats(samples, t0, t1):
             'mean_speed': round(sum(speeds) / len(speeds), 3), 'samples': len(speeds)}
 
 
+def oa_not_ready(switch_verify, api_control):
+    """Why an obstacles_avoid motion test must not run, or None.
+
+    Both arguments are (code, data) replies. Avoidance must read back ON and API
+    control must be granted, or the run would not be a native-avoidance run."""
+    try:
+        switch_on = switch_verify[0] == 0 and json.loads(switch_verify[1]).get('enable') is True
+    except (TypeError, ValueError, AttributeError):
+        switch_on = False
+    if not switch_on:
+        return f'obstacles_avoid switch not verified on ({switch_verify})'
+    if api_control[0] != 0:
+        return f'API control not granted ({api_control})'
+    return None
+
+
 def yaw_from_quaternion(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
@@ -353,6 +369,10 @@ def cmd_move(p, args, rec):
                                     {'is_remote_commands_from_api': True}, label='take')
     if rec['enable'][0] != 0:
         raise SystemExit(f'refused: enable failed {rec["enable"]}')
+    if backend == 'oa':
+        problem = oa_not_ready(rec['switch_verify'], rec['api_control'])
+        if problem:
+            raise SystemExit(f'refused: {problem}')
     p.spin(0.5)
     start_pose = p.pose[1:]
     t0 = time.monotonic()

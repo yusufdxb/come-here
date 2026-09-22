@@ -420,3 +420,39 @@ def test_status_reports_the_native_state():
 def test_invalid_backend_refuses_to_start():
     with pytest.raises(ValueError):
         make(native_avoid_backend='custom_planner')
+
+
+# -- review 2026-09-21 --
+
+def test_motion_mode_loss_suspends_and_releases_api_control():
+    n = make(native_avoid_backend='obstacles_avoid', require_motion_mode='mcf')
+    n._mode_pub = FakePub()
+    r = Response()
+    r.header.identity.api_id = 1001
+    r.header.status.code = 0
+    r.data = json.dumps({'form': '0', 'name': 'mcf'})
+    n._mode_response_cb(r)
+    n._native_tick()
+    assert n._backend.enabled and n._backend.api_control_taken
+    r.data = json.dumps({'form': '0', 'name': 'ai'})
+    n._mode_response_cb(r)
+    n._native_tick()
+    assert n._backend.state == 'disabled' and not n._backend.api_control_taken
+    n.destroy_node()
+
+
+def test_sit_while_inhibited_does_not_leave_a_posture_hold():
+    n = make(dry_run=False)            # live, not cleared: gate inhibited
+    n._sit_cb(flag(True))
+    assert n._posture_hold is False
+    n.destroy_node()
+
+
+def test_rotate_worker_move_is_seen_by_a_following_plain_stop():
+    n = make()
+    enable_dry(n)
+    n._publish_move(0.0, 0.8)           # rotate worker
+    mark = len(n._sport_pub.msgs)
+    n._publish_stop()                   # e.g. a zero cmd_velocity preempting the turn
+    assert [m.header.identity.api_id for m in n._sport_pub.msgs[mark:]] == [1003]
+    n.destroy_node()
