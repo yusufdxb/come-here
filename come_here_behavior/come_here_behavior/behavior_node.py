@@ -6,7 +6,7 @@ timestamps, publishes the commands it returns, and records one JSON line per
 trial as evidence.
 
 Subscribes:
-  /come_here/wake_phrase        (std_msgs/String)
+  /come_here/wake_phrase        (std_msgs/String) not subscribed when enable_skill_api is true
   /come_here/wake_detail        (std_msgs/String) JSON from audio_node: confidence, latency
   /come_here/person_detection   (std_msgs/Float64MultiArray)
                                 [bearing, distance, confidence, detected,
@@ -49,6 +49,7 @@ from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 
 from come_here_behavior.come_here_fsm import (
     MOTION_STATES,
+    SKILL_API_VERSION,
     ComeHereFsm,
     FsmConfig,
     PersonObservation,
@@ -128,7 +129,10 @@ class BehaviorNode(Node):
                            durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # -- Subscribers --
-        self.create_subscription(String, '/come_here/wake_phrase', self._wake_cb, 10)
+        if not self._skill_api:
+            # With the skill interface a supervisor owns the robot: a wake phrase would
+            # start the whole baseline sequence, sit included, outside its control.
+            self.create_subscription(String, '/come_here/wake_phrase', self._wake_cb, 10)
         self.create_subscription(String, '/come_here/wake_detail', self._wake_detail_cb, 10)
         self.create_subscription(
             Float64MultiArray, '/come_here/person_detection', self._person_cb, 10
@@ -156,7 +160,8 @@ class BehaviorNode(Node):
             f'max_walk={config.max_walk_distance_m} m '
             f'git={self._git["commit"][:10]} '
             f'trial_log={self._log_writer.path if self._log_writer else "off"}'
-            + (' skill_api=ON' if self._skill_api else '')
+            + (f' skill_api=ON(v{SKILL_API_VERSION}, wake_phrase ignored)'
+               if self._skill_api else '')
         )
 
     # -- inputs --
@@ -188,7 +193,8 @@ class BehaviorNode(Node):
             req = None                         # the FSM rejects it as malformed
         started = not self._fsm.trial_active
         cmds = self._fsm.on_skill_request(req, now)
-        if started and self._fsm.trial_active:
+        # A no-motion skill can open and close its trial in this one call.
+        if started and (self._fsm.trial_active or cmds.trial_summary is not None):
             self._trial_index += 1
             self._pending_detail = None
             self._trial_meta = {

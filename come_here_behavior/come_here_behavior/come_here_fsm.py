@@ -64,16 +64,33 @@ ARRIVAL_SIT_AND_IDENTIFY = 'sit_and_identify'
 ARRIVED_REASONS = ('arrived_bbox', 'arrived_distance', 'arrived_walk_budget')
 
 # Stepwise skill interface (behavior_node parameter enable_skill_api; off by default).
-SKILL_API_VERSION = 1
-SKILL_TURN = 'turn_to_voice'
-SKILL_APPROACH = 'approach_person'
+# Each skill is one action whose result a supervisor reads before choosing the next;
+# a step that needs an earlier one names that step's request_id (a handoff token).
+SKILL_API_VERSION = 2
+SKILL_LOCALIZE = 'localize_caller'       # no motion: a fresh, confident voice bearing
+SKILL_ORIENT = 'orient_to_caller'        # one turn by a localization's bearing
+SKILL_ACQUIRE = 'acquire_caller'         # no motion: the caller in the camera, gated
+SKILL_APPROACH = 'approach_caller'       # walk to an acquired caller; ends STANDING
+SKILL_SIT = 'sit'                        # sit after an arrival, nothing else
+SKILL_ASK_AGAIN = 'ask_caller_again'     # no motion: ask the caller to speak again
 SKILL_CANCEL = 'cancel'
+SKILLS = (SKILL_LOCALIZE, SKILL_ORIENT, SKILL_ACQUIRE, SKILL_APPROACH, SKILL_SIT,
+          SKILL_ASK_AGAIN, SKILL_CANCEL)
+SKILL_ARGS = {SKILL_LOCALIZE: set(), SKILL_ORIENT: {'localization'},
+              SKILL_ACQUIRE: set(), SKILL_APPROACH: {'acquisition'},
+              SKILL_SIT: {'arrival'}, SKILL_ASK_AGAIN: set(), SKILL_CANCEL: {'request_id'}}
+SKILL_MOTION = (SKILL_ORIENT, SKILL_APPROACH, SKILL_SIT)
 SKILL_TURN_OK = ('turn_not_needed', 'reached', 'overshoot', 'timed')
 # Sit sequence phases where a cancel cannot stop anything: the robot is sitting or
 # changing posture, and the operator reset owns the stand-up.
 SKILL_POSTURE_PHASES = ('sit', 'look', 'speak_hold', 'done', 'stand')
 MAX_GOAL_ID_LEN = 64
 GOAL_ID_MEMORY = 1024
+# Handoff lifetimes: an acquisition holds while the caller stays continuously in view
+# (person_stale_timeout_s) and at most this long; an arrival while the robot has not
+# moved since.
+SKILL_ACQUISITION_MAX_S = 15.0
+SKILL_ARRIVAL_VALID_S = 30.0
 
 # Tolerance for duration comparisons, so a 0.3 s debounce on a 10 Hz tick is
 # exactly three ticks despite float rounding.
@@ -96,6 +113,11 @@ SIT_PHASE_NAMES = {
     'final_align': 'ALIGN_TO_CALLER', 'settle': 'ARRIVED', 'sit': 'SIT',
     'look': 'LOOK_AT_FACE', 'speak_hold': 'DONE', 'done': 'DONE', 'stand': 'STAND',
 }
+
+
+def _valid_id(value) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= MAX_GOAL_ID_LEN
+            and value.isprintable())
 
 
 def wrap_pi(angle: float) -> float:
@@ -319,6 +341,7 @@ class TrialStats:
     relistens: int = 0
     goal_id: Optional[str] = None           # skill interface only
     skill: Optional[str] = None
+    request_id: Optional[str] = None
 
     def summary(self, end_s: float) -> dict:
         def rel(t):
@@ -375,6 +398,7 @@ class TrialStats:
         if self.goal_id is not None:          # baseline trials keep the exact key set
             out['goal_id'] = self.goal_id
             out['skill'] = self.skill
+            out['request_id'] = self.request_id
         return out
 
 
@@ -426,9 +450,25 @@ class ComeHereFsm:
         # Skill interface state; None / False on every baseline path.
         self._skill: Optional[str] = None
         self._goal_id: Optional[str] = None
-        self._skill_arrival: Optional[str] = None
+        self._request_id: Optional[str] = None
         self._turn_gate_valid = False
-        self._seen_goal_ids: List[str] = []
+        self._seen_request_ids: List[str] = []
+        self._retired_goal_ids: List[str] = []
+        self._session_goal: Optional[str] = None
+        self._session_seq = 0
+        # Handoff tokens: {'id', 'goal', 't', ...} from the last successful step.
+        self._localization: Optional[dict] = None
+        self._acquisition: Optional[dict] = None
+        self._arrival: Optional[dict] = None
+        self._skill_turn_rad = 0.0
+        self._last_motion_s: Optional[float] = None   # last nonzero command or turn end
+        self._bearing_floor_s: Optional[float] = None  # a bearing must be newer than this
+        self._lost_bearing: Optional[Tuple[float, float]] = None  # (bearing, t) at track loss
+        self._skill_seated = False    # a skill sit was sent; cleared by the operator reset
+        self._skill_data: dict = {}
+        self._pending_localization: dict = {}
+        self._skill_turn_conf = 0.0
+        self._asked_s: Optional[float] = None
 
     # -- read-only state --
 
@@ -483,6 +523,19 @@ class ComeHereFsm:
         if self._skill is not None:
             status['goal_id'] = self._goal_id
             status['skill'] = self._skill
+            status['request_id'] = self._request_id
+        if self._session_goal is not None:
+            status['skill_session'] = {
+                'goal_id': self._session_goal, 'seq': self._session_seq,
+                'localization': None if self._localization is None
+                else self._localization['id'],
+                'acquisition': None if self._acquisition is None
+                else self._acquisition['id'],
+                'arrival': None if self._arrival is None else self._arrival['id'],
+                'seated': self._skill_seated,
+                'last_motion_age_s': None if self._last_motion_s is None
+                else round(now - self._last_motion_s, 2),
+            }
         return status
 
     def status(self) -> dict:
@@ -505,6 +558,9 @@ class ComeHereFsm:
             cmds.log.append(f'Wake "{phrase}" ignored: e-stop engaged')
             return cmds
         if self._state != State.IDLE:
+            return cmds
+        if self._session_goal is not None:
+            cmds.log.append(f'Wake "{phrase}" ignored: the skill interface owns this robot')
             return cmds
         cfg = self.config
         self._trial = TrialStats(wake_time_s=now, wake_phrase=phrase)
@@ -638,9 +694,14 @@ class ComeHereFsm:
         cmds = Commands()
         if self._state == State.SIT_AND_IDENTIFY and self._sit_phase == 'done':
             cmds.stand = True
+            self._skill_seated = False
             self._sit_phase = 'stand'
             self._sit_step_since = now
             cmds.log.append('Operator reset: standing up')
+        elif self._skill_seated and self._state == State.IDLE:
+            # E-stopped while seated: the operator stood the robot up by hand.
+            self._skill_seated = False
+            cmds.log.append('Operator reset: skill sit cleared (robot stood up by the operator)')
         else:
             cmds.log.append(f'Operator reset ignored in {self.display_state}')
         return cmds
@@ -651,78 +712,145 @@ class ComeHereFsm:
     def active_goal_id(self) -> Optional[str]:
         return self._goal_id if self._skill is not None else None
 
+    @property
+    def active_request_id(self) -> Optional[str]:
+        return self._request_id if self._skill is not None else None
+
     def on_skill_request(self, req, now: float) -> Commands:
         """One request from the skill interface (already JSON-decoded).
 
-        Every request gets exactly one result. A rejection never touches motion: it
-        returns Commands with no velocity, rotation, sit or stand. Accepted requests
-        run the existing trial code and end through the existing stop paths.
+        Every request gets exactly one result naming its goal_id and request_id. A
+        rejection never touches motion: it returns Commands with no velocity, rotation,
+        sit or stand. Accepted requests run the existing trial code and end through the
+        existing stop paths.
         """
         cmds = Commands()
-        goal_id = req.get('goal_id') if isinstance(req, dict) else None
-        skill = req.get('skill') if isinstance(req, dict) else None
-        if not isinstance(goal_id, str):
-            goal_id = None
-        if (not isinstance(req, dict) or req.get('v') != SKILL_API_VERSION
-                or goal_id is None or not 1 <= len(goal_id) <= MAX_GOAL_ID_LEN
-                or not goal_id.isprintable()
-                or not isinstance(req.get('args', {}), dict)):
-            return self._skill_reject(cmds, goal_id, skill, 'malformed')
-        if skill not in (SKILL_TURN, SKILL_APPROACH, SKILL_CANCEL):
-            return self._skill_reject(cmds, goal_id, skill, 'unknown_skill')
-        args = req.get('args', {})
-        if goal_id in self._seen_goal_ids:
-            return self._skill_reject(cmds, goal_id, skill, 'duplicate_goal_id')
-        self._remember_goal_id(goal_id)
+        if not isinstance(req, dict):
+            return self._skill_reject(cmds, req, 'malformed')
+        goal_id, request_id = req.get('goal_id'), req.get('request_id')
+        skill, seq, args = req.get('skill'), req.get('seq'), req.get('args', {})
+        if (req.get('v') != SKILL_API_VERSION
+                or not _valid_id(goal_id) or not _valid_id(request_id)
+                or isinstance(seq, bool) or not isinstance(seq, int) or seq < 1
+                or not isinstance(args, dict)):
+            return self._skill_reject(cmds, req, 'malformed')
+        if skill not in SKILLS:
+            return self._skill_reject(cmds, req, 'unknown_skill')
+        if request_id in self._seen_request_ids:
+            return self._skill_reject(cmds, req, 'duplicate_request_id')
+        self._remember(self._seen_request_ids, request_id)
+        if goal_id in self._retired_goal_ids:
+            return self._skill_reject(cmds, req, 'stale_goal')
+        if set(args) != SKILL_ARGS[skill] or not all(_valid_id(v) for v in args.values()):
+            return self._skill_reject(cmds, req, 'bad_args')
+
+        if goal_id != self._session_goal:
+            if skill == SKILL_CANCEL or self._skill is not None:
+                return self._skill_reject(
+                    cmds, req, 'not_active' if skill == SKILL_CANCEL else 'not_idle')
+            # A new goal: everything the previous goal handed over is void.
+            if self._session_goal is not None:
+                self._remember(self._retired_goal_ids, self._session_goal)
+            self._session_goal = goal_id
+            self._session_seq = 0
+            self._clear_handoffs()
+        if seq <= self._session_seq:
+            return self._skill_reject(cmds, req, 'out_of_order')
+        self._session_seq = seq
 
         if skill == SKILL_CANCEL:
-            target = args.get('goal_id')
-            if set(args) != {'goal_id'} or not isinstance(target, str):
-                return self._skill_reject(cmds, goal_id, skill, 'bad_args')
-            if self._skill is None or target != self._goal_id:
-                return self._skill_reject(cmds, goal_id, skill, 'not_active')
+            target = args['request_id']
+            if self._skill is None or target != self._request_id:
+                return self._skill_reject(cmds, req, 'not_active')
             if (self._state == State.SIT_AND_IDENTIFY
                     and self._sit_phase in SKILL_POSTURE_PHASES):
-                return self._skill_reject(cmds, goal_id, skill, 'posture_phase')
-            cmds.log.append(f'Skill {self._skill} [{target}] cancelled by [{goal_id}]')
+                return self._skill_reject(cmds, req, 'posture_phase')
+            cmds.log.append(f'Skill {self._skill} [{target}] cancelled by [{request_id}]')
             self._abort(now, cmds, 'cancelled')
-            cmds.skill_results[-1]['data']['cancel_goal_id'] = goal_id
-            cmds.skill_results.append({'v': SKILL_API_VERSION, 'goal_id': goal_id,
-                                       'skill': SKILL_CANCEL, 'status': 'succeeded',
-                                       'reason': 'cancelled', 'data': {'goal_id': target}})
+            cmds.skill_results[-1]['data']['cancel_request_id'] = request_id
+            cmds.skill_results.append(self._result(
+                goal_id, request_id, SKILL_CANCEL, 'succeeded', 'cancelled',
+                {'request_id': target}))
             return cmds
 
-        if skill == SKILL_TURN and args:
-            return self._skill_reject(cmds, goal_id, skill, 'bad_args')
-        if skill == SKILL_APPROACH and (
-                set(args) != {'arrival'}
-                or args['arrival'] not in (ARRIVAL_STOP, ARRIVAL_SIT_AND_IDENTIFY)):
-            return self._skill_reject(cmds, goal_id, skill, 'bad_args')
         if self._estopped:
-            return self._skill_reject(cmds, goal_id, skill, 'estopped')
+            return self._skill_reject(cmds, req, 'estopped')
         if self._state != State.IDLE or self._trial is not None:
-            return self._skill_reject(cmds, goal_id, skill, 'not_idle')
-        self._start_skill_trial(skill, goal_id, args.get('arrival'), now, cmds)
+            return self._skill_reject(cmds, req, 'not_idle')
+        if self._skill_seated and skill in SKILL_MOTION:
+            return self._skill_reject(cmds, req, 'seated')
+        why = self._handoff_problem(skill, args, now)
+        if why is not None:
+            return self._skill_reject(cmds, req, why)
+        self._start_skill_trial(skill, goal_id, request_id, args, now, cmds)
         return cmds
 
-    def _skill_reject(self, cmds: Commands, goal_id, skill, reason: str) -> Commands:
-        cmds.skill_results.append({'v': SKILL_API_VERSION, 'goal_id': goal_id,
-                                   'skill': skill if isinstance(skill, str) else None,
-                                   'status': 'rejected', 'reason': reason, 'data': {}})
-        cmds.log.append(f'Skill request [{goal_id}] {skill} rejected: {reason}')
+    def _handoff_problem(self, skill: str, args: dict, now: float) -> Optional[str]:
+        """Why the earlier step this request depends on cannot be used, or None."""
+        cfg = self.config
+        if skill == SKILL_ORIENT:
+            loc = self._localization
+            if loc is None or loc['id'] != args['localization']:
+                return 'no_localization'
+            if now - loc['measured_s'] > cfg.direction_max_age_s:
+                return 'stale_localization'
+            if self._moved_since(loc['measured_s']):
+                return 'moved_since_localization'
+        elif skill == SKILL_APPROACH:
+            acq = self._acquisition
+            if acq is None or acq['id'] != args['acquisition']:
+                return 'no_acquisition'
+            if now - acq['t'] > SKILL_ACQUISITION_MAX_S:
+                return 'stale_acquisition'
+            if self._moved_since(acq['t']):
+                return 'moved_since_acquisition'
+            if not self._person_fresh(now):
+                return 'caller_not_in_view'
+        elif skill == SKILL_SIT:
+            arr = self._arrival
+            if arr is None or arr['id'] != args['arrival']:
+                return 'no_arrival'
+            if now - arr['t'] > SKILL_ARRIVAL_VALID_S:
+                return 'stale_arrival'
+            if self._moved_since(arr['t']):
+                return 'moved_since_arrival'
+        return None
+
+    def _moved_since(self, t: float) -> bool:
+        return self._last_motion_s is not None and self._last_motion_s >= t
+
+    def _clear_handoffs(self) -> None:
+        self._localization = None
+        self._acquisition = None
+        self._arrival = None
+        self._lost_bearing = None
+        self._turn_gate_valid = False
+
+    def _result(self, goal_id, request_id, skill, status, reason, data) -> dict:
+        return {'v': SKILL_API_VERSION, 'goal_id': goal_id, 'request_id': request_id,
+                'skill': skill, 'status': status, 'reason': reason, 'data': data}
+
+    def _skill_reject(self, cmds: Commands, req, reason: str) -> Commands:
+        req = req if isinstance(req, dict) else {}
+        ids = [v if _valid_id(v) else None for v in (req.get('goal_id'), req.get('request_id'))]
+        skill = req.get('skill') if isinstance(req.get('skill'), str) else None
+        cmds.skill_results.append(self._result(ids[0], ids[1], skill, 'rejected', reason, {}))
+        cmds.log.append(f'Skill request [{ids[1]}] {skill} rejected: {reason}')
         return cmds
 
-    def _remember_goal_id(self, goal_id: str) -> None:
-        self._seen_goal_ids.append(goal_id)
-        if len(self._seen_goal_ids) > GOAL_ID_MEMORY:
-            del self._seen_goal_ids[0]
+    @staticmethod
+    def _remember(memory: List[str], value: str) -> None:
+        memory.append(value)
+        if len(memory) > GOAL_ID_MEMORY:
+            del memory[0]
 
-    def _start_skill_trial(self, skill: str, goal_id: str, arrival: Optional[str],
+    def _start_skill_trial(self, skill: str, goal_id: str, request_id: str, args: dict,
                            now: float, cmds: Commands) -> None:
         # Same reset as on_wake (kept as a copy so the baseline entry is untouched).
         self._trial = TrialStats(wake_time_s=now, wake_phrase=f'skill:{skill}',
-                                 goal_id=goal_id, skill=skill)
-        self._reset_person_tracking()
+                                 goal_id=goal_id, skill=skill, request_id=request_id)
+        if skill != SKILL_APPROACH:                # the approach keeps the acquired track
+            self._reset_person_tracking()
         self._approach_start = None
         self._walk_distance_m = 0.0
         self._wake_s = None                   # no wake phrase is spoken, no hold
@@ -738,62 +866,129 @@ class ComeHereFsm:
         self._relisten_s = None
         self._skill = skill
         self._goal_id = goal_id
-        self._skill_arrival = arrival
+        self._request_id = request_id
+        self._skill_data = {}
         # An explicit stop first, as on a wake: re-arms the bridge after an e-stop release.
         self._command(cmds, now, 0.0, 0.0)
-        cmds.log.append(f'Skill request [{goal_id}] {skill} accepted'
-                        + ('' if arrival is None else f' (arrival {arrival})'))
-        if skill == SKILL_TURN:
-            self._gate_center = 0.0
-            self._turn_gate_valid = False
+        cmds.log.append(f'Skill request [{request_id}] {skill} accepted (goal {goal_id})')
+        keep_turn_gate = self._turn_gate_valid
+        self._turn_gate_valid = False
+        if skill == SKILL_LOCALIZE:
+            self._localization = None
             self._enter(State.LISTENING, now, cmds, f'skill {skill}')
-        else:
-            # The residual of an immediately preceding turn skill says where the caller
-            # should be in the camera; anything else starts centered.
-            self._gate_center = (self._gate_center if self._turn_gate_valid else 0.0)
-            self._turn_gate_valid = False
-            if self._trial is not None:
+        elif skill == SKILL_ORIENT:
+            loc, self._localization = self._localization, None     # used once
+            self._acquisition = self._arrival = None
+            self._skill_turn_rad = loc['az']
+            self._skill_turn_conf = loc['conf']
+            if abs(loc['az']) < self.config.turn_min_rad:
+                self._gate_center = loc['az']
                 self._trial.gate_center_rad = self._gate_center
+                self._skill_done(now, cmds, 'turn_not_needed')
+                return
+            if self.config.direction_speak_text:
+                cmds.say = self.config.direction_speak_text
+            self._enter(State.TURN_TO_SOUND, now, cmds, f'skill {skill}')
+        elif skill == SKILL_ACQUIRE:
+            self._acquisition = self._arrival = None
+            # Where the caller should be in the camera: the residual of an immediately
+            # preceding turn, else the bearing where a track was just lost, else ahead.
+            lost = self._lost_bearing
+            if keep_turn_gate:
+                center = self._gate_center
+            elif lost is not None and now - lost[1] <= self.config.search_timeout_s:
+                center = lost[0]
+            else:
+                center = 0.0
+            self._lost_bearing = None
+            self._gate_center = center
+            self._trial.gate_center_rad = center
             self._enter(State.ACQUIRE_PERSON, now, cmds, f'skill {skill}')
+        elif skill == SKILL_APPROACH:
+            acq, self._acquisition = self._acquisition, None       # used once
+            self._arrival = None
+            self._gate_center = acq['bearing'] if self._ema_bearing is None \
+                else self._ema_bearing
+            self._trial.gate_center_rad = self._gate_center
+            self._enter(State.ACQUIRE_PERSON, now, cmds, f'skill {skill}')
+        elif skill == SKILL_SIT:
+            self._arrival = None                                   # used once
+            self._enter(State.SIT_AND_IDENTIFY, now, cmds, f'skill {skill}')
+            self._face_received = False
+            self._set_sit_phase('settle', now)                     # no final align: no motion
+        elif skill == SKILL_ASK_AGAIN:
+            self._localization = None
+            # Only an utterance after this prompt may localize the caller.
+            self._bearing_floor_s = now
+            self._asked_s = now
+            cmds.say = self.config.relisten_speak_text or 'Please call me again.'
+            self._skill_done(now, cmds, 'asked', {'prompt': cmds.say})
 
-    def _skill_finish_result(self, summary: dict, reason: str) -> dict:
-        """Result for the active skill from its trial summary; clears the skill."""
-        skill, goal_id = self._skill, self._goal_id
+    def _skill_done(self, now: float, cmds: Commands, reason: str,
+                    data: Optional[dict] = None) -> None:
+        """A skill ends here, stopped: trial closed, result emitted."""
+        self._command(cmds, now, 0.0, 0.0)
+        if data:
+            self._skill_data.update(data)
+        if self._trial is not None:
+            self._trial.stop_reason = reason
+        self._finish(now, cmds, reason)
+
+    def _skill_finish_result(self, summary: dict, reason: str, now: float) -> dict:
+        """Result for the active skill from its trial summary; clears the skill and
+        records the handoff a later step may name."""
+        skill, goal_id, request_id = self._skill, self._goal_id, self._request_id
         stop = summary.get('stop_reason') or reason
+        data = dict(getattr(self, '_skill_data', {}) or {})
         if summary.get('estop') or reason in ('estop', 'cancelled') or stop in (
                 'estop', 'cancelled'):
-            # Cancelled even after an arrival: the requested arrival did not complete.
+            # Cancelled even after an arrival: the requested step did not complete.
             status = 'cancelled'
             stop = 'estop' if (summary.get('estop') or 'estop' in (reason, stop)) \
                 else 'cancelled'
-        elif skill == SKILL_TURN:
+        elif skill == SKILL_ORIENT:
             ok = stop == 'turn_not_needed' or (
                 stop == 'turn_complete'
                 and summary.get('turn_result_reason') in SKILL_TURN_OK)
             status = 'succeeded' if ok else 'failed'
-        else:
+        elif skill == SKILL_APPROACH:
+            # Same arrival rule as the baseline, walk budget included; the result says
+            # which one it was so a supervisor can weigh the evidence.
             status = 'succeeded' if summary.get('success') else 'failed'
-        if skill == SKILL_TURN:
-            data = {k: summary.get(k) for k in (
-                'turn_rad', 'turn_turned_rad', 'turn_result_reason', 'gate_center_rad',
-                'turn_confidence')}
-            data['turn_result_reason'] = (
-                'turn_not_needed' if stop == 'turn_not_needed'
-                else data['turn_result_reason'])
         else:
-            data = {k: summary.get(k) for k in (
-                'final_distance_m', 'final_bearing_rad', 'final_bbox_h_frac',
-                'commanded_walk_distance_m', 'align_phases', 'walk_phases', 'lost_events',
-                'reacquisitions', 'face_present')}
-            data['arrival'] = self._skill_arrival
+            ok_reason = {SKILL_LOCALIZE: 'localized', SKILL_ACQUIRE: 'acquired',
+                         SKILL_SIT: 'sit_commanded', SKILL_ASK_AGAIN: 'asked'}[skill]
+            status = 'succeeded' if stop == ok_reason else 'failed'
+        if skill == SKILL_ORIENT:
+            data.update({k: summary.get(k) for k in (
+                'turn_rad', 'turn_turned_rad', 'turn_result_reason', 'gate_center_rad',
+                'turn_confidence')})
+            if stop == 'turn_not_needed':
+                data['turn_result_reason'] = 'turn_not_needed'
+        elif skill == SKILL_APPROACH:
+            data.update({k: summary.get(k) for k in (
+                'final_distance_m', 'final_distance_source', 'final_bearing_rad',
+                'final_bbox_h_frac', 'commanded_walk_distance_m', 'align_phases',
+                'walk_phases', 'lost_events', 'stale_events')})
             data['stop_reason'] = summary.get('stop_reason')
-            if self._skill_arrival == ARRIVAL_SIT_AND_IDENTIFY and status == 'succeeded':
-                data['posture'] = 'unverified'
+            data['proximity_evidence'] = stop in ('arrived_bbox', 'arrived_distance')
+            data['posture'] = 'standing' if status == 'succeeded' else 'unknown'
+        elif skill == SKILL_SIT:
+            data['posture'] = 'unverified'      # nothing here reads posture
+        if status == 'succeeded':
+            if skill == SKILL_LOCALIZE:
+                self._localization = dict(self._pending_localization, id=request_id)
+            elif skill == SKILL_ACQUIRE:
+                self._acquisition = {'id': request_id, 't': now,
+                                     'bearing': data['bearing_rad'],
+                                     'confidence': data['confidence']}
+            elif skill == SKILL_APPROACH:
+                self._arrival = {'id': request_id, 't': now}
         self._skill = None
         self._goal_id = None
-        self._skill_arrival = None
-        return {'v': SKILL_API_VERSION, 'goal_id': goal_id, 'skill': skill,
-                'status': status, 'reason': stop, 'data': data}
+        self._request_id = None
+        self._skill_data = {}
+        return self._result(goal_id, request_id, skill, status, stop, data)
 
     def on_estop(self, engaged: bool, now: float) -> Commands:
         cmds = Commands()
@@ -801,6 +996,8 @@ class ComeHereFsm:
             newly_engaged = not self._estopped
             self._estopped = True
             self._turn_gate_valid = False     # the robot may be moved by hand
+            if self._session_goal is not None:
+                self._clear_handoffs()
             self._command(cmds, now, 0.0, 0.0)
             if self._trial is not None:
                 if self._trial.stop_reason is None:
@@ -828,7 +1025,7 @@ class ComeHereFsm:
             cmds.trial_summary = self._trial.summary(now)
             self._trial = None
             if self._skill is not None:
-                result = self._skill_finish_result(cmds.trial_summary, 'shutdown')
+                result = self._skill_finish_result(cmds.trial_summary, 'shutdown', now)
                 result.update(status='failed', reason='shutdown')
                 cmds.skill_results.append(result)
         self._state = State.IDLE
@@ -839,6 +1036,13 @@ class ComeHereFsm:
         self._integrate_walk(now)
         state = self._state
         if state == State.IDLE:
+            acq = self._acquisition
+            if acq is not None:
+                if now - acq['t'] > SKILL_ACQUISITION_MAX_S or not self._person_fresh(now):
+                    self._acquisition = None      # the track broke: a new acquire is needed
+                elif self._ema_bearing is not None:
+                    # Keep perception on the acquired caller until the approach.
+                    cmds.gate = (self._ema_bearing, self.config.track_gate_half_rad)
             return cmds
         if state == State.LISTENING:
             self._tick_listening(now, cmds)
@@ -887,8 +1091,46 @@ class ComeHereFsm:
 
     # -- state handlers --
 
+    def _tick_localize(self, now: float, cmds: Commands) -> None:
+        """localize_caller: report a voice bearing; never turn.
+
+        Only a bearing measured after the robot last moved (a turn changes what every
+        older bearing means), after any ask_caller_again prompt, and within
+        direction_max_age_s counts.
+        """
+        cfg = self.config
+        floor = max((t for t in (self._bearing_floor_s, self._last_motion_s)
+                     if t is not None), default=None)
+        fresh = (self._last_dir_s is not None
+                 and now - self._last_dir_s <= cfg.direction_max_age_s
+                 and (floor is None or self._last_dir_s > floor))
+        data = {'bearing_rad': None, 'bearing_deg': None, 'confidence': None, 'age_s': None,
+                'threshold': cfg.direction_confidence_threshold}
+        if fresh:
+            data.update(bearing_rad=round(self._last_azimuth, 4),
+                        bearing_deg=round(math.degrees(self._last_azimuth), 1),
+                        confidence=round(self._last_dir_confidence, 3),
+                        age_s=round(now - self._last_dir_s, 3))
+        if fresh and self._last_dir_confidence >= cfg.direction_confidence_threshold:
+            self._pending_localization = {
+                'az': self._last_azimuth, 'conf': self._last_dir_confidence,
+                'measured_s': self._last_dir_s, 'goal': self._goal_id}
+            cmds.log.append(f'LOCALIZE: voice at {data["bearing_deg"]:+.0f} deg '
+                            f'(confidence {data["confidence"]:.2f}, age {data["age_s"]:.2f} s)')
+            self._asked_s = None
+            self._skill_done(now, cmds, 'localized', data)
+            return
+        # After a prompt the caller needs time to answer.
+        wait = cfg.relisten_timeout_s if self._asked_s is not None else cfg.listening_timeout_s
+        if now - self._state_since > wait:
+            self._asked_s = None
+            self._skill_done(now, cmds, 'low_confidence' if fresh else 'no_direction', data)
+
     def _tick_listening(self, now: float, cmds: Commands) -> None:
         cfg = self.config
+        if self._skill == SKILL_LOCALIZE:
+            self._tick_localize(now, cmds)
+            return
         if (self._wake_s is not None
                 and now - self._wake_s + _TIME_EPS < cfg.wake_speak_hold_s):
             return                                   # the wake phrase plays before any turn
@@ -909,9 +1151,6 @@ class ComeHereFsm:
                 self._gate_center = self._last_azimuth
                 if self._trial is not None:
                     self._trial.gate_center_rad = self._gate_center
-                if self._skill == SKILL_TURN:
-                    self._skill_turn_done(now, cmds, 'turn_not_needed')
-                    return
                 self._enter(State.ACQUIRE_PERSON, now, cmds,
                             f'sound ahead ({self._last_azimuth:+.2f} rad), no turn')
             else:
@@ -925,7 +1164,7 @@ class ComeHereFsm:
             why = ('no bearing for this utterance' if not fresh else
                    f'bearing {az_deg:+.0f} deg confidence {self._last_dir_confidence:.2f} '
                    f'< {cfg.direction_confidence_threshold}')
-            if cfg.require_direction or self._skill is not None:
+            if cfg.require_direction:
                 cmds.log.append(f'NOT WALKING: no confident voice direction ({why})')
                 self._abort(now, cmds, 'no_direction')
             else:
@@ -938,14 +1177,19 @@ class ComeHereFsm:
         if not self._turn_sent:
             self._turn_sent = True
             # The bearing can keep updating during the turn (built-in DOA streams);
-            # the result is matched against the angle actually commanded.
-            self._turn_target = self._last_azimuth
+            # the result is matched against the angle actually commanded. A skill
+            # turn uses the bearing of the localization it names, never a newer one.
+            orient = self._skill == SKILL_ORIENT and self._turn_purpose == 'doa'
+            target = self._skill_turn_rad if orient else self._last_azimuth
+            conf = self._skill_turn_conf if orient else self._last_dir_confidence
+            self._turn_target = target
             cmds.rotate_rad = self._turn_target
+            self._last_motion_s = now
             if trial is not None and self._turn_purpose == 'doa':
-                trial.turn_rad = self._last_azimuth
-                trial.turn_confidence = self._last_dir_confidence
-            cmds.log.append(f'Rotating toward sound: {self._last_azimuth:+.2f} rad '
-                            f'(confidence {self._last_dir_confidence:.2f}); waiting for the turn')
+                trial.turn_rad = target
+                trial.turn_confidence = conf
+            cmds.log.append(f'Rotating toward sound: {target:+.2f} rad '
+                            f'(confidence {conf:.2f}); waiting for the turn')
             return
         if self._turn_result is None:
             if now - self._state_since > cfg.turn_result_timeout_s:
@@ -953,6 +1197,7 @@ class ComeHereFsm:
                 self._abort(now, cmds, 'turn_no_result')
             return
         if now - self._turn_done_s + _TIME_EPS < cfg.turn_settle_s:
+            self._last_motion_s = now           # still settling from the turn
             return
         target, turned, reason = self._turn_result
         # Timed (no odometry) turns report no angle: assume the commanded turn.
@@ -966,8 +1211,8 @@ class ComeHereFsm:
             f'{self._turn_purpose.upper()}->turn: requested {math.degrees(target):+.0f} deg, turned '
             f'{"n/a" if turned is None else f"{math.degrees(turned):+.0f}"} deg ({reason}); '
             f'caller expected at {math.degrees(residual):+.0f} deg in the camera')
-        if self._skill == SKILL_TURN and self._turn_purpose == 'doa':
-            self._skill_turn_done(now, cmds, 'turn_complete')
+        if self._skill == SKILL_ORIENT and self._turn_purpose == 'doa':
+            self._skill_done(now, cmds, 'turn_complete')
             return
         self._reset_person_tracking()
         self._enter(State.ACQUIRE_PERSON, now, cmds, f'turn {reason}')
@@ -982,7 +1227,7 @@ class ComeHereFsm:
                     trial.acquired_s = now
                     trial.acquire_confidence = self._last_valid_obs.confidence
                     trial.acquire_bearing_rad = self._ema_bearing
-                    if cfg.acquired_speak_text:
+                    if cfg.acquired_speak_text and self._skill != SKILL_APPROACH:
                         cmds.say = cfg.acquired_speak_text
                     cmds.log.append(
                         f'Caller acquired at {math.degrees(self._ema_bearing):+.0f} deg '
@@ -990,6 +1235,9 @@ class ComeHereFsm:
                         f'confidence {self._last_valid_obs.confidence:.2f})')
                 else:
                     trial.reacquisitions += 1
+            if self._skill == SKILL_ACQUIRE:
+                self._skill_acquired(now, cmds)
+                return
             reason = self._close_enough_reason()
             if reason is not None:
                 self._arrive(now, cmds, reason)
@@ -1117,6 +1365,22 @@ class ComeHereFsm:
             cmds.sit = True
             cmds.log.append('SIT: StopMove sent, settled; sitting')
             self._set_sit_phase('sit', now)
+            if self._skill == SKILL_SIT:
+                self._skill_seated = True
+                self._last_motion_s = now
+        elif phase == 'sit' and elapsed >= cfg.sit_settle_s and self._skill == SKILL_SIT:
+            # The sit skill ends once Sit was sent and has had time to take effect;
+            # whether the robot is seated is for a posture observer to prove.
+            if cfg.speak_text:
+                cmds.say = cfg.speak_text
+            if self._trial is not None:
+                self._trial.stop_reason = 'sit_commanded'
+                cmds.trial_summary = self._trial.summary(now)
+                self._trial = None
+                cmds.skill_results.append(self._skill_finish_result(
+                    cmds.trial_summary, 'sit_commanded', now))
+            cmds.log.append('DONE: sit sent; operator reset stands the robot up')
+            self._set_sit_phase('done', now)
         elif phase == 'sit' and elapsed >= cfg.sit_settle_s:
             cmds.face_request = True
             self._set_sit_phase('look', now)
@@ -1131,7 +1395,7 @@ class ComeHereFsm:
                     self._trial = None
                     if self._skill is not None:
                         cmds.skill_results.append(self._skill_finish_result(
-                            cmds.trial_summary, 'seated'))
+                            cmds.trial_summary, 'seated', now))
                 cmds.log.append('DONE: sitting; operator reset stands the robot up')
                 self._set_sit_phase('done', now)
             else:
@@ -1168,6 +1432,13 @@ class ComeHereFsm:
 
     def _lose(self, now: float, cmds: Commands, why: str) -> None:
         self._command(cmds, now, 0.0, 0.0)
+        if self._skill == SKILL_APPROACH:
+            # Stopped, and the step ends: the supervisor decides about a reacquisition.
+            if self._ema_bearing is not None:
+                self._lost_bearing = (self._ema_bearing, now)
+            cmds.log.append(f'NOT WALKING: caller lost ({why})')
+            self._abort(now, cmds, 'track_lost')
+            return
         self._enter(State.ACQUIRE_PERSON, now, cmds, why)
 
     def _arrive(self, now: float, cmds: Commands, reason: str) -> None:
@@ -1181,7 +1452,8 @@ class ComeHereFsm:
             f'Close enough ({reason}): bbox_h_frac={obs.bbox_h_frac:.2f} '
             f'distance={obs.distance_m:.2f} m'
         )
-        mode = self._skill_arrival if self._skill is not None else self.config.arrival_mode
+        # A skill approach always ends standing; only the sit skill sits.
+        mode = ARRIVAL_STOP if self._skill is not None else self.config.arrival_mode
         if mode == ARRIVAL_SIT_AND_IDENTIFY:
             self._enter(State.SIT_AND_IDENTIFY, now, cmds, reason)
             self._face_received = False
@@ -1196,7 +1468,7 @@ class ComeHereFsm:
                 self._set_sit_phase('settle', now)
         else:
             self._enter(State.ARRIVED, now, cmds, reason)
-            if self.config.speak_text:
+            if self.config.speak_text and self._skill is None:
                 cmds.say = self.config.speak_text
 
     def _abort(self, now: float, cmds: Commands, reason: str) -> None:
@@ -1209,26 +1481,38 @@ class ComeHereFsm:
         self._finish(now, cmds, reason)
 
     def _finish(self, now: float, cmds: Commands, reason: str) -> None:
-        keep_gate = (self._skill == SKILL_TURN
+        keep_gate = (self._skill == SKILL_ORIENT
                      and reason in ('turn_complete', 'turn_not_needed'))
         if self._trial is not None:
             cmds.trial_summary = self._trial.summary(now)
             self._trial = None
             if self._skill is not None:
-                result = self._skill_finish_result(cmds.trial_summary, reason)
+                result = self._skill_finish_result(cmds.trial_summary, reason, now)
                 cmds.skill_results.append(result)
                 keep_gate = keep_gate and result['status'] == 'succeeded'
         self._skill = None
         self._turn_gate_valid = keep_gate
         self._enter(State.IDLE, now, cmds, reason)
 
-    def _skill_turn_done(self, now: float, cmds: Commands, reason: str) -> None:
-        """A turn_to_voice request ends here: stopped (the bridge forces StopMove after
-        every rotation), trial closed, result emitted."""
-        self._command(cmds, now, 0.0, 0.0)
-        if self._trial is not None:
-            self._trial.stop_reason = reason
-        self._finish(now, cmds, reason)
+    def _skill_acquired(self, now: float, cmds: Commands) -> None:
+        """acquire_caller ends here: the caller is in view, gated; nothing moved."""
+        obs = self._last_valid_obs
+        data = {
+            'bearing_rad': round(self._ema_bearing, 4),
+            'bearing_deg': round(math.degrees(self._ema_bearing), 1),
+            'confidence': round(obs.confidence, 3),
+            'distance_m': round(obs.distance_m, 3),
+            'distance_source': DISTANCE_SOURCES.get(int(obs.distance_source), 'unknown'),
+            'bbox_h_frac': round(obs.bbox_h_frac, 3),
+            'frame_age_s': round(obs.frame_age_s, 3),
+            'age_s': round(now - self._last_valid_s, 3),
+            'gate_center_rad': round(self._gate_center, 4),
+            'close_enough': self._close_enough_reason(),
+            # No persistent track ids exist here: the track is the gated EMA bearing,
+            # held until the approach that names this acquisition.
+            'track': 'gated_ema',
+        }
+        self._skill_done(now, cmds, 'acquired', data)
 
     def _align_turn(self, now: float, cmds: Commands, why: str) -> None:
         """Stop, then one closed-loop odometry turn by the caller's camera bearing."""
@@ -1325,6 +1609,8 @@ class ComeHereFsm:
         self._integrate_walk(now)
         cmds.velocity = (float(vx), float(yaw_rate))
         self._last_cmd_vx = float(vx)
+        if vx != 0.0 or yaw_rate != 0.0:
+            self._last_motion_s = now
         trial = self._trial
         if trial is not None and (vx != 0.0 or yaw_rate != 0.0):
             trial.motion_commands += 1

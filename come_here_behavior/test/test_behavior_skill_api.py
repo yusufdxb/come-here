@@ -1,8 +1,9 @@
 """Node-level tests for the skill interface of BehaviorNode (need a ROS 2 runtime).
 
 Flag off (the default and the deployed configuration): no skill topic exists and the
-trial record's config snapshot is unchanged. Flag on: results carry the request's goal_id
-and the trial's run_id, are latched for late subscribers, and bad input never moves.
+trial record's config snapshot is unchanged. Flag on: the wake phrase is not subscribed,
+results carry the request's goal_id, request_id and the trial's run_id, are latched for
+late subscribers, and bad input never moves.
 """
 
 import dataclasses
@@ -89,6 +90,7 @@ def test_flag_on_creates_exactly_the_two_skill_topics():
         subs_off, pubs_off = _topics(off)
         subs_on, pubs_on = _topics(on)
         assert subs_on - subs_off == {'/come_here/skill_request'}
+        assert subs_off - subs_on == {'/come_here/wake_phrase'}
         assert pubs_on - pubs_off == {'/come_here/skill_result'}
     finally:
         off.destroy_node()
@@ -96,7 +98,10 @@ def test_flag_on_creates_exactly_the_two_skill_topics():
 
 
 @pytest.mark.parametrize('body', ['{not json', '[]', 'null', '"x"',
-                                  json.dumps({'v': 1, 'goal_id': 'g', 'skill': 'fly'})])
+                                  json.dumps({'v': 2, 'goal_id': 'g', 'request_id': 'r', 'seq': 1,
+                                             'skill': 'fly', 'args': {}}),
+                                  json.dumps({'v': 1, 'goal_id': 'g', 'skill': 'approach_person',
+                                              'args': {'arrival': 'stop'}})])
 def test_malformed_requests_are_answered_and_never_move(body):
     node = _make_node(enable_skill_api=True)
     try:
@@ -114,19 +119,20 @@ def test_malformed_requests_are_answered_and_never_move(body):
 def test_accepted_request_result_carries_goal_id_and_the_trial_run_id():
     node = _make_node(enable_skill_api=True)
     try:
-        _request(node, {'v': 1, 'goal_id': 'a1', 'skill': 'approach_person',
-                        'args': {'arrival': 'stop'}})
+        _request(node, {'v': 2, 'goal_id': 'g1', 'request_id': 'a1', 'seq': 1,
+                        'skill': 'acquire_caller', 'args': {}})
         assert node._fsm.state == State.ACQUIRE_PERSON
         assert [list(m.data) for m in node._velocity_pub.msgs] == [[0.0, 0.0]]
         run_id = node._trial_meta['run_id']
-        _request(node, {'v': 1, 'goal_id': 'c1', 'skill': 'cancel',
-                        'args': {'goal_id': 'a1'}})
-        results = {r['goal_id']: r for r in
+        _request(node, {'v': 2, 'goal_id': 'g1', 'request_id': 'c1', 'seq': 2,
+                        'skill': 'cancel', 'args': {'request_id': 'a1'}})
+        results = {r['request_id']: r for r in
                    (json.loads(m.data) for m in node._skill_pub.msgs)}
         assert results['a1']['status'] == 'cancelled' and results['a1']['run_id'] == run_id
+        assert results['a1']['goal_id'] == 'g1'
         assert results['c1']['status'] == 'succeeded'
         record = json.loads(node._trial_pub.msgs[-1].data)
-        assert record['run_id'] == run_id and record['goal_id'] == 'a1'
+        assert record['run_id'] == run_id and record['request_id'] == 'a1'
         assert record['wake'] == {'source': 'skill_api'}
         assert list(node._velocity_pub.msgs[-1].data) == [0.0, 0.0]
     finally:
@@ -138,8 +144,8 @@ def test_result_is_latched_for_a_late_subscriber():
     late = Node('late_skill_subscriber')
     got = []
     try:
-        _request(node, {'v': 1, 'goal_id': 'r1', 'skill': 'cancel',
-                        'args': {'goal_id': 'none'}})     # answered: rejected
+        _request(node, {'v': 2, 'goal_id': 'g9', 'request_id': 'r1', 'seq': 1,
+                        'skill': 'cancel', 'args': {'request_id': 'none'}})  # rejected
         late.create_subscription(
             String, '/come_here/skill_result', lambda m: got.append(json.loads(m.data)),
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
@@ -147,7 +153,29 @@ def test_result_is_latched_for_a_late_subscriber():
         deadline = time.monotonic() + 5.0
         while not got and time.monotonic() < deadline:
             rclpy.spin_once(late, timeout_sec=0.1)
-        assert got and got[0]['goal_id'] == 'r1' and got[0]['reason'] == 'not_active'
+        assert got and got[0]['request_id'] == 'r1' and got[0]['reason'] == 'not_active'
     finally:
         late.destroy_node()
+        node.destroy_node()
+
+
+def test_no_motion_skill_that_ends_at_once_gets_its_own_run_id():
+    node = _make_node(enable_skill_api=True)
+    try:
+        _request(node, {'v': 2, 'goal_id': 'g1', 'request_id': 'k1', 'seq': 1,
+                        'skill': 'ask_caller_again', 'args': {}})
+        _request(node, {'v': 2, 'goal_id': 'g1', 'request_id': 'k2', 'seq': 2,
+                        'skill': 'ask_caller_again', 'args': {}})
+        results = [json.loads(m.data) for m in node._skill_pub.msgs]
+        assert [r['status'] for r in results] == ['succeeded', 'succeeded']
+        assert None not in (results[0]['run_id'], results[1]['run_id'])
+        assert results[0]['run_id'] != results[1]['run_id']
+        records = [json.loads(m.data) for m in node._trial_pub.msgs]
+        assert [r['request_id'] for r in records] == ['k1', 'k2']
+        assert [r['run_id'] for r in records] == [r['run_id'] for r in results]
+        for name in ('_velocity_pub', '_rotate_pub', '_sit_pub', '_stand_pub'):
+            assert all(list(getattr(m, 'data', [])) in ([0.0, 0.0], [])
+                       for m in getattr(node, name).msgs), name
+        assert not node._sit_pub.msgs and not node._rotate_pub.msgs
+    finally:
         node.destroy_node()
