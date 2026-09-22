@@ -90,6 +90,14 @@ GOAL_ID_MEMORY = 1024
 # (person_stale_timeout_s) and at most this long; an arrival while the robot has not
 # moved since.
 SKILL_ACQUISITION_MAX_S = 15.0
+# A decomposed acquire_caller is ONE look at the current view, not the baseline's search:
+# it gives up quickly, so a voice bearing (direction_max_age_s) is still usable after it.
+SKILL_ACQUIRE_TIMEOUT_S = 4.0
+# How old a localization may be when orient_to_caller uses it. The baseline's
+# direction_max_age_s (5 s) guards a continuous FSM run against acting on an older
+# utterance; in skill mode the bearing is bound to one localization, used once, void
+# after any motion and after a new prompt, so a supervisor's thinking time fits here.
+SKILL_LOCALIZATION_MAX_AGE_S = 12.0
 SKILL_ARRIVAL_VALID_S = 30.0
 
 # Tolerance for duration comparisons, so a 0.3 s debounce on a 10 Hz tick is
@@ -798,7 +806,7 @@ class ComeHereFsm:
             loc = self._localization
             if loc is None or loc['id'] != args['localization']:
                 return 'no_localization'
-            if now - loc['measured_s'] > cfg.direction_max_age_s:
+            if now - loc['measured_s'] > SKILL_LOCALIZATION_MAX_AGE_S:
                 return 'stale_localization'
             if self._moved_since(loc['measured_s']):
                 return 'moved_since_localization'
@@ -1110,7 +1118,7 @@ class ComeHereFsm:
         floor = max((t for t in (self._bearing_floor_s, self._last_motion_s)
                      if t is not None), default=None)
         fresh = (self._last_dir_s is not None
-                 and now - self._last_dir_s <= cfg.direction_max_age_s
+                 and now - self._last_dir_s <= SKILL_LOCALIZATION_MAX_AGE_S
                  and (floor is None or self._last_dir_s > floor))
         data = {'bearing_rad': None, 'bearing_deg': None, 'confidence': None, 'age_s': None,
                 'threshold': cfg.direction_confidence_threshold}
@@ -1287,7 +1295,9 @@ class ComeHereFsm:
                         f'nobody in view after the turn: search turn {self._search_turns} of '
                         f'{cfg.max_search_turns} toward the voice side')
             return
-        if now - self._acquire_since > cfg.search_timeout_s:
+        limit = (SKILL_ACQUIRE_TIMEOUT_S if self._skill == SKILL_ACQUIRE
+                 else cfg.search_timeout_s)
+        if now - self._acquire_since > limit:
             if can_relisten:                         # someone flickered in view, never acquired
                 self._relisten(now, cmds)
                 return

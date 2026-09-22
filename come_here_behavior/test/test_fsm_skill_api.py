@@ -186,9 +186,10 @@ def test_localize_low_confidence_fails_and_reports_the_bearing():
 
 
 def test_localize_stale_bearing_fails():
+    from come_here_behavior.come_here_fsm import SKILL_LOCALIZATION_MAX_AGE_S
     d = SkillDriver(gb.World(1.2, 2.4))
     _voice(d)
-    d.run(d.fsm.config.direction_max_age_s + 0.5)
+    d.run(SKILL_LOCALIZATION_MAX_AGE_S + 0.5)
     assert d.run_until(d.request('localize_caller'))['reason'] == 'no_direction'
 
 
@@ -198,7 +199,7 @@ def test_a_bearing_from_before_a_turn_never_localizes_again():
     loc = d.request('localize_caller')
     d.run_until(loc)
     d.run_until(d.request('orient_to_caller', localization=loc))
-    # Same (pre-turn) bearing still within direction_max_age_s: void after the turn.
+    # Same (pre-turn) bearing still within the age limit: void after the turn.
     r = d.run_until(d.request('localize_caller'))
     assert r['status'] == 'failed' and r['reason'] == 'no_direction'
     _voice(d)                                   # a new utterance after the turn
@@ -246,7 +247,8 @@ def test_orient_needs_a_fresh_unused_localization(case):
     if case == 'reused':
         d.run_until(d.request('orient_to_caller', localization=loc))
     if case == 'stale':
-        d.run(d.fsm.config.direction_max_age_s + 0.2)
+        from come_here_behavior.come_here_fsm import SKILL_LOCALIZATION_MAX_AGE_S
+        d.run(SKILL_LOCALIZATION_MAX_AGE_S + 0.2)
     n = len(d.frames)
     if case == 'none':
         rid = d.request('orient_to_caller', localization='never-issued')
