@@ -91,3 +91,31 @@ def match_come_here(transcript: str) -> Optional[PhraseMatch]:
     if utterance in WHOLE_UTTERANCE_ALIASES:
         return PhraseMatch(phrase=CANONICAL, heard=utterance, ratio=0.85)
     return None
+
+
+# -- "good boy": praise that stands a seated robot back up -------------------
+#
+# Same rules as "come here": whole tokens only, never a substring, so
+# "goodbye", "good boyfriend" and "a good buoy" do not match. No lab
+# recordings of "good boy" exist yet: the variants below are spellings, not
+# measured mishears. Re-score against robot-mic recordings before adding more.
+
+PRAISE = 'good boy'
+
+GOOD_FORMS = frozenset({'good'})
+BOY_FORMS = frozenset({'boy', 'boi'})
+PRAISE_JOINED_FORMS = frozenset({'goodboy', 'goodboi'})
+
+
+def match_good_boy(transcript: str) -> Optional[PhraseMatch]:
+    """PhraseMatch for "good boy" or None (1.0 exact, 0.9 spelling variant)."""
+    words = tokens(transcript)
+    for first, second in zip(words, words[1:]):
+        if first in GOOD_FORMS and second in BOY_FORMS:
+            heard = f'{first} {second}'
+            return PhraseMatch(phrase=PRAISE, heard=heard,
+                               ratio=1.0 if heard == PRAISE else 0.9)
+    for word in words:
+        if word in PRAISE_JOINED_FORMS:
+            return PhraseMatch(phrase=PRAISE, heard=word, ratio=0.9)
+    return None

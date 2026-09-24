@@ -2,6 +2,8 @@
 
 Publishes:
   /come_here/wake_phrase      (std_msgs/String) canonical phrase, e.g. "come here"
+  /come_here/praise           (std_msgs/String) "good boy" (praise_enabled only): never a
+                              wake, no DOA; the behavior node stands a seated robot up
   /come_here/wake_detail      (std_msgs/String) JSON for the trial log: confidence,
                               transcript, speech_end_to_publish_s, infer_ms, gate
   /come_here/audio_health     (std_msgs/String) JSON every health_period_s: mic,
@@ -28,6 +30,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float64MultiArray, String
 
 from come_here_audio.audio_direction_provider import AudioDirectionProvider
+from come_here_audio.come_here_matcher import PRAISE
 from come_here_audio.mock_audio_provider import MockAudioProvider
 from come_here_audio.wake_phrase_detector import (
     MockWakePhraseDetector,
@@ -82,6 +85,7 @@ class AudioNode(Node):
         p('whisper_vad_filter', True)
         p('phrase_ratio_threshold', 0.80)
         p('wake_cooldown_s', 3.0)
+        p('praise_enabled', False)        # also hear "good boy" -> /come_here/praise
         # Microphone: resolved by name; the far-field array is preferred.
         p('mic_device', 'ReSpeaker')
         p('mic_prefer_far_field', True)
@@ -195,6 +199,7 @@ class AudioNode(Node):
                 phrase_ratio_threshold=float(g('phrase_ratio_threshold')),
                 whisper_vad_filter=bool(g('whisper_vad_filter')),
                 cooldown_s=float(g('wake_cooldown_s')),
+                praise_enabled=bool(g('praise_enabled')),
                 adaptive_gate=bool(g('adaptive_gate')),
                 gate_snr_margin=float(g('gate_snr_margin')),
                 gate_floor_rms=float(g('gate_floor_rms')),
@@ -235,6 +240,7 @@ class AudioNode(Node):
 
         self._dir_pub = self.create_publisher(Float64MultiArray, '/come_here/audio_direction', 10)
         self._wake_pub = self.create_publisher(String, '/come_here/wake_phrase', 10)
+        self._praise_pub = self.create_publisher(String, '/come_here/praise', 10)
         self._detail_pub = self.create_publisher(String, '/come_here/wake_detail', 10)
         self._health_pub = self.create_publisher(String, '/come_here/audio_health', 10)
 
@@ -375,6 +381,15 @@ class AudioNode(Node):
 
         detection = self._wake_detector.check()
         if detection is None:
+            return
+        if detection.phrase == PRAISE:
+            # Not a wake: no bearing, no wake_detail (it would attach to the next trial).
+            praise = String()
+            praise.data = detection.phrase
+            self._praise_pub.publish(praise)
+            self.get_logger().info(
+                f'Praise heard: "{detection.phrase}" (confidence={detection.confidence:.2f}, '
+                f'heard="{detection.transcript}")')
             return
         now = time.monotonic()
         detail = {

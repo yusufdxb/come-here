@@ -16,6 +16,7 @@ Subscribes:
   /come_here/estop              (std_msgs/Bool)
   /come_here/rotate_result      (std_msgs/String) JSON from go2_bridge_node when a turn ends
   /come_here/reset              (std_msgs/Bool)   operator: stand up from DONE (estop_console)
+  /come_here/praise             (std_msgs/String) "good boy": same stand-up (praise_stands_up)
 
 Publishes:
   /come_here/cmd_velocity        (std_msgs/Float64MultiArray) [vx, yaw_rate]
@@ -126,6 +127,7 @@ class BehaviorNode(Node):
         self.create_subscription(Bool, '/come_here/estop', self._estop_cb, 10)
         self.create_subscription(String, '/come_here/rotate_result', self._rotate_result_cb, 10)
         self.create_subscription(Bool, '/come_here/reset', self._reset_cb, 10)
+        self.create_subscription(String, '/come_here/praise', self._praise_cb, 10)
 
         rate = float(self.get_parameter('tick_rate_hz').value)
         self._timer = self.create_timer(1.0 / rate, self._tick)
@@ -213,6 +215,9 @@ class BehaviorNode(Node):
     def _reset_cb(self, msg: Bool) -> None:
         if msg.data:
             self._apply(self._fsm.on_reset(self._now()))
+
+    def _praise_cb(self, msg: String) -> None:
+        self._apply(self._fsm.on_praise(self._now()))
 
     def _estop_cb(self, msg: Bool) -> None:
         self._apply(self._fsm.on_estop(bool(msg.data), self._now()))
