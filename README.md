@@ -37,6 +37,7 @@ stateDiagram-v2
     WALK --> ALIGN: bearing beyond 0.30 rad after 1.5 s
     ALIGN --> ACQUIRE_PERSON: caller lost (stop)
     WALK --> ACQUIRE_PERSON: caller lost (stop)
+    ACQUIRE_PERSON --> LISTENING: nobody seen, "Where are you?" (once)
     ACQUIRE_PERSON --> IDLE: 10 s without the caller
     WALK --> ARRIVED: bbox height >= 82% of frame, or walk budget reached on the caller
     ARRIVED --> SIT: align, settle, sit, speak
@@ -47,7 +48,7 @@ stateDiagram-v2
 |---|---|
 | Wake | ReSpeaker Mic Array v2.0 beamformed channel, an adaptive energy gate with pre-roll, faster-whisper `base.en` int8 on the CPU (capped at 2 threads), fuzzy match on "come here". |
 | Direction | The ReSpeaker built-in DOA (DOAANGLE, offset -90 deg on this mount), one bearing per matched utterance. The bridge turns in place until `/utlidar/robot_odom` yaw has moved by that bearing. Without a confident bearing the robot does not walk. |
-| Acquire | YOLO11n person detection, once per new camera frame, only inside a +/-35 deg gate around the voice bearing. Two consecutive fresh detections are required before any motion. If nobody is in view, the robot scans a full circle in 45 deg steps. |
+| Acquire | YOLO11n person detection, once per new camera frame, only inside a +/-35 deg gate around the voice bearing. Two consecutive fresh detections are required before any motion. If nobody is in view after the voice turn (4 fresh empty frames or 2 s), the robot says "Where are you?" once and turns toward the next "come here" (8 s wait); if that fails too, it scans a full circle in 45 deg steps. |
 | Align / walk | The stock `mcf` gait cannot combine forward motion and yaw cleanly, so ALIGN turns in place (yaw only) and WALK goes straight (0.6 m/s, no yaw), with hysteresis and minimum phase times. The bridge republishes Move at 20 Hz to keep the gait latched. |
 | Stop | The person's bounding box filling 82% of the frame height (LiDAR and pinhole distance read long at close range). Backstops: caller lost for 0.3 s, no valid detection for 1.5 s, a dead camera, a 20 s approach limit and a commanded walking-distance budget. |
 
@@ -94,25 +95,44 @@ Each trial appends a JSON line to `~/come_here_trials/trials.jsonl` (git commit,
 
 ## Live hardware result
 
-On 2026-09-15, two live end-to-end trials on the physical GO2 completed the full sequence (wake phrase, caller direction, turn, visual person acquisition, approach, stop, sit), running onboard the Jetson Orin NX. One was a blind trial, where the caller's position was not disclosed in advance; in it, the robot reached `DONE: sitting` about 12.8 s after wake-phrase detection (behavior-node log, `IDLE -> LISTENING` to `DONE: sitting`). Other attempts in the same session did not complete, including an attempt that timed out after an incorrect direction estimate.
+Live end-to-end trials on the physical GO2, running onboard the Jetson Orin NX. The full sequence is wake phrase, caller direction, turn, visual person acquisition, approach, stop, sit. Each row is one trial, successes and failures alike. Only the trials listed here are claimed as live end-to-end results; the trial logs from 2026-09-14 and 2026-09-15 also hold dry runs, staged tests and attempts that did not complete.
 
-These two runs show that the complete behavior executes on hardware. They are not a robustness or performance study, and 12.8 s describes one trial, not typical timing. The robot checkout was recorded as `047825b` with uncommitted changes, which were committed afterwards on this line; the exact executed source state is not fully reconstructable from Git history. Trial IDs: `20260915T225451-001` (caller at the robot's right), `20260915T230644-001` (blind trial).
+| Date | Trial ID | Caller | What happened | Result |
+|---|---|---|---|---|
+| 2026-09-14 | `19700105T111547-001` (robot clock unset) | Robot's left, about 90 deg | Bearing +34 deg, turn, one search turn, align, walk, bounding-box stop, sit | Success |
+| 2026-09-15 | `20260915T224403-001` | Robot's right | Bearing read +141 deg, nobody acquired | Failed (`acquire_timeout`) |
+| 2026-09-15 | `20260915T225451-001` | Robot's right | Bearing -100 deg, turn, walk, bounding-box stop, sit | Success |
+| 2026-09-15 | `20260915T230644-001` | Blind trial (caller position undisclosed) | Bearing -59 deg, turn, align, walk, bounding-box stop, sit; `DONE: sitting` about 12.8 s after wake-phrase detection | Success |
+| 2026-09-18 | `20260918T204123-001` | Robot's left | Bearing read +2 deg (straight ahead), so no turn; nobody in the camera view and, on that build, no search turn for a straight-ahead bearing; the robot did not move | Failed (`acquire_timeout`) |
+| 2026-09-18 | `20260918T204123-002` | Robot's right | Bearing -74 deg, turned -71 deg, one 23 deg align turn, walk, bounding-box stop (0.83 of frame height), sit; `DONE: sitting` about 12.5 s after wake-phrase detection | Success |
+| 2026-09-23 | Not captured | Not recorded | First call read +0.09 rad (ahead), no turn, nobody in view; the robot asked "Where are you?", heard a second "come here" at +0.19 rad, acquired the caller, walked and stopped on the bounding box, entering the sit state about 13.0 s after the first wake-phrase detection | Approach completed; the sit-complete log line and trial ID were not captured |
+
+These runs show that the complete behavior executes on hardware. They are not a robustness or performance study, and the timings describe single trials, not typical timing.
+
+**Boot service.** On 2026-09-18 the systemd service started the live stack by itself after a cold boot of the Jetson: its first attempt exited `NOT READY` because the robot network interface was not up yet, systemd retried, and the retry launched live with the robot standing. Both 2026-09-18 trials and the 2026-09-23 trial ran on a stack started this way.
+
+**Relisten.** The 2026-09-23 trial is the one live run of the relisten step, which is on `main` since `f7192c9` (the behavior node reported `git=f7192c9a95`). It was added after the 2026-09-18 straight-ahead failure: when nobody is in view after the voice turn, the robot asks "Where are you?" once and turns toward the next "come here" before any search sweep.
+
+**Source state.** For the 2026-09-14, 2026-09-15 and 2026-09-18 trials the robot checkout was recorded as `047825b` with uncommitted changes, which were committed afterwards on this line; the exact executed source state is not fully reconstructable from Git history.
+
+**Operator note.** In the 2026-09-15, 2026-09-18 and 2026-09-23 sessions a bump of the remote's stick while the robot was handled latched the e-stop, as designed; each time it was released from `estop_console` before the next trial.
 
 ## Status
 
 | Subsystem | Hardware evidence |
 |---|---|
-| Wake phrase (far-field front end, whole-token "come here" matcher) | Live wakes in the 2026-09-14 and 2026-09-15 trials; 49 of 57 recorded "come here" and 0 false wakes on replay |
-| Turn toward the voice (built-in DOA + closed-loop odometry turn) | Live on 2026-09-14 (caller at the robot's left) and 2026-09-15 (right, and the blind trial); one right-side attempt read +141 deg and failed |
-| YOLO acquisition, ALIGN / WALK, bounding-box stop, sit | Demonstrated in the 2026-09-14 and 2026-09-15 live trials |
-| Motion gate, mcf check, e-stop, shutdown stop, dry run | Unit and process tests; the remote-stick e-stop latched on the robot on 2026-09-15 |
-| Boot service | Reboot-tested in dry run on 2026-09-15; live boot path not yet exercised |
+| Wake phrase (far-field front end, whole-token "come here" matcher) | Live wakes in the trials above (2026-09-14 to 2026-09-23); 49 of 57 recorded "come here" and 0 false wakes on replay |
+| Turn toward the voice (built-in DOA + closed-loop odometry turn) | Live successes with the caller at the robot's left (2026-09-14), right (2026-09-15, 2026-09-18) and in the blind trial; failures: a right-side call read +141 deg (2026-09-15) and a left-side call read +2 deg (2026-09-18) |
+| Relisten ("Where are you?", second call) | One live trial on 2026-09-23: second call heard and approached; sit completion not captured |
+| YOLO acquisition, ALIGN / WALK, bounding-box stop, sit | Demonstrated in the live trials above |
+| Motion gate, mcf check, e-stop, shutdown stop, dry run | Unit and process tests; the remote-stick e-stop latched on the robot on 2026-09-15, 2026-09-18 and 2026-09-23 |
+| Boot service | Live boot path exercised on 2026-09-18 (cold boot, first attempt `NOT READY`, systemd retry launched live) and used again on 2026-09-23 |
 | Face detection after sitting | Not working: no face detected from the seated camera view |
 
 ## Known limits
 
 - One caller. Nobody closer to the robot than the caller.
-- The voice bearing is occasionally wrong (a held DOA register); the full-circle scan recovers some of these.
+- The voice bearing is occasionally wrong (a held DOA register, or a side caller read as straight ahead); the relisten step and the full-circle scan recover some of these.
 - Wake range with the robot's own noise is not yet measured with the new front end.
 - LiDAR distance reads long while walking at close range; the bounding-box fraction carries the stop.
 - The mcf forward gait drifts left about 0.1 to 0.2 m over 3 s of walking.
