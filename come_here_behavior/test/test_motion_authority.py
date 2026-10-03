@@ -230,3 +230,34 @@ def test_review_deferred_sit_does_not_cross_an_epoch(anode):
     _grant(n, epoch=2)                       # authority lost and regained meanwhile
     n._deferred_sport_call(SIT, 0.0, 'sit', epoch=1)
     assert _api_ids(n).count(SIT) == before  # sit queued under epoch 1 is dropped
+
+
+def _status(n):
+    """Capture the next /come_here/bridge_status payload."""
+    import json as _json
+    sent = []
+    orig = n._status_pub.publish
+    n._status_pub.publish = lambda m: sent.append(m)
+    try:
+        n._publish_status()
+    finally:
+        n._status_pub.publish = orig
+    return _json.loads(sent[-1].data)
+
+
+@bridge
+def test_status_attests_gated_mode_and_interface(anode):
+    s = _status(anode)
+    assert s['authority_enabled'] is True
+    assert s['authority_topic'] == '/auth' and s['authority_name'] == 'come_here'
+
+
+@bridge
+def test_status_attests_legacy_mode():
+    n = _make_node()
+    try:
+        s = _status(n)
+        assert s['authority_enabled'] is False and s['authority_topic'] == ''
+        assert n._authority.owned(n._now()) is True   # legacy: the send path is ungated
+    finally:
+        n.destroy_node()

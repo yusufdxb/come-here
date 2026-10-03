@@ -275,6 +275,8 @@ class Go2BridgeNode(Node):
 
         # Motion authority: empty topic = legacy, always owned.
         authority_topic = str(p('motion_authority_topic').value).strip()
+        # Reported verbatim in bridge_status: the topic this gate actually subscribes to.
+        self._authority_topic = authority_topic
         self._authority = AuthorityGate(
             str(p('motion_authority_name').value),
             float(p('grant_timeout_s').value),
@@ -409,6 +411,8 @@ class Go2BridgeNode(Node):
             'moving': self._gate.active,
             'odom_age_s': self._odom_age_s(),
             'authority_enabled': self._authority.enabled,
+            'authority_topic': self._authority_topic,
+            'authority_name': self._authority.name,
             'authority_owned': self._authority.owned(self._now()),
             'authority_owner': self._authority.owner,
             'authority_epoch': self._authority.epoch,
