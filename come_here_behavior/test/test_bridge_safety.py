@@ -200,8 +200,12 @@ def test_estop_release_does_not_resume_motion_without_zero_command(node):
     assert _api_ids(node)[-1] == MOVE_API_ID
 
 
-def test_every_estop_message_sends_stopmove(node):
+def test_estop_engage_edge_sends_one_stopmove_and_repeats_are_rate_limited(node):
+    # Was one StopMove per True; now engage edge + bounded reassert (1 s apart).
     node._estop_cb(_bool(True))
+    node._estop_cb(_bool(True))
+    assert _api_ids(node).count(STOP_MOVE_API_ID) == 1
+    node._now.t += 1.0
     node._estop_cb(_bool(True))
     assert _api_ids(node).count(STOP_MOVE_API_ID) == 2
 

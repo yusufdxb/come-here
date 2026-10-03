@@ -66,10 +66,13 @@ import time
 
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from unitree_api.msg import Request, Response
 
+from come_here_behavior.motion_authority import (
+    ACQUIRED, REVOKED, AuthorityGate, EstopReassert,
+)
 from come_here_behavior.motion_gate import MOVE, NONE, STOP, GateLimits, MotionGate
 from come_here_behavior.motion_mode import (
     MOTION_SWITCHER_CHECK_MODE_API_ID,
@@ -153,6 +156,9 @@ class Go2BridgeNode(Node):
         self.declare_parameter('rotate_prefer_ccw_beyond_rad', 2.6)
         self.declare_parameter('enable_posture_commands', True)
         # The operator touching a stick on the physical remote takes the robot back.
+        self.declare_parameter('motion_authority_topic', '')
+        self.declare_parameter('motion_authority_name', 'come_here')
+        self.declare_parameter('grant_timeout_s', 0.3)
         self.declare_parameter('manual_override_estop', True)
         self.declare_parameter('manual_override_axis_threshold', 0.2)
 
@@ -267,6 +273,20 @@ class Go2BridgeNode(Node):
         self.create_subscription(Bool, '/come_here/cmd_stand', self._stand_cb, 10)
         self.create_subscription(String, '/come_here/cmd_say', self._say_cb, 10)
 
+        # Motion authority: empty topic = legacy, always owned.
+        authority_topic = str(p('motion_authority_topic').value).strip()
+        self._authority = AuthorityGate(
+            str(p('motion_authority_name').value),
+            float(p('grant_timeout_s').value),
+            enabled=bool(authority_topic),
+        )
+        self._authority_dropped = 0
+        self._estop_reassert = EstopReassert(period_s=1.0, max_reasserts=3)
+        if authority_topic:
+            self.create_subscription(
+                String, authority_topic, self._grant_cb,
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+
         self._override_threshold = float(p('manual_override_axis_threshold').value)
         self._estop_pub = None
         if bool(p('manual_override_estop').value):
@@ -306,8 +326,35 @@ class Go2BridgeNode(Node):
 
     # -- Sport API publishing --
 
+    def _authority_ok(self, what: str) -> bool:
+        """True if a non-stop Sport request may be sent now; else count the drop."""
+        if self._authority.owned(self._now()):
+            return True
+        self._authority_dropped += 1
+        self._warn_throttled('authority_drop', f'{what} dropped: no motion authority')
+        return False
+
+    def _grant_cb(self, msg: String) -> None:
+        self._authority.on_grant(msg.data, self._now())
+        self._authority_poll()
+
+    def _authority_poll(self) -> None:
+        event = self._authority.update(self._now())
+        if event is None:
+            return
+        # Either edge discards any held command: a fresh one is required.
+        self._gate.disarm('authority')
+        self._preempt_rotation()
+        if event == REVOKED:
+            self._publish_stop(force=True)
+            self.get_logger().warn('motion authority REVOKED: StopMove sent')
+        else:
+            self.get_logger().info('motion authority ACQUIRED: fresh command required')
+
     def _publish_move(self, vx: float, yaw_rate: float) -> None:
         with self._sport_lock:
+            if not self._authority_ok('Move'):
+                return
             self._sport_pub.publish(
                 make_req(self._move_api_id, {'x': vx, 'y': 0.0, 'z': yaw_rate})
             )
@@ -361,6 +408,11 @@ class Go2BridgeNode(Node):
             'motion_mode_verified': self._mode_verified,
             'moving': self._gate.active,
             'odom_age_s': self._odom_age_s(),
+            'authority_enabled': self._authority.enabled,
+            'authority_owned': self._authority.owned(self._now()),
+            'authority_owner': self._authority.owner,
+            'authority_epoch': self._authority.epoch,
+            'authority_dropped': self._authority_dropped,
         }
         msg = String()
         msg.data = json.dumps(status)
@@ -415,6 +467,7 @@ class Go2BridgeNode(Node):
     # -- cmd_velocity --
 
     def _velocity_cb(self, msg: Float64MultiArray) -> None:
+        self._authority_poll()
         decision = self._gate.on_command(list(msg.data), self._now())
         if decision.action == NONE:
             self._warn_throttled('estopped', 'cmd_velocity ignored: e-stop engaged')
@@ -426,6 +479,7 @@ class Go2BridgeNode(Node):
 
     def _velocity_tick(self) -> None:
         """Republish the armed command, or stop once the watchdog trips."""
+        self._authority_poll()
         self._apply(self._gate.on_tick(self._now()), 'watchdog')
 
     # -- estop --
@@ -435,14 +489,17 @@ class Go2BridgeNode(Node):
             newly_engaged = not self._gate.estopped
             self._gate.engage_estop()
             self._preempt_rotation()
-            self._publish_stop(force=True)
+            if self._estop_reassert.on_true(self._now()):
+                self._publish_stop(force=True)
             if newly_engaged:
                 self.get_logger().error(
                     'ESTOP ENGAGED: StopMove sent, all motion blocked until '
                     '/come_here/estop false'
                 )
                 self._publish_status()
-        elif self._gate.estopped:
+        else:
+            self._estop_reassert.on_false()
+        if not msg.data and self._gate.estopped:
             self._gate.release_estop()
             self.get_logger().warn(
                 'ESTOP RELEASED: motion stays blocked until a zero cmd_velocity re-arms it'
@@ -605,6 +662,8 @@ class Go2BridgeNode(Node):
         self._gate.disarm('stand')
         self.get_logger().info(f'cmd_stand: api_id={self._stand_api_id}')
         with self._sport_lock:
+            if not self._authority_ok('Stand'):
+                return
             self._sport_pub.publish(make_req(self._stand_api_id))
 
     def _deferred_sport_call(self, api_id: int, delay_s: float, label: str) -> None:
@@ -614,6 +673,8 @@ class Go2BridgeNode(Node):
             return
         self.get_logger().info(f'cmd_{label} (deferred): api_id={api_id}')
         with self._sport_lock:
+            if not self._authority_ok(label.capitalize()):
+                return
             self._sport_pub.publish(make_req(api_id))
 
     # -- cmd_say --
