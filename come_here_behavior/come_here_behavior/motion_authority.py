@@ -56,6 +56,10 @@ class AuthorityGate:
         if grant is None:
             return False
         with self._lock:
+            g = self._grant
+            if g is not None and grant['guardian'] == g['guardian'] \
+                    and grant['epoch'] < g['epoch']:
+                return False  # late grant from an older epoch of the same guardian
             self._grant = grant
             self._grant_t = now
         return True

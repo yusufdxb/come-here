@@ -652,7 +652,7 @@ class Go2BridgeNode(Node):
         self.get_logger().info(f'cmd_sit: stopping, will sit in 0.5s (api={self._sit_api_id})')
         threading.Thread(
             target=self._deferred_sport_call,
-            args=(self._sit_api_id, 0.5, 'sit'),
+            args=(self._sit_api_id, 0.5, 'sit', self._authority.epoch),
             daemon=True,
         ).start()
 
@@ -666,7 +666,8 @@ class Go2BridgeNode(Node):
                 return
             self._sport_pub.publish(make_req(self._stand_api_id))
 
-    def _deferred_sport_call(self, api_id: int, delay_s: float, label: str) -> None:
+    def _deferred_sport_call(self, api_id: int, delay_s: float, label: str,
+                             epoch=None) -> None:
         time.sleep(delay_s)
         if self._gate.estopped or self._gate.inhibited or self._gate.active:
             self.get_logger().warn(f'cmd_{label} (deferred) dropped: motion blocked')
@@ -674,6 +675,9 @@ class Go2BridgeNode(Node):
         self.get_logger().info(f'cmd_{label} (deferred): api_id={api_id}')
         with self._sport_lock:
             if not self._authority_ok(label.capitalize()):
+                return
+            if self._authority.enabled and epoch is not None and self._authority.epoch != epoch:
+                self.get_logger().warn(f'cmd_{label} (deferred) dropped: authority epoch changed')
                 return
             self._sport_pub.publish(make_req(api_id))
 

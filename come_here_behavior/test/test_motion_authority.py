@@ -200,3 +200,33 @@ def test_legacy_default_unchanged():
     st = json.loads(json.dumps({'e': n._authority.enabled}))
     assert st['e'] is False
     n.destroy_node()
+
+
+# ---- review 2026-10-03 follow-ups ----
+
+def _g(owner, epoch, guardian='g1'):
+    import json as _json
+    return _json.dumps({'v': 1, 'owner': owner, 'epoch': epoch, 'guardian': guardian,
+                        'state': 'WATCHING', 'mode': 'LOCOMOTION'})
+
+
+def test_review_older_epoch_from_same_guardian_is_rejected():
+    from come_here_behavior.motion_authority import AuthorityGate
+    gate = AuthorityGate('come_here', 0.3)
+    assert gate.on_grant(_g(None, 2), 0.0)
+    assert gate.on_grant(_g('come_here', 1), 0.01) is False   # late, older epoch
+    assert gate.owned(0.02) is False
+    assert gate.on_grant(_g('come_here', 0, guardian='g2'), 0.03)  # restarted guardian
+    assert gate.owned(0.04) is True
+
+
+@bridge
+def test_review_deferred_sit_does_not_cross_an_epoch(anode):
+    n = anode
+    _grant(n, epoch=1)
+    n._deferred_sport_call(SIT, 0.0, 'sit', epoch=1)
+    assert SIT in _api_ids(n)
+    before = _api_ids(n).count(SIT)
+    _grant(n, epoch=2)                       # authority lost and regained meanwhile
+    n._deferred_sport_call(SIT, 0.0, 'sit', epoch=1)
+    assert _api_ids(n).count(SIT) == before  # sit queued under epoch 1 is dropped
