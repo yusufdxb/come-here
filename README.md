@@ -9,7 +9,7 @@ A "come here" behavior for the [Unitree GO2](https://www.unitree.com/go2) quadru
 Everything runs on the Jetson Orin NX payload on the robot, with no network dependency at runtime.
 
 <p align="center">
-  <a href="https://youtu.be/EwJF_jjldvY"><img src="https://img.youtube.com/vi/EwJF_jjldvY/maxresdefault.jpg" width="720" alt="come-here demo video: three live runs on a Unitree GO2"></a>
+  <a href="https://youtu.be/Ky4fMO8ooio"><img src="https://img.youtube.com/vi/Ky4fMO8ooio/maxresdefault.jpg" width="720" alt="come-here demo video: three live runs on a Unitree GO2"></a>
 </p>
 <p align="center"><sub>Three live runs on the GO2, each played start to finish (click to watch). Waiting and some walking stretches are sped up 2x and labeled; every spoken line plays at real speed.</sub></p>
 
@@ -132,7 +132,7 @@ These runs show that the complete behavior executes on hardware. They are not a 
 | YOLO acquisition, ALIGN / WALK, bounding-box stop, sit | Demonstrated in the live trials above |
 | Motion gate, mcf check, e-stop, shutdown stop, dry run | Unit and process tests; the remote-stick e-stop latched on the robot on 2026-09-15, 2026-09-18 and 2026-09-23 |
 | Boot service | Live boot path exercised on 2026-09-18 (cold boot, first attempt `NOT READY`, systemd retry launched live) and used again on 2026-09-23 |
-| "Good boy" stand-up and return to IDLE | Seen in two runs filmed by the caller: the robot stands after "good boy"; no trial log or trial IDs were captured for those runs |
+| "Good boy" stand-up and return to IDLE | Seen in two runs filmed by the caller (runs 2 and 3 of the [demo video](https://youtu.be/Ky4fMO8ooio)): the robot stands after "good boy"; no trial log or trial IDs were captured for those runs |
 | Face detection after sitting | Not working: no face detected from the seated camera view |
 
 ## Known limits
