@@ -8,6 +8,11 @@ A "come here" behavior for the [Unitree GO2](https://www.unitree.com/go2) quadru
 
 Everything runs on the Jetson Orin NX payload on the robot, with no network dependency at runtime.
 
+<p align="center">
+  <a href="https://youtu.be/EwJF_jjldvY"><img src="https://img.youtube.com/vi/EwJF_jjldvY/maxresdefault.jpg" width="720" alt="come-here demo video: three live runs on a Unitree GO2"></a>
+</p>
+<p align="center"><sub>Three live runs on the GO2, each played start to finish (click to watch). Waiting and some walking stretches are sped up 2x and labeled; every spoken line plays at real speed.</sub></p>
+
 ---
 
 ## The supported demo
