@@ -4,7 +4,7 @@
 [![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E.svg)](https://docs.ros.org/en/humble/)
 [![Status](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#status)
 
-A "come here" behavior for the [Unitree GO2](https://www.unitree.com/go2) quadruped. A person says *"come here"*, the robot says "I am coming.", turns toward the voice using the microphone array's direction estimate, finds the caller with its front camera, walks up to them, stops about 0.8 m away and sits.
+A "come here" behavior for the [Unitree GO2](https://www.unitree.com/go2) quadruped. A person says *"come here"*, the robot says "I am coming.", turns toward the voice using the microphone array's direction estimate, finds the caller with its front camera, walks up to them, stops about 0.8 m away and sits. Say *"good boy"* while it is seated and it stands back up and listens for the next "come here".
 
 Everything runs on the Jetson Orin NX payload on the robot, with no network dependency at runtime.
 
@@ -46,7 +46,7 @@ stateDiagram-v2
     ACQUIRE_PERSON --> IDLE: 10 s without the caller
     WALK --> ARRIVED: bbox height >= 82% of frame, or walk budget reached on the caller
     ARRIVED --> SIT: align, settle, sit, speak
-    SIT --> IDLE: operator reset (estop_console) or remote
+    SIT --> IDLE: "good boy", operator reset (estop_console) or remote, then stand and settle 3 s
 ```
 
 | Stage | What happens |
@@ -56,8 +56,8 @@ stateDiagram-v2
 | Acquire | YOLO11n person detection, once per new camera frame, only inside a +/-35 deg gate around the voice bearing. Two consecutive fresh detections are required before any motion. If nobody is in view after the voice turn (4 fresh empty frames or 2 s), the robot says "Where are you?" once and turns toward the next "come here" (8 s wait); if that fails too, it scans a full circle in 45 deg steps. |
 | Align / walk | The stock `mcf` gait cannot combine forward motion and yaw cleanly, so ALIGN turns in place (yaw only) and WALK goes straight (0.6 m/s, no yaw), with hysteresis and minimum phase times. The bridge republishes Move at 20 Hz to keep the gait latched. |
 | Stop | The person's bounding box filling 82% of the frame height (LiDAR and pinhole distance read long at close range). Backstops: caller lost for 0.3 s, no valid detection for 1.5 s, a dead camera, a 20 s approach limit and a commanded walking-distance budget. |
-
-| Arrive | Final yaw-only align, 1 s standing still, Sit, "Made it." / "Here I am.", stay seated until the operator resets. |
+| Arrive | Final yaw-only align, 1 s standing still, Sit, "Made it." / "Here I am.", stay seated until "good boy" or an operator reset. |
+| Good boy | "good boy" is matched as its own whole-token phrase and is never a wake. While the robot is seated it sends RiseSit (Sport API 1010); after `stand_settle_s` (3 s) the behavior returns to IDLE and accepts the next "come here". Set by `praise_enabled` and `praise_stands_up` in the demo config. |
 
 `skip_turn_to_sound:=true` restores the camera-only behavior. `scripts/install_come_here_service.sh --enable` installs a systemd service that starts the stack at boot (dry run unless `.come_here_live` exists in the checkout).
 
@@ -132,6 +132,7 @@ These runs show that the complete behavior executes on hardware. They are not a 
 | YOLO acquisition, ALIGN / WALK, bounding-box stop, sit | Demonstrated in the live trials above |
 | Motion gate, mcf check, e-stop, shutdown stop, dry run | Unit and process tests; the remote-stick e-stop latched on the robot on 2026-09-15, 2026-09-18 and 2026-09-23 |
 | Boot service | Live boot path exercised on 2026-09-18 (cold boot, first attempt `NOT READY`, systemd retry launched live) and used again on 2026-09-23 |
+| "Good boy" stand-up and return to IDLE | Seen in two runs filmed by the caller: the robot stands after "good boy"; no trial log or trial IDs were captured for those runs |
 | Face detection after sitting | Not working: no face detected from the seated camera view |
 
 ## Known limits
