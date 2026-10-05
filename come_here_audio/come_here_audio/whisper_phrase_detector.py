@@ -45,7 +45,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from come_here_audio.come_here_matcher import match_come_here
+from come_here_audio.come_here_matcher import match_come_here, match_good_boy
 from come_here_audio.phrase_matcher import match_trigger
 from come_here_audio.ring_buffer import LatestOnlyQueue, MultiRingBuffer, RingBuffer
 from come_here_audio.wake_phrase_detector import PhraseDetection, WakePhraseDetector
@@ -114,6 +114,8 @@ class WhisperPhraseDetector(WakePhraseDetector):
         whisper_vad_filter: bool = True,
         cpu_threads: int = 2,
         cooldown_s: float = 3.0,
+        # Also listen for "good boy" (praise: stands a seated robot back up).
+        praise_enabled: bool = False,
         # Deprecated, fixed-hop segmenter was replaced by utterance endpointing.
         # Kept so existing callers (e.g. hear_and_rotate_demo) don't raise TypeError.
         window_duration_s: Optional[float] = None,
@@ -218,6 +220,7 @@ class WhisperPhraseDetector(WakePhraseDetector):
         # Cooldown: suppress duplicate detections of one utterance
         self._last_detection_time: float = 0.0
         self._detection_cooldown_s: float = float(cooldown_s)
+        self._praise_enabled = bool(praise_enabled)
         # Highpass filter state (initialized in _start_audio_stream)
         self._hp_sos = None
         self._hp_zi = None
@@ -625,12 +628,17 @@ class WhisperPhraseDetector(WakePhraseDetector):
 
         {"come here"} uses the bounded whole-token matcher (come_here_matcher:
         no substring hits such as "welcome here everyone"); any other trigger
-        set keeps the generic substring + difflib matcher.
+        set keeps the generic substring + difflib matcher. With praise_enabled,
+        a transcript with no wake match is also tried against "good boy".
         """
         if set(self.TRIGGER_PHRASES) == {'come here'}:
-            return match_come_here(text)
-        return match_trigger(text, self.TRIGGER_PHRASES,
-                             ratio_threshold=self._phrase_ratio_threshold)
+            match = match_come_here(text)
+        else:
+            match = match_trigger(text, self.TRIGGER_PHRASES,
+                                  ratio_threshold=self._phrase_ratio_threshold)
+        if match is None and getattr(self, '_praise_enabled', False):
+            match = match_good_boy(text)
+        return match
 
     def _transcribe_ct2(self, audio_np: np.ndarray) -> PhraseDetection | None:
         """Transcribe using faster-whisper (CTranslate2)."""

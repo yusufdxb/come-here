@@ -170,6 +170,9 @@ class FsmConfig:
     final_align_timeout_s: float = 2.0
     pre_sit_settle_s: float = 1.0       # StopMove, then this long before Sit
     sit_hold_until_reset: bool = False  # true: stay seated after speaking until on_reset
+    # true: "good boy" (on_praise) while seated in DONE does what the operator
+    # reset does: stand up and go back to IDLE, ready for the next "come here".
+    praise_stands_up: bool = False
 
     def validate(self) -> None:
         def positive(name):
@@ -604,14 +607,27 @@ class ComeHereFsm:
 
     def on_reset(self, now: float) -> Commands:
         """Operator: stand up from DONE and go back to IDLE."""
+        return self._stand_from_done(now, 'Operator reset')
+
+    def on_praise(self, now: float) -> Commands:
+        """"Good boy": the same stand-up as on_reset, if praise_stands_up."""
+        if not self.config.praise_stands_up:
+            cmds = Commands()
+            cmds.log.append('Good boy heard: praise_stands_up is off')
+            return cmds
+        return self._stand_from_done(now, 'Good boy')
+
+    def _stand_from_done(self, now: float, who: str) -> Commands:
         cmds = Commands()
-        if self._state == State.SIT_AND_IDENTIFY and self._sit_phase == 'done':
+        if self._estopped:
+            cmds.log.append(f'{who} ignored: e-stop engaged')
+        elif self._state == State.SIT_AND_IDENTIFY and self._sit_phase == 'done':
             cmds.stand = True
             self._sit_phase = 'stand'
             self._sit_step_since = now
-            cmds.log.append('Operator reset: standing up')
+            cmds.log.append(f'{who}: standing up')
         else:
-            cmds.log.append(f'Operator reset ignored in {self.display_state}')
+            cmds.log.append(f'{who} ignored in {self.display_state}')
         return cmds
 
     def on_estop(self, engaged: bool, now: float) -> Commands:

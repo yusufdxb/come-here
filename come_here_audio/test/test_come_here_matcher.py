@@ -103,3 +103,48 @@ def test_other_trigger_sets_keep_the_generic_matcher():
     detection = detector._transcribe_ct2(None)
     assert detection is not None
     assert detection.phrase == 'stop now'
+
+
+# -- "good boy" ----------------------------------------------------------------
+
+@pytest.mark.parametrize('text', [
+    'good boy', 'Good boy!', "Who's a good boy?", 'good boy, good boy', 'Goodboy.',
+    'good boi', 'Good-boy',
+])
+def test_good_boy_matches(text):
+    from come_here_audio.come_here_matcher import match_good_boy
+    match = match_good_boy(text)
+    assert match is not None and match.phrase == 'good boy'
+
+
+@pytest.mark.parametrize('text', [
+    'goodbye', 'good bye', 'good job', 'good buoy', 'good boyfriend', 'a boy is good',
+    'good', 'boy', '', 'come here', 'made it', 'here i am', 'where are you',
+    'i am coming', 'i see you',
+])
+def test_good_boy_does_not_match(text):
+    from come_here_audio.come_here_matcher import match_good_boy
+    assert match_good_boy(text) is None
+
+
+def test_praise_is_off_by_default():
+    assert _detector([_segment(' Good boy!')])._transcribe_ct2(None) is None
+
+
+def test_praise_enabled_detects_good_boy():
+    detector = _detector([_segment(' Good boy!')])
+    detector._praise_enabled = True
+    detection = detector._transcribe_ct2(None)
+    assert detection is not None and detection.phrase == 'good boy'
+
+
+def test_come_here_wins_over_praise_in_one_utterance():
+    detector = _detector([_segment(' Good boy, come here.')])
+    detector._praise_enabled = True
+    assert detector._transcribe_ct2(None).phrase == 'come here'
+
+
+def test_praise_goes_through_the_same_gates():
+    detector = _detector([_segment(' good boy', avg_logprob=-0.89)])
+    detector._praise_enabled = True
+    assert detector._transcribe_ct2(None) is None

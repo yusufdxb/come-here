@@ -13,7 +13,7 @@ Subscribes:
                                   closed loop on odometry yaw, see rotate_controller.py
   <odom_topic>                    (nav_msgs/Odometry) robot yaw for closed-loop turns
   /come_here/cmd_sit              (std_msgs/Bool)   True triggers Sit, optional
-  /come_here/cmd_stand            (std_msgs/Bool)   True triggers BalanceStand, optional
+  /come_here/cmd_stand            (std_msgs/Bool)   True sends stand_api_id (demo: RiseSit 1010), optional
   /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub, queued
   /wirelesscontroller             (unitree_go/WirelessController) manual override: any stick
                                   beyond manual_override_axis_threshold latches the e-stop

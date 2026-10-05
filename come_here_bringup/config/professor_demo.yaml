@@ -8,7 +8,8 @@
 # direction (software DOA, calibrated by scripts/calibrate_doa.py), turns once
 # (closed loop on odometry yaw), selects only a person inside the DOA gate,
 # ALIGN/WALK, stops about 0.8 m away, StopMove, settles, sits, checks the face,
-# speaks, and stays seated until estop_console "reset". No L1 / deadman input.
+# speaks, and stays seated until "good boy" (or estop_console "reset"), which
+# stands it up for the next "come here". No L1 / deadman input.
 # Values marked "hw 2026-04-24" are the ones the last full hardware run used.
 # Launch arguments: skip_turn_to_sound:=true restores the camera-only demo.
 
@@ -37,6 +38,7 @@ audio_node:
     whisper_vad_filter: true
     phrase_ratio_threshold: 0.80     # fuzzy "come here" match ("come hear" passes)
     wake_cooldown_s: 3.0             # one utterance cannot fire twice
+    praise_enabled: true             # also hear "good boy" -> /come_here/praise (never a wake)
     mic_device: ReSpeaker            # resolved by name; the 6-channel array is preferred
     mic_prefer_far_field: true
     mic_channels: 6                  # ch0 DSP beam for Whisper, ch1-4 raw capsules for DOA
@@ -150,8 +152,9 @@ behavior_node:
     sit_settle_s: 3.0
     face_timeout_s: 1.5
     speak_hold_s: 3.0
-    stand_settle_s: 0.5
-    sit_hold_until_reset: true       # stay seated; estop_console "reset" stands up
+    stand_settle_s: 3.0              # RiseSit takes ~2 s: no new wake is accepted until it is up (HW-UNVERIFIED)
+    sit_hold_until_reset: true       # stay seated; estop_console "reset" or "good boy" stands up
+    praise_stands_up: true           # "good boy" while seated in DONE: stand up, back to IDLE
 
 go2_bridge_node:
   ros__parameters:
@@ -178,7 +181,7 @@ go2_bridge_node:
     rotate_timeout_s: 6.0
     rotate_prefer_ccw_beyond_rad: 2.6   # beyond 150 deg turn left the long way
     sit_api_id: 1009
-    stand_api_id: 1002
+    stand_api_id: 1010               # RiseSit: the SDK's inverse of Sit 1009 (unitree_sdk2py sport_api); HW-UNVERIFIED
     move_api_id: 1008
     stop_move_api_id: 1003
     wav_chunk_size_bytes: 16384

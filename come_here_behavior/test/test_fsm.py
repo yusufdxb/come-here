@@ -704,6 +704,61 @@ def test_seated_finish_holds_until_operator_reset():
     assert sim.fsm.state == State.IDLE
 
 
+def seated_done_sim(**overrides):
+    """A trial that walked up, sat, spoke, and now waits seated in DONE."""
+    sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, sit_hold_until_reset=True,
+                      **overrides)
+    sim.run(0.3, person=obs(bbox=0.8))
+    sim.run(4.0)
+    sim._record(sim.fsm.on_face_result(True, sim.t, 0.5))
+    sim.run(0.2)
+    assert sim.fsm.display_state == 'DONE' and sim.sits == 1 and sim.stands == 0
+    return sim
+
+
+def test_good_boy_stands_up_from_done_and_rearms_come_here():
+    sim = seated_done_sim(praise_stands_up=True, stand_settle_s=3.0)
+    trials = len(sim.summaries)
+    sim._record(sim.fsm.on_praise(sim.t))
+    assert sim.stands == 1 and sim.fsm.display_state == 'STAND'
+    sim.run(1.0)
+    sim.wake()                                              # still rising: ignored
+    assert sim.fsm.display_state == 'STAND' and len(sim.summaries) == trials
+    sim.run(2.5)
+    assert sim.fsm.state == State.IDLE
+    sim.wake()                                              # next "come here" starts a trial
+    assert sim.fsm.trial_active
+
+
+def test_good_boy_is_ignored_when_praise_stands_up_is_off():
+    sim = seated_done_sim()
+    sim._record(sim.fsm.on_praise(sim.t))
+    sim.run(5.0)
+    assert sim.stands == 0 and sim.fsm.display_state == 'DONE'
+
+
+def test_good_boy_never_starts_or_stands_outside_done():
+    sim = Sim(praise_stands_up=True)
+    sim._record(sim.fsm.on_praise(sim.t))                   # IDLE: not a wake
+    assert sim.fsm.state == State.IDLE and not sim.fsm.trial_active
+    sim = walking_sim(praise_stands_up=True, arrival_mode=ARRIVAL_SIT_AND_IDENTIFY,
+                      sit_hold_until_reset=True)
+    sim._record(sim.fsm.on_praise(sim.t))                   # walking: no stand
+    assert sim.fsm.state == State.WALK and sim.stands == 0
+    sim.run(0.3, person=obs(bbox=0.8))
+    sim.run(1.0)
+    assert sim.sits == 1
+    sim._record(sim.fsm.on_praise(sim.t))                   # mid-sit: no stand
+    assert sim.stands == 0 and sim.fsm.display_state == 'SIT'
+
+
+def test_good_boy_twice_sends_one_stand():
+    sim = seated_done_sim(praise_stands_up=True)
+    sim._record(sim.fsm.on_praise(sim.t))
+    sim._record(sim.fsm.on_praise(sim.t + 0.1))
+    assert sim.stands == 1
+
+
 def test_final_align_turns_onto_the_caller_before_sitting():
     sim = walking_sim(arrival_mode=ARRIVAL_SIT_AND_IDENTIFY, final_align_rad=0.1)
     t0 = sim.t

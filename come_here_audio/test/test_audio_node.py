@@ -183,3 +183,21 @@ def test_builtin_doa_without_samples_publishes_no_direction():
         assert json.loads(node._detail_pub.msgs[0].data)['doa_source'] == 'none'
     finally:
         node.destroy_node()
+
+
+def test_praise_publishes_on_its_own_topic_never_as_a_wake():
+    from come_here_audio.wake_phrase_detector import PhraseDetection
+
+    node = AudioNode(parameter_overrides=[Parameter('use_mock', value=True)])
+    try:
+        node._wake_pub, node._detail_pub = FakePub(), FakePub()
+        node._dir_pub, node._praise_pub = FakePub(), FakePub()
+        node._direction_provider = None                     # mock DOA publishes every tick
+        node._wake_detector.check = lambda: PhraseDetection(
+            phrase='good boy', confidence=0.9, transcript='good boy')
+        node._tick()
+        assert [m.data for m in node._praise_pub.msgs] == ['good boy']
+        assert node._wake_pub.msgs == [] and node._detail_pub.msgs == []
+        assert node._dir_pub.msgs == []
+    finally:
+        node.destroy_node()
