@@ -14,6 +14,9 @@ Subscribes:
   <odom_topic>                    (nav_msgs/Odometry) robot yaw for closed-loop turns
   /come_here/cmd_sit              (std_msgs/Bool)   True triggers Sit, optional
   /come_here/cmd_stand            (std_msgs/Bool)   True triggers BalanceStand, optional
+  /come_here/cmd_posture          (std_msgs/String) settle sequence, one of: lie (StandDown, allowed
+                                  under e-stop, refused while moving), stand_up (StandUp) or
+                                  balance (BalanceStand); the last two need authority and no e-stop
   /come_here/cmd_say              (std_msgs/String) phrase to play through the audiohub, queued
   /wirelesscontroller             (unitree_go/WirelessController) manual override: any stick
                                   beyond manual_override_axis_threshold latches the e-stop
@@ -39,7 +42,7 @@ Parameters:
   cmd_velocity_timeout_s   (float, 0.5)   watchdog: StopMove if cmd_velocity goes quiet
   republish_rate_hz        (float, 20.0)  Move republish rate (mcf gait latching needs 20 Hz)
   enable_rotate_command    (bool,  True)  accept /come_here/cmd_rotate
-  enable_posture_commands  (bool,  True)  accept /come_here/cmd_sit and /come_here/cmd_stand
+  enable_posture_commands  (bool,  True)  accept /come_here/cmd_sit, cmd_stand and cmd_posture
   cmd_z                    (float, 2.0)   rotation worker yaw rate, capped at max_yaw_rate
   deg_per_sec              (float, 90.0)  measured rotation speed at cmd_z, for the timed
                                           fallback when odometry is missing
@@ -50,6 +53,8 @@ Parameters:
   rotate_timeout_s         (float, 6.0)   hard bound on any turn
   rotate_prefer_ccw_beyond_rad (float, 2.6) targets beyond this turn left, the long way
   sit_api_id / stand_api_id / move_api_id / stop_move_api_id  Sport API ids (never 1001, Damp)
+  lie_api_id / stand_up_api_id / balance_api_id  cmd_posture ids (1005 StandDown, 1004 StandUp,
+                                          1002 BalanceStand; never 1001)
   wav_dir / wav_chunk_size_bytes / wav_chunk_delay_s          audiohub playback
 """
 
@@ -129,6 +134,9 @@ class Go2BridgeNode(Node):
         self.declare_parameter('stand_api_id', 1002)
         self.declare_parameter('move_api_id', 1008)
         self.declare_parameter('stop_move_api_id', 1003)
+        self.declare_parameter('lie_api_id', 1005)
+        self.declare_parameter('stand_up_api_id', 1004)
+        self.declare_parameter('balance_api_id', 1002)
         self.declare_parameter(
             'wav_dir', '/home/unitree/come-here/come_here_audio/scripts'
         )
@@ -169,11 +177,22 @@ class Go2BridgeNode(Node):
         self._stand_api_id = int(p('stand_api_id').value)
         self._move_api_id = int(p('move_api_id').value)
         self._stop_move_api_id = int(p('stop_move_api_id').value)
+        self._lie_api_id = int(p('lie_api_id').value)
+        self._stand_up_api_id = int(p('stand_up_api_id').value)
+        self._balance_api_id = int(p('balance_api_id').value)
         # 1001 on the Sport topic is Damp: refuse to start with it configured.
         check_sport_api_ids(
             sit_api_id=self._sit_api_id, stand_api_id=self._stand_api_id,
             move_api_id=self._move_api_id, stop_move_api_id=self._stop_move_api_id,
+            lie_api_id=self._lie_api_id, stand_up_api_id=self._stand_up_api_id,
+            balance_api_id=self._balance_api_id,
         )
+        # cmd_posture allowlist: any other value is ignored.
+        self._posture_ids = {
+            'lie': self._lie_api_id,
+            'stand_up': self._stand_up_api_id,
+            'balance': self._balance_api_id,
+        }
         self._required_mode = str(p('require_motion_mode').value).strip()
         if self._required_mode and self._required_mode not in VALID_MOTION_MODES:
             raise ValueError(
@@ -228,6 +247,7 @@ class Go2BridgeNode(Node):
         self._rotate_generation = 0
         self._rotate_lock = threading.Lock()
         self._rotate_cancel = threading.Event()
+        self._rotate_thread = None
         self._rotate_closed_loop = bool(p('rotate_closed_loop').value)
         self._odom_max_age_s = float(p('odom_max_age_s').value)
         self._rotate_deadband_rad = float(p('rotate_deadband_rad').value)
@@ -271,6 +291,7 @@ class Go2BridgeNode(Node):
         self.create_subscription(Float64, '/come_here/cmd_rotate', self._rotate_cb, 10)
         self.create_subscription(Bool, '/come_here/cmd_sit', self._sit_cb, 10)
         self.create_subscription(Bool, '/come_here/cmd_stand', self._stand_cb, 10)
+        self.create_subscription(String, '/come_here/cmd_posture', self._posture_cb, 10)
         self.create_subscription(String, '/come_here/cmd_say', self._say_cb, 10)
 
         # Motion authority: empty topic = legacy, always owned.
@@ -569,11 +590,12 @@ class Go2BridgeNode(Node):
             self._rotate_cancel.set()
             self._rotate_cancel = threading.Event()
             cancel_event = self._rotate_cancel
-            threading.Thread(
+            self._rotate_thread = threading.Thread(
                 target=self._rotate_worker,
                 args=(my_gen, controller, target_rad, cancel_event),
                 daemon=True,
-            ).start()
+            )
+            self._rotate_thread.start()
 
         self.get_logger().info(
             f'cmd_rotate: {target_rad:+.2f} rad, '
@@ -669,6 +691,46 @@ class Go2BridgeNode(Node):
             if not self._authority_ok('Stand'):
                 return
             self._sport_pub.publish(make_req(self._stand_api_id))
+
+    def _rotating(self) -> bool:
+        thread = self._rotate_thread
+        return thread is not None and thread.is_alive()
+
+    def _posture_cb(self, msg: String) -> None:
+        """Settle sequence from MOSAIC: lie (1005), stand_up (1004), balance (1002).
+
+        lie de-loads the robot, so the latched e-stop and a missing grant do not
+        block it; it is refused only while velocity motion is active, with a
+        StopMove so the caller can retry. stand_up and balance load the robot
+        and gate like cmd_stand. None of them touches the e-stop or the authority.
+        """
+        value = msg.data
+        api_id = self._posture_ids.get(value)
+        if api_id is None:
+            self._warn_throttled('posture_unknown', f'cmd_posture ignored: unknown value {value!r}')
+            return
+        if not self._enable_posture:
+            self._warn_throttled('posture_disabled', 'cmd_posture ignored: disabled')
+            return
+        moving = self._gate.active or self._rotating()
+        if value == 'lie':
+            if moving:
+                self._gate.disarm('posture')
+                self._preempt_rotation()
+                self._publish_stop(force=True)
+                self._warn_throttled(
+                    'posture_blocked', 'cmd_posture lie refused: moving, StopMove sent, retry')
+                return
+        elif self._gate.estopped or self._gate.inhibited or moving:
+            self._warn_throttled(
+                'posture_blocked', f'cmd_posture {value} ignored: motion blocked')
+            return
+        self._gate.disarm('posture')
+        self.get_logger().info(f'cmd_posture {value}: api_id={api_id}')
+        with self._sport_lock:
+            if value != 'lie' and not self._authority_ok(f'Posture {value}'):
+                return
+            self._sport_pub.publish(make_req(api_id))
 
     def _deferred_sport_call(self, api_id: int, delay_s: float, label: str,
                              epoch=None) -> None:

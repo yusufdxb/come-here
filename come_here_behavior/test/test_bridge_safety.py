@@ -24,7 +24,7 @@ import pytest
 try:
     import rclpy
     from rclpy.parameter import Parameter
-    from std_msgs.msg import Bool, Float64, Float64MultiArray
+    from std_msgs.msg import Bool, Float64, Float64MultiArray, String
     from come_here_behavior.go2_bridge_node import (
         DRY_RUN_SPORT_TOPIC,
         SPORT_TOPIC,
@@ -43,6 +43,9 @@ pytestmark = pytest.mark.skipif(
 
 MOVE_API_ID = 1008
 STOP_MOVE_API_ID = 1003
+LIE_API_ID = 1005
+STAND_UP_API_ID = 1004
+BALANCE_API_ID = 1002
 
 
 class FakePub:
@@ -463,3 +466,163 @@ def test_phrase_filenames_match_the_sound_files():
     assert phrase_filename('I am coming') == 'i_am_coming.wav'
     assert phrase_filename("Got you. I'm on my way.") == 'got_you_i_m_on_my_way.wav'
     assert phrase_filename(' Found you. ') == 'found_you.wav'
+
+
+# -- cmd_posture: the settle sequence lie / stand_up / balance --
+
+POSTURE_IDS = {'lie': LIE_API_ID, 'stand_up': STAND_UP_API_ID, 'balance': BALANCE_API_ID}
+
+
+def _str(value):
+    m = String()
+    m.data = value
+    return m
+
+
+def _grant_authority(n, epoch=1):
+    n._authority.on_grant(json.dumps({
+        'v': 1, 'owner': 'come_here', 'epoch': epoch, 'guardian': 'g1',
+        'state': 'RUN', 'mode': 'mcf'}), n._now())
+    n._authority_poll()
+
+
+@pytest.mark.parametrize('value', sorted(POSTURE_IDS))
+def test_posture_each_value_sends_one_request(node, value):
+    node._posture_cb(_str(value))
+    assert _api_ids(node) == [POSTURE_IDS[value]]
+
+
+@pytest.mark.parametrize('value', ['', 'Lie', 'lie ', 'sit', 'damp', '1001', 'stand', 'lie_down'])
+def test_posture_unknown_value_is_ignored(node, value):
+    node._posture_cb(_str(value))
+    assert _api_ids(node) == []
+
+
+def test_posture_ids_come_from_parameters():
+    n = _make_node(lie_api_id=1006, stand_up_api_id=1010, balance_api_id=1007)
+    try:
+        for value, api_id in (('lie', 1006), ('stand_up', 1010), ('balance', 1007)):
+            n._posture_cb(_str(value))
+            assert _api_ids(n)[-1] == api_id
+    finally:
+        n.destroy_node()
+
+
+@pytest.mark.parametrize('param', ['lie_api_id', 'stand_up_api_id', 'balance_api_id'])
+def test_posture_api_id_1001_is_refused_at_startup(param):
+    with pytest.raises(ValueError, match='Damp'):
+        Go2BridgeNode(parameter_overrides=[Parameter(param, value=1001)])
+
+
+def test_posture_lie_is_sent_under_estop_and_leaves_it_latched(node):
+    node._estop_cb(_bool(True))
+    mark = _mark(node)
+    node._posture_cb(_str('lie'))
+    assert _api_ids(node, mark) == [LIE_API_ID]
+    assert node._gate.estopped
+    assert _api_ids(node).count(STOP_MOVE_API_ID) == 1  # only the engage StopMove
+
+
+@pytest.mark.parametrize('value', ['stand_up', 'balance'])
+def test_posture_loading_commands_are_refused_under_estop(node, value):
+    node._estop_cb(_bool(True))
+    mark = _mark(node)
+    node._posture_cb(_str(value))
+    assert _api_ids(node, mark) == []
+
+
+@pytest.mark.parametrize('value', ['stand_up', 'balance'])
+def test_posture_loading_commands_are_refused_while_inhibited(value):
+    n = _make_node(require_motion_mode='mcf')  # inhibited until CheckMode reports mcf
+    try:
+        n._posture_cb(_str(value))
+        assert _api_ids(n) == []
+    finally:
+        n.destroy_node()
+
+
+def test_posture_lie_needs_no_authority_and_does_not_change_it():
+    n = _make_node(motion_authority_topic='/auth', grant_timeout_s=0.3)
+    try:
+        n._posture_cb(_str('lie'))
+        assert _api_ids(n) == [LIE_API_ID]
+        assert n._authority_dropped == 0 and not n._authority.owned(n._now())
+    finally:
+        n.destroy_node()
+
+
+@pytest.mark.parametrize('value', ['stand_up', 'balance'])
+def test_posture_loading_commands_need_authority_like_cmd_stand(value):
+    n = _make_node(motion_authority_topic='/auth', grant_timeout_s=0.3)
+    try:
+        n._posture_cb(_str(value))
+        assert _api_ids(n) == [] and n._authority_dropped == 1
+        _grant_authority(n)
+        n._posture_cb(_str(value))
+        assert _api_ids(n) == [POSTURE_IDS[value]]
+    finally:
+        n.destroy_node()
+
+
+def test_posture_lie_while_active_sends_stopmove_and_retry_succeeds(node):
+    node._velocity_cb(_vel(0.6, 0.0))
+    assert node._gate.active
+    mark = _mark(node)
+    node._posture_cb(_str('lie'))
+    assert _api_ids(node, mark) == [STOP_MOVE_API_ID]
+    assert not node._gate.active
+    mark = _mark(node)
+    node._posture_cb(_str('lie'))
+    assert _api_ids(node, mark) == [LIE_API_ID]
+
+
+@pytest.mark.parametrize('value', ['stand_up', 'balance'])
+def test_posture_loading_commands_are_refused_while_active(node, value):
+    node._velocity_cb(_vel(0.6, 0.0))
+    mark = _mark(node)
+    node._posture_cb(_str(value))
+    assert _api_ids(node, mark) == []
+
+
+def test_posture_lie_during_a_rotation_stops_it_and_is_refused():
+    n = _make_node(cmd_z=1.0, max_yaw_rate=1.0, deg_per_sec=90.0, rotate_closed_loop=False)
+    n._now = time.monotonic
+    try:
+        msg = Float64()
+        msg.data = math.radians(90)         # 1 s timed turn
+        n._rotate_cb(msg)
+        assert n._rotating()
+        mark = _mark(n)
+        n._posture_cb(_str('lie'))
+        assert LIE_API_ID not in _api_ids(n, mark)
+        assert _api_ids(n, mark)[-1] == STOP_MOVE_API_ID
+        time.sleep(0.2)                     # the preempted worker exits
+        assert not n._rotating()
+        mark = _mark(n)
+        n._posture_cb(_str('lie'))
+        assert _api_ids(n, mark) == [LIE_API_ID]
+    finally:
+        n.destroy_node()
+
+
+@pytest.mark.parametrize('value', sorted(POSTURE_IDS))
+def test_posture_ignored_when_posture_commands_disabled(value):
+    n = _make_node(enable_posture_commands=False)
+    try:
+        n._posture_cb(_str(value))
+        assert _api_ids(n) == []
+    finally:
+        n.destroy_node()
+
+
+def test_posture_dry_run_publishes_only_on_the_dry_run_topic():
+    n = Go2BridgeNode(parameter_overrides=[Parameter('dry_run', value=True)])
+    try:
+        assert n._sport_pub.topic_name == DRY_RUN_SPORT_TOPIC
+        real_pub, n._sport_pub = n._sport_pub, FakePub()
+        n._posture_cb(_str('lie'))
+        assert _api_ids(n) == [LIE_API_ID]  # goes through the dry-run publisher
+        n._sport_pub = real_pub
+    finally:
+        n._sport_pub = FakePub()
+        n.destroy_node()
