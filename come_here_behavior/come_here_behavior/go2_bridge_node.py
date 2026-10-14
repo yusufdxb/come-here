@@ -241,6 +241,8 @@ class Go2BridgeNode(Node):
         # -- Runtime state --
         self._sport_lock = threading.Lock()
         self._last_was_zero = True  # suppress a StopMove at startup
+        # Last posture the bridge commanded, for the idle-revoke log line only.
+        self._last_posture = 'unknown'
         self._warn_times = {}
 
         # Rotation thread control: incrementing generation invalidates older rotations.
@@ -365,14 +367,33 @@ class Go2BridgeNode(Node):
         event = self._authority.update(self._now())
         if event is None:
             return
+        # Sampled before the rotation is preempted: a turn in progress counts.
+        was_active = self._motion_active()
         # Either edge discards any held command: a fresh one is required.
         self._gate.disarm('authority')
         self._preempt_rotation()
         if event == REVOKED:
-            self._publish_stop(force=True)
-            self.get_logger().warn('motion authority REVOKED: StopMove sent')
+            # StopMove on a sitting GO2 stands it back up (hardware, 2026-10-13),
+            # so an idle robot is left alone. Not an e-stop path: the e-stop
+            # handler still sends StopMove unconditionally.
+            if was_active:
+                self._publish_stop(force=True)
+                self.get_logger().warn('motion authority REVOKED: StopMove sent')
+            else:
+                self.get_logger().info(
+                    f'revoke while idle: no StopMove (posture {self._last_posture})')
         else:
             self.get_logger().info('motion authority ACQUIRED: fresh command required')
+
+    def _motion_active(self) -> bool:
+        """True if a velocity or rotation command may still be moving the robot.
+
+        _last_was_zero is cleared when a Move is forwarded and set again by every
+        StopMove (watchdog, zero command, rotate end, sit), so it is False exactly
+        from a forwarded Move until the next StopMove. A time cutoff on top would
+        only risk skipping the stop when a revoke lands just before the watchdog.
+        """
+        return self._rotating() or not self._last_was_zero
 
     def _publish_move(self, vx: float, yaw_rate: float) -> None:
         with self._sport_lock:
@@ -382,6 +403,7 @@ class Go2BridgeNode(Node):
                 make_req(self._move_api_id, {'x': vx, 'y': 0.0, 'z': yaw_rate})
             )
             self._last_was_zero = False
+            self._last_posture = 'moving'
 
     def _publish_stop(self, force: bool = False) -> None:
         """StopMove once per stop transition, or unconditionally with force."""
@@ -691,6 +713,7 @@ class Go2BridgeNode(Node):
             if not self._authority_ok('Stand'):
                 return
             self._sport_pub.publish(make_req(self._stand_api_id))
+            self._last_posture = 'stand'
 
     def _rotating(self) -> bool:
         thread = self._rotate_thread
@@ -731,6 +754,7 @@ class Go2BridgeNode(Node):
             if value != 'lie' and not self._authority_ok(f'Posture {value}'):
                 return
             self._sport_pub.publish(make_req(api_id))
+            self._last_posture = value
 
     def _deferred_sport_call(self, api_id: int, delay_s: float, label: str,
                              epoch=None) -> None:
@@ -746,6 +770,7 @@ class Go2BridgeNode(Node):
                 self.get_logger().warn(f'cmd_{label} (deferred) dropped: authority epoch changed')
                 return
             self._sport_pub.publish(make_req(api_id))
+            self._last_posture = label
 
     # -- cmd_say --
 

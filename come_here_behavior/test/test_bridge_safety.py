@@ -626,3 +626,126 @@ def test_posture_dry_run_publishes_only_on_the_dry_run_topic():
     finally:
         n._sport_pub = FakePub()
         n.destroy_node()
+
+
+# -- authority revoke: StopMove only if motion was active --
+# StopMove on a sitting GO2 stands it back up (hardware, 2026-10-13), so a
+# revoke on an idle robot must send nothing. E-stop is unchanged.
+
+def _authority_node(**params):
+    n = _make_node(motion_authority_topic='/auth', grant_timeout_s=0.3, **params)
+    _grant_authority(n)
+    assert n._authority.owned(n._now())
+    return n
+
+
+def _revoke(n):
+    n._now.t += 1.0  # past grant_timeout_s with no refreshed grant
+    n._authority_poll()
+    assert not n._authority.owned(n._now())
+
+
+def test_revoke_after_sit_sends_no_stopmove():
+    n = _authority_node(sit_api_id=1009)  # the deployed value (behavior_params.yaml)
+    try:
+        n._sit_cb(_bool(True))
+        time.sleep(0.7)  # the deferred Sit fires 0.5 s after cmd_sit
+        assert _api_ids(n) == [STOP_MOVE_API_ID, 1009]
+        assert n._last_posture == 'sit'
+        mark = _mark(n)
+        _revoke(n)
+        assert _api_ids(n, mark) == []
+    finally:
+        n.destroy_node()
+
+
+def test_revoke_while_idle_sends_no_stopmove():
+    n = _authority_node()
+    try:
+        _revoke(n)
+        assert _api_ids(n) == []
+    finally:
+        n.destroy_node()
+
+
+def test_revoke_during_walking_sends_stopmove():
+    n = _authority_node()
+    try:
+        n._velocity_cb(_vel(0.6, 0.0))
+        assert _api_ids(n)[-1] == MOVE_API_ID
+        mark = _mark(n)
+        _revoke(n)
+        assert _api_ids(n, mark) == [STOP_MOVE_API_ID]
+    finally:
+        n.destroy_node()
+
+
+def test_revoke_after_walking_stopped_by_watchdog_sends_no_second_stopmove():
+    n = _authority_node(cmd_velocity_timeout_s=0.5)
+    try:
+        n._velocity_cb(_vel(0.6, 0.0))
+        n._now.t += 0.2
+        n._authority.on_grant(json.dumps({
+            'v': 1, 'owner': 'come_here', 'epoch': 1, 'guardian': 'g1',
+            'state': 'RUN', 'mode': 'mcf'}), n._now())
+        n._now.t += 0.3
+        n._velocity_tick()  # command is 0.5+ s old: watchdog stops
+        n._now.t += 0.3
+        n._velocity_tick()
+        assert _api_ids(n)[-1] == STOP_MOVE_API_ID
+        mark = _mark(n)
+        _revoke(n)
+        assert _api_ids(n, mark) == []
+    finally:
+        n.destroy_node()
+
+
+def test_revoke_during_rotate_sends_stopmove():
+    n = _make_node(motion_authority_topic='/auth', grant_timeout_s=0.3, cmd_z=1.0,
+                   max_yaw_rate=1.0, deg_per_sec=90.0, rotate_closed_loop=False)
+    n._now = time.monotonic  # the rotate worker needs a real clock
+    try:
+        _grant_authority(n)
+        msg = Float64()
+        msg.data = math.radians(180)         # 2 s timed turn
+        n._rotate_cb(msg)
+        assert n._rotating()
+        time.sleep(0.15)
+        assert MOVE_API_ID in _api_ids(n)
+        time.sleep(0.3)                      # grant (0.3 s) expires mid-rotation
+        assert n._rotating()
+        mark = _mark(n)
+        n._authority_poll()
+        assert _api_ids(n, mark)[0] == STOP_MOVE_API_ID
+        time.sleep(0.2)                      # the preempted worker exits
+        assert not n._rotating()
+    finally:
+        n.destroy_node()
+
+
+def test_estop_while_sitting_still_sends_stopmove():
+    # Unchanged on purpose: the e-stop path sends StopMove even when idle.
+    # Whether that stands a sitting GO2 is an open hardware question.
+    n = _authority_node()
+    try:
+        n._sit_cb(_bool(True))
+        time.sleep(0.7)
+        mark = _mark(n)
+        n._estop_cb(_bool(True))
+        assert _api_ids(n, mark) == [STOP_MOVE_API_ID]
+    finally:
+        n.destroy_node()
+
+
+def test_estop_during_walking_still_sends_stopmove_and_authority_revoke_after_is_quiet():
+    n = _authority_node()
+    try:
+        n._velocity_cb(_vel(0.6, 0.0))
+        mark = _mark(n)
+        n._estop_cb(_bool(True))
+        assert _api_ids(n, mark) == [STOP_MOVE_API_ID]
+        mark = _mark(n)
+        _revoke(n)  # StopMove already sent by the e-stop; robot is idle now
+        assert _api_ids(n, mark) == []
+    finally:
+        n.destroy_node()
